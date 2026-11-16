@@ -43,6 +43,35 @@ test plan, definition of done).
 
 ## Session log (most recent first)
 
+### 2026-11-17 — CI/CD session (Europe/Vienna)
+
+- Added GitHub Actions CI/CD; no application behaviour changed except one lint-driven
+  error-wrapping fix.
+  - `.github/workflows/ci.yml`: on push to `main`, PRs, manual — **lint** (gofmt, go vet,
+    hexagon guard, golangci-lint), **test** (`-race`, coverage artifact), **build** +
+    live smoke test (healthz + order create); binary artifact on `main`.
+  - `.github/workflows/release.yml`: on `v*` tags — tests, cross-compile
+    `linux/{amd64,arm64}` + `darwin/{amd64,arm64}`, SHA-256 checksums, artifact smoke
+    test (version match), `gh release create` (auto pre-release for hyphenated tags).
+  - `.github/dependabot.yml`: weekly grouped updates for GitHub Actions and Go modules.
+  - `.golangci.yml`: golangci-lint v2 config (standard set + errorlint, misspell, nilerr,
+    nolintlint, unconvert, wastedassign; gofmt/goimports formatters).
+  - `Makefile`: `verify` (lint+test+check-deps+build) and `cover`; `.gitignore`:
+    `coverage.out`, `dist/`; README: CI/CD section + badges.
+- Fix: local storage now wraps malformed-ID errors with `%w: %w` (errorlint), so the
+  message reads `order <id>: not found: invalid order id ...`.
+- **Verification (local):** actionlint 1.7.12 → clean; golangci-lint 2.15.0 → **0
+  issues**; gofmt clean; `go vet` clean; `make check-deps` → OK; `go test -race` all
+  packages green, **83.8 %** statement coverage; `make build VERSION=citest`; CI smoke
+  script green (healthz 200, order 201, 32-hex id); release cross-compile produced four
+  static binaries + checksums (`file(1)` verified ELF/Mach-O targets).
+- Pinned action versions (checked via GitHub API on 2026-11-17): `actions/checkout`
+  v7.0.1, `actions/setup-go` v7.0.0, `actions/upload-artifact` v7.0.2,
+  `golangci/golangci-lint-action` v9.3.0, `golangci-lint` v2.15.0.
+- Deployment is intentionally **not** automated: DESIGN.md §6.5 (deployment target) is
+  still open, so release artifacts are the CD boundary for now.
+- Not committed/pushed in this session (no request yet).
+
 ### 2026-11-16 — C0 implementation session (Europe/Vienna)
 
 - Implemented [plans/01-foundation.md](plans/01-foundation.md) end to end; all §7 exit
@@ -113,7 +142,12 @@ test plan, definition of done).
 - **Go toolchain:** go1.27.4 darwin/arm64 at `/opt/homebrew/bin/go`; module directive
   `go 1.27.4`. Keep `go.mod` bare (zero external requires).
 - **make:** use `/Library/Developer/CommandLineTools/usr/bin/make` (the `/usr/bin/make`
-  shim is broken by the Xcode 16.2/macOS 26 issue); `golangci-lint` optional/absent.
+  shim is broken by the Xcode 16.2/macOS 26 issue); `golangci-lint` optional/absent
+  (CI installs v2.15.0 itself).
+- **CI/CD:** GitHub Actions — `ci.yml` (push/PR/manual: lint, race tests, build+smoke),
+  `release.yml` (`v*` tags: cross-compiled binaries + checksums + GitHub release),
+  Dependabot weekly. Local parity: `make verify` / `make cover`; CI-only linter:
+  `golangci-lint` per `.golangci.yml`.
 - **Binary / command dir:** `cmd/ininsteadly` is wrong — correct is `cmd/insteadly`, binary
   `bin/insteadly`.
 - **Config:** env prefix `INSTEADLY_`, dots→underscores (e.g. `INSTEADLY_TELEPHONY_PROVIDER`);

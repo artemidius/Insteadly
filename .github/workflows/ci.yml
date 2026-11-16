@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Fail instead of silently rewriting go.mod: CI must not mutate the module.
+  GOFLAGS: -mod=readonly
+
+jobs:
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: Check formatting
+        run: |
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            echo "gofmt needed for:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Hexagon dependency guard
+        run: make check-deps
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.15.0
+          args: --timeout=5m
+
+  test:
+    name: Test (race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: Run tests
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -n 1
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+          if-no-files-found: error
+
+  build:
+    name: Build & smoke test
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: Build
+        run: make build VERSION="${GITHUB_SHA::12}"
+
+      - name: Smoke test the binary
+        run: |
+          set -euo pipefail
+          export INSTEADLY_HTTP_ADDR=127.0.0.1:18080
+          export INSTEADLY_STORAGE_LOCAL_DIR="$RUNNER_TEMP/data"
+
+          ./bin/insteadly &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 50); do
+            if curl -fsS http://127.0.0.1:18080/healthz 2>/dev/null > "$RUNNER_TEMP/health.json"; then
+              break
+            fi
+            sleep 0.1
+          done
+          jq -e '.status == "ok" and .providers.storage == "local"' "$RUNNER_TEMP/health.json"
+
+          status="$(curl -sS -o "$RUNNER_TEMP/order.json" -w '%{http_code}' \
+            -X POST http://127.0.0.1:18080/api/v1/orders \
+            -H 'Content-Type: application/json' \
+            -d '{"clinic":{"name":"CI","phone":"+431"},"patient":{"full_name":"CI"}}')"
+          test "$status" = "201"
+          jq -e '.status == "created" and (.id | test("^[0-9a-f]{32}$"))' "$RUNNER_TEMP/order.json"
+
+      - name: Upload binary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: insteadly-linux-amd64
+          path: bin/insteadly
+          retention-days: 7

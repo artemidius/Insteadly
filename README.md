@@ -1,5 +1,8 @@
 # Insteadly
 
+[![CI](https://github.com/artemidius/Insteadly/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/artemidius/Insteadly/actions/workflows/ci.yml)
+[![Release](https://github.com/artemidius/Insteadly/actions/workflows/release.yml/badge.svg)](https://github.com/artemidius/Insteadly/actions/workflows/release.yml)
+
 AI voice assistant that makes phone calls on behalf of users — starting with booking
 medical appointments in Vienna, Austria. The backend is a Go service built as a
 **hexagon** (ports & adapters): the core owns all business logic and depends only on
@@ -76,6 +79,8 @@ Configuring a provider whose adapter does not exist yet fails fast with a clear
 | `make build` | build `bin/insteadly` (version via `VERSION=...`) |
 | `make run` | `go run ./cmd/insteadly` |
 | `make test` | `go test -race -count=1 ./...` |
+| `make cover` | tests with coverage + one-line total |
+| `make verify` | `lint` + `test` + `check-deps` + `build` (what CI enforces) |
 | `make lint` | gofmt check + `go vet` (+ `golangci-lint` when installed) |
 | `make check-deps` | fails if `internal/core` imports an adapter (hexagon guard) |
 | `make fmt` | `gofmt -w .` |
@@ -106,6 +111,35 @@ internal/adapters/* → core/{ports,domain}
 internal/core/ports → internal/core/domain
 internal/core/domain → stdlib only
 ```
+
+## CI/CD
+
+GitHub Actions runs on every push to `main`, every pull request, and on demand
+([ci.yml](.github/workflows/ci.yml)):
+
+| Job | Checks |
+|---|---|
+| **Lint & format** | `gofmt -l`, `go vet`, `make check-deps` (hexagon guard), golangci-lint |
+| **Test (race)** | `go test -race -count=1` with coverage; `coverage.out` uploaded as an artifact |
+| **Build & smoke test** | `make build`, boots the binary against a temp data dir, checks `/healthz` and a real order create; uploads the binary on `main` |
+
+Releases ([release.yml](.github/workflows/release.yml)) are cut from `v*` tags: the
+workflow re-runs the tests, cross-compiles `linux/{amd64,arm64}` and `darwin/{amd64,arm64}`
+with the tag as `main.version`, writes `checksums.txt`, smoke-tests the Linux artifact, and
+publishes a GitHub release (marked pre-release when the tag contains `-`). Deployment is
+deliberately not automated yet — the deployment target is still open (DESIGN.md §6.5), so
+the release artifact is the delivery boundary for now.
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Action versions are pinned to immutable release tags and kept current by
+[Dependabot](.github/dependabot.yml) (weekly, grouped; also watches Go modules).
+Lint rules live in [.golangci.yml](.golangci.yml). To reproduce CI locally: `make verify`
+(and `make cover`). CI needs only the default `GITHUB_TOKEN` (`contents: read`; `contents:
+write` for releases).
 
 ## Roadmap
 

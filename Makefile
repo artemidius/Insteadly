@@ -1,7 +1,7 @@
 BIN      := bin/insteadly
 VERSION  ?= dev
 
-.PHONY: build run test lint fmt check-deps clean clean-data
+.PHONY: build run test lint fmt check-deps verify cover clean clean-data
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$(VERSION)" -o $(BIN) ./cmd/insteadly
@@ -11,6 +11,12 @@ run:
 
 test:
 	go test -race -count=1 ./...
+
+cover:
+	go test -race -count=1 -coverprofile=coverage.out ./...
+	go tool cover -func=coverage.out | tail -n 1
+
+verify: lint test check-deps build
 
 lint:
 	@test -z "$$(gofmt -l .)" || (echo "gofmt needed:"; gofmt -l .; exit 1)

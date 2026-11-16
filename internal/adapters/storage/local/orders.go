@@ -64,7 +64,7 @@ func (s *Store) Get(ctx context.Context, id domain.OrderID) (domain.Order, error
 	if err != nil {
 		// A malformed ID can never address a stored order; report it as a miss so the
 		// API can answer 404 without leaking path-validation details.
-		return domain.Order{}, fmt.Errorf("order %s: %w (%v)", id, ports.ErrNotFound, err)
+		return domain.Order{}, fmt.Errorf("order %s: %w: %w", id, ports.ErrNotFound, err)
 	}
 	o, err := readOrder(path)
 	if errors.Is(err, ports.ErrNotFound) {
@@ -128,7 +128,7 @@ func (s *Store) Update(ctx context.Context, id domain.OrderID, fn func(*domain.O
 	if err != nil {
 		// A malformed ID can never address a stored order; report it as a miss so the
 		// API can answer 404 without leaking path-validation details.
-		return domain.Order{}, fmt.Errorf("order %s: %w (%v)", id, ports.ErrNotFound, err)
+		return domain.Order{}, fmt.Errorf("order %s: %w: %w", id, ports.ErrNotFound, err)
 	}
 	o, err := readOrder(path)
 	if errors.Is(err, ports.ErrNotFound) {
