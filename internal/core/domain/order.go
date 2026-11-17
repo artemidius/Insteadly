@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -47,6 +48,15 @@ type Order struct {
 	// AttemptHistory is the append-only record of prior finished attempts, oldest
 	// first. It is what makes callback rescheduling a history-preserving requeue.
 	AttemptHistory []AttemptRecord `json:"attempt_history,omitempty"`
+
+	// UserID is the registered account that owns the order. It is empty for orders
+	// created while auth is disabled or by a machine caller.
+	UserID UserID `json:"user_id,omitempty"`
+	// PaidAt is when payment completed (C6). Nil until a payment marks the order paid.
+	PaidAt *time.Time `json:"paid_at,omitempty"`
+	// PaymentReference is the opaque provider id (Stripe checkout session id) that paid
+	// the order. It is unique per order and is what makes webhook replay durable.
+	PaymentReference *string `json:"payment_reference,omitempty"`
 }
 
 // AttemptRecord is one completed dial attempt in the order's durable history. It is
@@ -205,6 +215,27 @@ func (o *Order) Requeue(next *time.Time) error {
 	o.Status = OrderScheduled
 	o.NextAttemptAt = next
 	o.UpdatedAt = time.Now()
+	return nil
+}
+
+// MarkPaid records a completed payment and moves created → paid. It is idempotent: an
+// order already past "created" is returned unchanged, so a replayed webhook is a no-op.
+// reference is the provider's opaque id (Stripe checkout session id), stored for durable
+// idempotency; at is the payment time (zero ⇒ now).
+func (o *Order) MarkPaid(reference string, at time.Time) error {
+	if o.Status != OrderCreated {
+		return nil // idempotent: already processed
+	}
+	if err := o.Transition(OrderPaid); err != nil {
+		return err
+	}
+	t := at
+	if t.IsZero() {
+		t = time.Now()
+	}
+	o.PaidAt = &t
+	ref := strings.TrimSpace(reference)
+	o.PaymentReference = &ref
 	return nil
 }
 
