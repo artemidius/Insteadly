@@ -1,13 +1,16 @@
 package app
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
 
 	dialoguemistral "github.com/artemidius/insteadly/internal/adapters/dialogue/mistral"
 	"github.com/artemidius/insteadly/internal/adapters/storage/local"
+	"github.com/artemidius/insteadly/internal/adapters/storage/postgres"
 	sttmistral "github.com/artemidius/insteadly/internal/adapters/stt/mistral"
 	"github.com/artemidius/insteadly/internal/adapters/stub"
 	"github.com/artemidius/insteadly/internal/adapters/telephony/twilio"
@@ -19,14 +22,52 @@ import (
 // Each builder is one switch: adding a provider means one new case and one adapter
 // package, never a core edit (DESIGN.md §2.3).
 
-func buildStorage(c config.Storage) (ports.Storage, error) {
+// buildStorage returns the order/blob storage, the scheduler store, and a closer for the
+// durable handle. In postgres mode blobs stay on the local adapter (C5 does not build a
+// Postgres blob store), so Local.Dir remains required.
+func buildStorage(ctx context.Context, c config.Storage, log *slog.Logger) (ports.Storage, ports.SchedulerStore, io.Closer, error) {
 	switch c.Provider {
 	case "local":
-		return local.New(c.Local.Dir)
+		store, err := local.New(c.Local.Dir)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return store, store, nopCloser{}, nil
+	case "postgres":
+		blobs, err := local.New(c.Local.Dir)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		openCtx, cancel := context.WithTimeout(ctx, storageOpenTimeout)
+		defer cancel()
+		store, err := postgres.New(openCtx, postgres.Config{DSN: c.Postgres.DSN, Logger: log})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if err := store.Migrate(openCtx); err != nil {
+			_ = store.Close()
+			return nil, nil, nil, err
+		}
+		return compositeStorage{orders: store, blobs: blobs}, store, store, nil
 	default:
-		return nil, fmt.Errorf("unknown provider %q", c.Provider)
+		return nil, nil, nil, fmt.Errorf("unknown provider %q", c.Provider)
 	}
 }
+
+// compositeStorage is the postgres-mode ports.Storage: orders on Postgres, blobs local.
+type compositeStorage struct {
+	orders ports.OrderStore
+	blobs  ports.BlobStore
+}
+
+func (s compositeStorage) Orders() ports.OrderStore { return s.orders }
+
+func (s compositeStorage) Blobs() ports.BlobStore { return s.blobs }
+
+// nopCloser is the local-storage closer: there is nothing to release.
+type nopCloser struct{}
+
+func (nopCloser) Close() error { return nil }
 
 func buildTelephony(c config.Telephony, publicURL string, log *slog.Logger) (ports.Telephony, http.Handler, error) {
 	switch c.Provider {

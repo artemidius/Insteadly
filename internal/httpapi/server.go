@@ -16,10 +16,15 @@ import (
 
 	"github.com/artemidius/insteadly/internal/app"
 	"github.com/artemidius/insteadly/internal/core/config"
+	"github.com/artemidius/insteadly/internal/core/events"
 	"github.com/artemidius/insteadly/internal/core/ports"
 )
 
-const requestIDHeader = "X-Request-Id"
+const (
+	requestIDHeader = "X-Request-Id"
+	sseHeartbeat    = 15 * time.Second
+	sseRetryMS      = 3000
+)
 
 // API holds the handler dependencies. It is constructed once per process.
 type API struct {
@@ -28,49 +33,79 @@ type API struct {
 	version string
 	started time.Time
 	log     *slog.Logger
+
+	// hub is the SSE source. Nil is tolerated (snapshot-only stream) so a bare test
+	// App does not need an events hub.
+	hub events.Subscriber
+	// idem is the in-process place-call idempotency cache (prototype scope; C6 makes it
+	// durable). TTL comes from api.idempotency_ttl.
+	idem *idempotencyCache
+	// heartbeat is the SSE comment interval; overridden by tests.
+	heartbeat time.Duration
 }
 
 // New builds the HTTP server, including middleware. The listener address comes from
 // cfg.HTTP.Addr; binding happens when the caller runs ListenAndServe.
 func New(cfg config.Config, a *app.App, version string) *http.Server {
 	api := newAPI(cfg, a, version)
+	return &http.Server{
+		Addr:              cfg.HTTP.Addr,
+		Handler:           api.withMiddleware(api.routes()),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}
 
+// routes registers every route on a fresh mux. Tests use it directly so they can wrap
+// the handlers with their own middleware/round-tripper.
+func (a *API) routes() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", api.health)
-	mux.HandleFunc("GET /api/v1/orders", api.listOrders)
-	mux.HandleFunc("POST /api/v1/orders", api.createOrder)
-	mux.HandleFunc("GET /api/v1/orders/{id}", api.getOrder)
+	mux.HandleFunc("GET /healthz", a.health)
+	mux.HandleFunc("GET /api/v1/orders", a.listOrders)
+	mux.HandleFunc("POST /api/v1/orders", a.createOrder)
+	mux.HandleFunc("GET /api/v1/orders/{id}", a.getOrder)
+
+	// C5 orchestration surface. Place-call is an eligibility endpoint, never a direct
+	// dial: the scheduler picks the order up on its next tick.
+	mux.HandleFunc("POST /api/v1/orders/{id}/call", a.apiKeyAuth(a.callOrder))
+	mux.HandleFunc("GET /api/v1/orders/{id}/events", a.orderEvents)
 
 	// Provider webhooks are mounted only when the selected adapter has them. They are
 	// not part of the JSON API: Twilio posts form-encoded requests and expects TwiML.
-	if a.Webhooks != nil {
-		mux.Handle("/webhooks/telephony/twilio/", a.Webhooks)
+	if a.app != nil && a.app.Webhooks != nil {
+		mux.Handle("/webhooks/telephony/twilio/", a.app.Webhooks)
 	}
+	return mux
+}
 
-	// Outermost first: recoverer -> requestID -> logger. A panic is still logged with
-	// its request id, and the access log line records the final status.
-	var handler http.Handler = mux
-	handler = api.logRequests(handler)
-	handler = requestID(handler)
-	handler = api.recoverer(handler)
-
-	return &http.Server{
-		Addr:              cfg.HTTP.Addr,
-		Handler:           handler,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+// withMiddleware wraps h with the shared middleware chain. Outermost first: recoverer ->
+// requestID -> logger. A panic is still logged with its request id, and the access log
+// line records the final status.
+func (a *API) withMiddleware(h http.Handler) http.Handler {
+	h = a.logRequests(h)
+	h = requestID(h)
+	h = a.recoverer(h)
+	return h
 }
 
 // newAPI builds the handler set. New wraps it in middleware and a server; tests use
 // it directly to exercise individual middlewares.
 func newAPI(cfg config.Config, a *app.App, version string) *API {
-	return &API{
-		cfg:     cfg,
-		app:     a,
-		version: version,
-		started: time.Now(),
-		log:     a.Log,
+	api := &API{
+		cfg:       cfg,
+		app:       a,
+		version:   version,
+		started:   time.Now(),
+		log:       a.Log,
+		idem:      newIdempotencyCache(cfg.API.IdempotencyTTL),
+		heartbeat: sseHeartbeat,
 	}
+	if a.Events != nil {
+		api.hub = a.Events
+	}
+	if cfg.API.Key == "" {
+		api.log.Warn("place-call auth is disabled: INSTEADLY_API_KEY is not set (development only)")
+	}
+	return api
 }
 
 type healthResponse struct {

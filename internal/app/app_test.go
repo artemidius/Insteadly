@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/artemidius/insteadly/internal/core/config"
 	"github.com/artemidius/insteadly/internal/core/ports"
@@ -35,6 +37,9 @@ func TestNewWiresDefaults(t *testing.T) {
 	}
 	if a.Agent == nil || a.Runner == nil {
 		t.Fatal("agent/runner not wired")
+	}
+	if a.Scheduler == nil || a.Events == nil {
+		t.Fatal("scheduler/events not wired")
 	}
 	if a.Payments != nil || a.Notify != nil {
 		t.Error("payments/notify must stay nil until C6/C7")
@@ -189,11 +194,19 @@ func TestStubHasNoWebhooks(t *testing.T) {
 	}
 }
 
-func TestNewRejectsUnknownProviders(t *testing.T) {
+func TestNewRejectsPostgresWithoutDSN(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Storage.Provider = "postgres"
-	_, err := New(cfg)
-	if err == nil {
+	// config.Validate would reject this first; app.New must not half-wire it either.
+	if _, err := New(cfg); err == nil {
+		t.Fatal("expected error for postgres without a DSN")
+	}
+}
+
+func TestNewRejectsUnknownProviders(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Storage.Provider = "bogus"
+	if _, err := New(cfg); err == nil {
 		t.Fatal("expected error for unknown storage provider")
 	}
 }
@@ -217,5 +230,94 @@ func TestParseLevelFallback(t *testing.T) {
 	}
 	if got := parseLevel("warn"); got.String() != "WARN" {
 		t.Errorf("parseLevel(warn) = %s, want WARN", got)
+	}
+}
+
+func TestAppStartCloseIsIdempotent(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Scheduler.Enabled = true
+	cfg.Scheduler.Tick = time.Millisecond
+	cfg.Scheduler.WindowsJSON = config.DefaultSchedulerWindows
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Start(ctx)
+	a.Start(ctx) // idempotent
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+	if err := a.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := a.Close(closeCtx); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if err := a.CloseStorage(); err != nil {
+		t.Fatalf("CloseStorage: %v", err)
+	}
+	if err := a.CloseStorage(); err != nil {
+		t.Fatalf("second CloseStorage: %v", err)
+	}
+}
+
+func TestAppStartNoopWhenSchedulerDisabled(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Scheduler.Enabled = false
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	a.Start(context.Background())
+	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := a.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+type recordingCloser struct {
+	mu     *sync.Mutex
+	calls  *[]string
+	closed bool
+}
+
+func (c *recordingCloser) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	*c.calls = append(*c.calls, "storage")
+	return nil
+}
+
+func TestAppCloseDoesNotCloseStoragePool(t *testing.T) {
+	cfg := testConfig(t)
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var mu sync.Mutex
+	var calls []string
+	closer := &recordingCloser{mu: &mu, calls: &calls}
+	a.storageCloser = closer
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if closer.closed {
+		t.Fatal("App.Close closed the storage pool; it must be closed last by CloseStorage")
+	}
+	if err := a.CloseStorage(); err != nil {
+		t.Fatalf("CloseStorage: %v", err)
+	}
+	if !closer.closed {
+		t.Fatal("CloseStorage did not close the pool")
+	}
+	if len(calls) != 1 || calls[0] != "storage" {
+		t.Errorf("closer calls = %v", calls)
 	}
 }
