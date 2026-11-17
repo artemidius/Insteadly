@@ -133,6 +133,23 @@ observed; the real-phone M0 exit still waits on the Twilio account upgrade.
   green; both live tests **SKIP**; `go mod tidy` no drift (still only
   `github.com/coder/websocket v1.8.15`); contract drift empty; `git diff --check
   main...HEAD` clean (plan whitespace fixed).
+- **Live-gate follow-up (conductor's live run on `main` = `da3741d` failed):** fixed two
+  independent causes on `fix/c3-live-gate` without running any live test:
+  1. the STT/TTS realtime readers waited for a provider close frame after
+     `transcription.done`/`speech.audio.done`, which with a ~9 s utterance produced
+     `stt close: context deadline exceeded`; both now treat `done` as terminal (emit final /
+     flush tail, `CloseNow`, return), with fake-socket regression tests that keep the
+     connection open after `done`;
+  2. the live scripted utterance was ambiguous (STT heard "Grundkontrolle") and the model
+     skipped `capture_info`; the script now uses the explicit "Der Grund lautet Kontrolle"
+     phrasing and the prompt lists the German→`capture_info` field mapping.
+  Recorded in `plans/04-m0-e2e.md` §13; C3 remains 🔵 until the conductor's re-run passes.
+- **Live-gate follow-up verification (observed):** `make verify` green (gofmt/vet, all race
+  tests `ok`, `OK: core imports no adapters`, binary built); `go test -race -count=10
+  ./internal/adapters/stt/mistral ./internal/adapters/tts/mistral ./internal/core/agent
+  ./internal/core/runner ./internal/app` green; both live tests **SKIP**;
+  `golangci-lint v2.15.0` → **0 issues**; `go mod tidy` no drift; contract drift empty;
+  `make cover` → **87.4 %** total.
 
 ### 2026-11-17 — C2 implementation session (Europe/Vienna)
 

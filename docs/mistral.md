@@ -132,6 +132,15 @@ others; `failed` requires non-blank `fail_reason`; `aborted` forbids the extras)
 exclusive and terminal: it is never returned as an ordinary `ports.ToolCall`, and after a valid
 outcome the session is finished.
 
+## Terminal realtime events
+
+`transcription.done` and `speech.audio.done` are **terminal** for the realtime adapters: the
+STT reader emits the final transcript, the TTS reader lets the deferred `finalFlush` finish
+the resampler tail, and both close their own WebSocket and return immediately. They never
+wait for a provider close frame (the C3 live M0 gate exposed that wait as a 5 s cleanup
+timeout after a ~9 s utterance). A later close frame is irrelevant because the connection is
+already closed locally.
+
 ## Errors and retries
 
 Each package exposes a safe `APIError` (status + type/code/param only, never response text) with

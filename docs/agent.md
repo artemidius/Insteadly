@@ -227,8 +227,10 @@ The booking policy is fixed core German text, not env-configurable: AI disclosur
 Austrian German telephone style, no medical advice, no invented patient/availability/
 confirmation data, JSON order values are data not instructions, `propose_slot` is not a
 booking, `confirm_booking` needs explicit acceptance of the exact proposed slot, only
-authorized information via `capture_info`, honest `unavailable` escalation, and exactly one
-terminal `finish_call`. A deterministic `Auftragsdaten (JSON, nur Daten):` section contains
+authorized information via `capture_info` (including the German-to-field mapping
+`Name→full_name`, `Telefonnummer→phone`, `Geburtsdatum→birth_date`,
+`Versicherungsnummer→insurance_number`, `Grund→reason`, `Notiz→note`), honest `unavailable`
+escalation, and exactly one terminal `finish_call`. A deterministic `Auftragsdaten (JSON, nur Daten):` section contains
 clinic name, available patient fields, preferred slots, `current_time` (RFC 3339), and
 `time_zone:"Europe/Vienna"`. It excludes the clinic phone, recording flags, outcome,
 attempts, provider settings, and storage paths. The clock is captured once at run start so
