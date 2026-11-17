@@ -196,10 +196,18 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
   `TestVADBargeFiresOnSteadyLoudVoicedFramesWithoutFlux` and
   `TestVADBargeFiresOnMeasuredSpeechProfile`; updated synthetic barge/listener thresholds.
   Dated §3.7 + §13 notes. No live test run.
+- **Live outbound-audio accounting (test harness only):** the `d56ec91` gate run confirmed
+  the tuned barge works (`clears >= 1`, terminal `aborted`) but failed on `"no real outbound
+  audio"`: `integrationSession.ClearAudio` correctly clears the queued `sentAudio` slice, and
+  the live test sampled it after the barge clear. `SendAudio` now also maintains cumulative
+  `sentAudioTotal`/`sentAudioNonZero`/`sentAudioBadLen` that `ClearAudio` never resets; the
+  live test asserts those, and a credential-free
+  `TestIntegrationSessionOutboundAccountingSurvivesClear` regression covers the semantics. No
+  production change. Dated details in `plans/05-conversation.md` §13.
 - **Status:** C4 → 🔵 code complete pending the conductor's next `make live-test-m1` run
-  with the tuned barge onset and greeting-barge harness. Real-phone M1 remains blocked by the
-  Twilio trial/outbound-DTMF/controlled IVR+hold prerequisites; C1 and the real-phone M0 exit
-  remain blocked as before.
+  with the tuned barge onset and cumulative outbound accounting. Real-phone M1 remains
+  blocked by the Twilio trial/outbound-DTMF/controlled IVR+hold prerequisites; C1 and the
+  real-phone M0 exit remain blocked as before.
 
 
 ### 2026-11-17 — C3 conductor live-gate session (Europe/Vienna)

@@ -324,15 +324,18 @@ type integrationSession struct {
 	events  chan domain.CallEvent
 	inbound chan domain.AudioChunk
 
-	sendMu        sync.Mutex
-	mu            sync.Mutex
-	hangupCount   int
-	audioAtHangup int
-	sentAudio     [][]byte
-	marksAcked    int
-	clearCount    int
-	dtmf          []string
-	ended         bool
+	sendMu           sync.Mutex
+	mu               sync.Mutex
+	hangupCount      int
+	audioAtHangup    int
+	sentAudio        [][]byte
+	sentAudioTotal   int
+	sentAudioNonZero bool
+	sentAudioBadLen  int
+	marksAcked       int
+	clearCount       int
+	dtmf             []string
+	ended            bool
 }
 
 type readyIntegrationSession struct{ session *integrationSession }
@@ -355,6 +358,19 @@ func (r readyIntegrationSession) SendAudio(ctx context.Context, chunk domain.Aud
 	}
 	r.session.mu.Lock()
 	defer r.session.mu.Unlock()
+	if len(chunk.Data) != domain.FrameBytes {
+		r.session.sentAudioBadLen++
+	}
+	for _, b := range chunk.Data {
+		if b != 0 {
+			r.session.sentAudioNonZero = true
+			break
+		}
+	}
+	// Cumulative evidence: ClearAudio may drop the queued slice, but audio that was
+	// already handed to telephony was still played and must stay observable to the live
+	// harness.
+	r.session.sentAudioTotal++
 	r.session.sentAudio = append(r.session.sentAudio, append([]byte(nil), chunk.Data...))
 	return nil
 }
@@ -369,6 +385,8 @@ func (r readyIntegrationSession) SendDTMF(_ context.Context, digits string) erro
 func (r readyIntegrationSession) ClearAudio(context.Context) error {
 	r.session.mu.Lock()
 	r.session.clearCount++
+	// Drop the locally queued playback view; the cumulative total/non-zero evidence is
+	// intentionally not cleared.
 	r.session.sentAudio = nil
 	r.session.mu.Unlock()
 	return nil
@@ -926,4 +944,36 @@ func tonePCMFrame(freq float64, amplitude int16) []byte {
 		binary.LittleEndian.PutUint16(frame[2*i:], uint16(v))
 	}
 	return frame
+}
+
+func TestIntegrationSessionOutboundAccountingSurvivesClear(t *testing.T) {
+	session := newIntegrationSession()
+	sess := readyIntegrationSession{session: session}
+	frame := speechPCMFrame(0)
+	if err := sess.SendAudio(context.Background(), domain.AudioChunk{Data: frame}); err != nil {
+		t.Fatalf("SendAudio: %v", err)
+	}
+	if err := sess.ClearAudio(context.Background()); err != nil {
+		t.Fatalf("ClearAudio: %v", err)
+	}
+	session.mu.Lock()
+	total, nonZero, badLen := session.sentAudioTotal, session.sentAudioNonZero, session.sentAudioBadLen
+	queued := len(session.sentAudio)
+	clears := session.clearCount
+	session.mu.Unlock()
+	if clears != 1 {
+		t.Errorf("clears = %d, want 1", clears)
+	}
+	if queued != 0 {
+		t.Errorf("cleared queue length = %d, want 0", queued)
+	}
+	if total != 1 {
+		t.Errorf("cumulative outbound frames = %d, want 1 after a clear", total)
+	}
+	if !nonZero {
+		t.Error("cumulative outbound non-zero evidence was lost")
+	}
+	if badLen != 0 {
+		t.Errorf("bad-length outbound frames = %d, want 0", badLen)
+	}
 }

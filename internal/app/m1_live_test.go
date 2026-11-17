@@ -138,34 +138,30 @@ func TestLiveM1NoPhone(t *testing.T) {
 	}
 	session.mu.Lock()
 	clears := session.clearCount
-	sent := append([][]byte(nil), session.sentAudio...)
+	sentTotal := session.sentAudioTotal
+	sentNonZero := session.sentAudioNonZero
+	sentBadLen := session.sentAudioBadLen
 	hangups := session.hangupCount
 	session.mu.Unlock()
 	if clears < 1 {
 		t.Fatal("no barge-in clear was observed; the barge scenario did not run")
 	}
-	if len(sent) == 0 {
+	// Use the cumulative total, not the queued slice: the barge's ClearAudio correctly
+	// drops queued playback, but the greeting frames were actually sent before the clear.
+	if sentTotal == 0 {
 		t.Fatal("no real outbound audio")
 	}
-	nonZero := false
-	for _, frame := range sent {
-		if len(frame) != domain.FrameBytes {
-			t.Fatalf("outbound frame length = %d", len(frame))
-		}
-		for _, b := range frame {
-			if b != 0 {
-				nonZero = true
-			}
-		}
+	if sentBadLen != 0 {
+		t.Fatalf("%d outbound frame(s) had a non-canonical length", sentBadLen)
 	}
-	if !nonZero {
+	if !sentNonZero {
 		t.Error("outbound canonical audio was silent")
 	}
 	if hangups != 1 {
 		t.Errorf("hangups = %d, want 1", hangups)
 	}
 	t.Logf("live M1 no-phone: outcome=%s fail_reason=%q attempts=%d clears=%d outbound_frames=%d",
-		final.Outcome.Kind, final.Outcome.FailReason, final.Attempts, clears, len(sent))
+		final.Outcome.Kind, final.Outcome.FailReason, final.Attempts, clears, sentTotal)
 	if bytes.Contains(logs.Bytes(), []byte(key)) {
 		t.Error("API key leaked into logs")
 	}
