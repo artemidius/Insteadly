@@ -60,8 +60,7 @@ func TestLiveM0NoPhone(t *testing.T) {
 
 	// One real TTS synthesis creates the scripted receptionist utterance. It explicitly
 	// asks to capture the reason and authorizes the automated abort.
-	const scriptedUtterance = "Guten Tag. Bitte erfassen Sie als Grund Kontrolle. " +
-		"Das ist ein automatischer Test; bitte beenden Sie den Anruf und melden Sie ihn als abgebrochen."
+	const scriptedUtterance = "Guten Tag. Bitte erfassen Sie den Grund des Anrufs. Der Grund lautet Kontrolle. Danach beenden Sie den Anruf und melden ihn als abgebrochen, denn dies ist ein automatischer Test."
 	ttsCtx, ttsCancel := context.WithTimeout(ctx, 90*time.Second)
 	speech, err := tts.Speak(ttsCtx, ports.SpeakOptions{})
 	if err != nil {

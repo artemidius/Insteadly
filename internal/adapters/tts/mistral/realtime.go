@@ -218,17 +218,11 @@ func (s *realtimeStream) reader() {
 		close(s.readerDone)
 	}()
 
-	audioDone := false
 	for {
 		var ev ttsEvent
 		err := readWS(s.ctx, s.conn, &ev)
 		if err != nil {
 			if s.ctx.Err() != nil {
-				return
-			}
-			if audioDone {
-				// The generation completed; the server may close without a clean 1000
-				// close frame, which is still a successful end.
 				return
 			}
 			if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
@@ -256,7 +250,10 @@ func (s *realtimeStream) reader() {
 			out := s.res.feed(samples)
 			s.emitFrames(s.fr.push(int16LE(out)))
 		case "speech.audio.done":
-			audioDone = true
+			// done is terminal: close our side immediately and let the deferred flush
+			// finish the resampler tail. No server close frame is required.
+			_ = s.conn.CloseNow()
+			return
 		case "session.created", "session.updated":
 			// Handshake only.
 		case "error":
@@ -361,8 +358,8 @@ func (s *realtimeStream) FeedText(ctx context.Context, text string) error {
 // Audio returns the canonical PCM16 chunk channel, closed by the reader goroutine.
 func (s *realtimeStream) Audio() <-chan domain.AudioChunk { return s.audio }
 
-// Close ends input and drains audio through speech.audio.done and the server's normal
-// close. Idempotent; concurrent callers share one close operation.
+// Close ends input and drains audio through the terminal speech.audio.done event.
+// Idempotent; concurrent callers share one close operation.
 func (s *realtimeStream) Close(ctx context.Context) error {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()

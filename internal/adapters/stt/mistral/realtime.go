@@ -252,7 +252,6 @@ func (s *transcriptionStream) reader() {
 	}()
 
 	var accum strings.Builder
-	sawDone := false
 
 	for {
 		var ev wsEvent
@@ -260,11 +259,6 @@ func (s *transcriptionStream) reader() {
 		if err != nil {
 			if s.ctx.Err() != nil {
 				// Session cancelled (Close/CloseNow); nothing more to read.
-				return
-			}
-			if sawDone {
-				// The final transcript was delivered; the server may close without a
-				// clean 1000 close frame, which is still a successful end.
 				return
 			}
 			code := websocket.CloseStatus(err)
@@ -283,8 +277,11 @@ func (s *transcriptionStream) reader() {
 				s.emit(ports.TranscriptionEvent{Text: accum.String(), Final: false, At: time.Now()})
 			}
 		case "transcription.done":
-			sawDone = true
+			// done is terminal: deliver the final and close our side immediately. The
+			// provider is not required to send a close frame afterwards.
 			s.emitFinal(ev.Text)
+			_ = s.conn.CloseNow()
+			return
 		case "session.created", "session.updated":
 			// Handshake only; never transcript events.
 		case "error":
@@ -419,7 +416,7 @@ func (s *transcriptionStream) Close(ctx context.Context) error {
 		s.mu.Unlock()
 
 		if err == nil {
-			// Wait for transcription.done and a normal close (bounded final drain).
+			// Wait for the reader to deliver transcription.done (bounded final drain).
 			timer := time.NewTimer(finalDrainLimit)
 			defer timer.Stop()
 			select {
