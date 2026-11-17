@@ -6,9 +6,12 @@ import (
 	"net/http"
 	"time"
 
+	dialoguemistral "github.com/artemidius/insteadly/internal/adapters/dialogue/mistral"
 	"github.com/artemidius/insteadly/internal/adapters/storage/local"
+	sttmistral "github.com/artemidius/insteadly/internal/adapters/stt/mistral"
 	"github.com/artemidius/insteadly/internal/adapters/stub"
 	"github.com/artemidius/insteadly/internal/adapters/telephony/twilio"
+	ttsmistral "github.com/artemidius/insteadly/internal/adapters/tts/mistral"
 	"github.com/artemidius/insteadly/internal/core/config"
 	"github.com/artemidius/insteadly/internal/core/ports"
 )
@@ -50,34 +53,65 @@ func buildTelephony(c config.Telephony, publicURL string, log *slog.Logger) (por
 	}
 }
 
-func buildSTT(c config.STT) (ports.SpeechToText, error) {
+func buildSTT(c config.STT, mistral config.Mistral, log *slog.Logger) (ports.SpeechToText, error) {
 	switch c.Provider {
 	case "stub":
 		return stub.NewSTT(), nil
 	case "mistral":
-		return nil, fmt.Errorf("provider %q: %w (lands in chunk C2)", c.Provider, ports.ErrNotImplemented)
+		adapter, err := sttmistral.New(sttmistral.Config{
+			APIKey:           mistral.APIKey,
+			BaseURL:          mistral.BaseURL,
+			RealtimeModel:    mistral.STT.RealtimeModel,
+			BatchModel:       mistral.STT.BatchModel,
+			StreamingDelayMS: mistral.STT.StreamingDelayMS,
+			Logger:           log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return adapter, nil
 	default:
 		return nil, fmt.Errorf("unknown provider %q", c.Provider)
 	}
 }
 
-func buildTTS(c config.TTS) (ports.TextToSpeech, error) {
+func buildTTS(c config.TTS, mistral config.Mistral, log *slog.Logger) (ports.TextToSpeech, error) {
 	switch c.Provider {
 	case "stub":
 		return stub.NewTTS(), nil
 	case "mistral":
-		return nil, fmt.Errorf("provider %q: %w (lands in chunk C2)", c.Provider, ports.ErrNotImplemented)
+		adapter, err := ttsmistral.New(ttsmistral.Config{
+			APIKey:       mistral.APIKey,
+			BaseURL:      mistral.BaseURL,
+			Model:        mistral.TTS.Model,
+			DefaultVoice: mistral.TTS.DefaultVoice,
+			Mode:         mistral.TTS.Mode,
+			Logger:       log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return adapter, nil
 	default:
 		return nil, fmt.Errorf("unknown provider %q", c.Provider)
 	}
 }
 
-func buildDialogue(c config.Dialogue) (ports.Dialogue, error) {
+func buildDialogue(c config.Dialogue, mistral config.Mistral, log *slog.Logger) (ports.Dialogue, error) {
 	switch c.Provider {
 	case "stub":
 		return stub.NewDialogue(), nil
 	case "mistral":
-		return nil, fmt.Errorf("provider %q: %w (lands in chunk C2)", c.Provider, ports.ErrNotImplemented)
+		adapter, err := dialoguemistral.New(dialoguemistral.Config{
+			APIKey:  mistral.APIKey,
+			BaseURL: mistral.BaseURL,
+			Model:   mistral.Dialogue.Model,
+			Logger:  log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return adapter, nil
 	default:
 		return nil, fmt.Errorf("unknown provider %q", c.Provider)
 	}

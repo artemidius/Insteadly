@@ -78,9 +78,33 @@ type Policy struct {
 	AudioEnabled      bool
 }
 
-// Mistral holds the shared Mistral API settings (needed C2). APIKey is a secret.
+// Mistral holds the shared Mistral API settings. APIKey is a secret; the other
+// fields are non-secret protocol/model settings that never cross a port boundary.
 type Mistral struct {
-	APIKey string // secret; required only when a mistral provider is selected (C2)
+	APIKey   string // secret; required only when a mistral provider is selected
+	BaseURL  string
+	STT      MistralSTT
+	TTS      MistralTTS
+	Dialogue MistralDialogue
+}
+
+// MistralSTT holds the Mistral speech-to-text settings.
+type MistralSTT struct {
+	RealtimeModel    string
+	BatchModel       string
+	StreamingDelayMS int
+}
+
+// MistralTTS holds the Mistral text-to-speech settings.
+type MistralTTS struct {
+	Model        string
+	DefaultVoice string
+	Mode         string // "realtime" | "offline"
+}
+
+// MistralDialogue holds the Mistral dialogue (LLM) settings.
+type MistralDialogue struct {
+	Model string
 }
 
 // Log configures structured logging.
@@ -93,6 +117,7 @@ var (
 	telephonyProviders = []string{"twilio", "stub"}
 	twilioModes        = []string{"voice-api", "sip-trunk"}
 	aiProviders        = []string{"mistral", "stub"}
+	mistralTTSModes    = []string{"realtime", "offline"}
 	storageProviders   = []string{"local"}
 	logLevels          = []string{"debug", "info", "warn", "error"}
 	logFormats         = []string{"text", "json"}
@@ -146,7 +171,74 @@ func (c Config) Validate() error {
 	if err := checkEnum("tts.provider", c.TTS.Provider, aiProviders); err != nil {
 		return err
 	}
-	return checkEnum("dialogue.provider", c.Dialogue.Provider, aiProviders)
+	if err := checkEnum("dialogue.provider", c.Dialogue.Provider, aiProviders); err != nil {
+		return err
+	}
+	return c.validateMistral()
+}
+
+// validateMistral checks the shared Mistral settings. Model/voice/base-URL/delay/mode
+// validation is unconditional (invalid explicit settings fail even when every provider is
+// stub); only the API key is conditional on a mistral provider being selected.
+func (c Config) validateMistral() error {
+	if err := validateMistralBaseURL(c.Mistral.BaseURL); err != nil {
+		return err
+	}
+	if err := checkNonEmptyTrim("mistral.stt.realtime_model", c.Mistral.STT.RealtimeModel); err != nil {
+		return err
+	}
+	if err := checkNonEmptyTrim("mistral.stt.batch_model", c.Mistral.STT.BatchModel); err != nil {
+		return err
+	}
+	d := c.Mistral.STT.StreamingDelayMS
+	if (d < 80 || d > 1200) && d != 2400 {
+		return fmt.Errorf("config: mistral.stt.streaming_delay_ms: must be between 80 and 1200, or exactly 2400")
+	}
+	if err := checkNonEmptyTrim("mistral.tts.model", c.Mistral.TTS.Model); err != nil {
+		return err
+	}
+	if err := checkNonEmptyTrim("mistral.tts.voice", c.Mistral.TTS.DefaultVoice); err != nil {
+		return err
+	}
+	if err := checkEnum("mistral.tts.mode", c.Mistral.TTS.Mode, mistralTTSModes); err != nil {
+		return err
+	}
+	if err := checkNonEmptyTrim("mistral.dialogue.model", c.Mistral.Dialogue.Model); err != nil {
+		return err
+	}
+	if (c.STT.Provider == "mistral" || c.TTS.Provider == "mistral" || c.Dialogue.Provider == "mistral") &&
+		strings.TrimSpace(c.Mistral.APIKey) == "" {
+		return fmt.Errorf("config: mistral.api_key: required when a mistral provider is selected")
+	}
+	return nil
+}
+
+// validateMistralBaseURL accepts only an absolute https origin with no path, query,
+// credentials, or fragment. It is never empty (defaults supply it); trailing slashes are
+// trimmed by load.
+func validateMistralBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("config: mistral.api_base_url: invalid URL: %w", err)
+	}
+	if u.Scheme != "https" || u.Host == "" || u.User != nil ||
+		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("config: mistral.api_base_url: must be an https origin like https://api.mistral.ai")
+	}
+	return nil
+}
+
+// checkNonEmptyTrim rejects an empty value or one with surrounding whitespace. Model and
+// voice identifiers are compared verbatim to provider names, so silently trimming would
+// hide a copy/paste error.
+func checkNonEmptyTrim(name, value string) error {
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf("config: %s: must not have surrounding whitespace", name)
+	}
+	if value == "" {
+		return fmt.Errorf("config: %s: is required", name)
+	}
+	return nil
 }
 
 // validatePublicURL accepts an empty value (no public webhooks) or an absolute https
@@ -210,5 +302,13 @@ func (c Config) Summary() map[string]any {
 		"audio.enabled":                         c.Recording.AudioEnabled,
 		"log.level":                             c.Log.Level,
 		"log.format":                            c.Log.Format,
+		"mistral.api_base_url":                  c.Mistral.BaseURL,
+		"mistral.stt.realtime_model":            c.Mistral.STT.RealtimeModel,
+		"mistral.stt.batch_model":               c.Mistral.STT.BatchModel,
+		"mistral.stt.streaming_delay_ms":        c.Mistral.STT.StreamingDelayMS,
+		"mistral.tts.model":                     c.Mistral.TTS.Model,
+		"mistral.tts.voice":                     c.Mistral.TTS.DefaultVoice,
+		"mistral.tts.mode":                      c.Mistral.TTS.Mode,
+		"mistral.dialogue.model":                c.Mistral.Dialogue.Model,
 	}
 }

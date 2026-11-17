@@ -47,6 +47,30 @@ var registry = map[string]setter{
 	"INSTEADLY_TRANSCRIPT_ENABLED": {apply: boolSetter(func(c *Config, v bool) { c.Recording.TranscriptEnabled = v })},
 	"INSTEADLY_AUDIO_ENABLED":      {apply: boolSetter(func(c *Config, v bool) { c.Recording.AudioEnabled = v })},
 	"INSTEADLY_MISTRAL_API_KEY":    {apply: strSetter(func(c *Config, v string) { c.Mistral.APIKey = v }), secret: true},
+	"INSTEADLY_MISTRAL_API_BASE_URL": {
+		apply: strSetter(func(c *Config, v string) { c.Mistral.BaseURL = v }),
+	},
+	"INSTEADLY_MISTRAL_STT_REALTIME_MODEL": {
+		apply: strSetter(func(c *Config, v string) { c.Mistral.STT.RealtimeModel = v }),
+	},
+	"INSTEADLY_MISTRAL_STT_BATCH_MODEL": {
+		apply: strSetter(func(c *Config, v string) { c.Mistral.STT.BatchModel = v }),
+	},
+	"INSTEADLY_MISTRAL_STT_STREAMING_DELAY_MS": {
+		apply: intSetter(func(c *Config, v int) { c.Mistral.STT.StreamingDelayMS = v }),
+	},
+	"INSTEADLY_MISTRAL_TTS_MODEL": {
+		apply: strSetter(func(c *Config, v string) { c.Mistral.TTS.Model = v }),
+	},
+	"INSTEADLY_MISTRAL_TTS_VOICE": {
+		apply: strSetter(func(c *Config, v string) { c.Mistral.TTS.DefaultVoice = v }),
+	},
+	"INSTEADLY_MISTRAL_TTS_MODE": {
+		apply: strSetter(func(c *Config, v string) { c.Mistral.TTS.Mode = v }),
+	},
+	"INSTEADLY_MISTRAL_DIALOGUE_MODEL": {
+		apply: strSetter(func(c *Config, v string) { c.Mistral.Dialogue.Model = v }),
+	},
 }
 
 func strSetter(fn func(*Config, string)) func(*Config, string) error {
@@ -83,7 +107,21 @@ func defaults() Config {
 		TTS:       TTS{Provider: "stub"},
 		Dialogue:  Dialogue{Provider: "stub"},
 		Storage:   Storage{Provider: "local", Local: Local{Dir: "./data"}},
-		Log:       Log{Level: "info", Format: "text"},
+		Mistral: Mistral{
+			BaseURL: "https://api.mistral.ai",
+			STT: MistralSTT{
+				RealtimeModel:    "voxtral-mini-transcribe-realtime-3",
+				BatchModel:       "voxtral-mini-transcribe-3",
+				StreamingDelayMS: 480,
+			},
+			TTS: MistralTTS{
+				Model:        "voxtral-mini-tts-3-0",
+				DefaultVoice: "voice_447",
+				Mode:         "realtime",
+			},
+			Dialogue: MistralDialogue{Model: "mistral-small-2603"},
+		},
+		Log: Log{Level: "info", Format: "text"},
 	}
 }
 
@@ -107,6 +145,7 @@ func load(path string, environ []string) (Config, error) {
 	// A trailing slash is a common copy/paste artifact from tunnel tools and would turn
 	// webhook URLs into "https://host//webhooks/...". Normalize once, before validation.
 	c.HTTP.PublicURL = strings.TrimRight(c.HTTP.PublicURL, "/")
+	c.Mistral.BaseURL = strings.TrimRight(strings.TrimSpace(c.Mistral.BaseURL), "/")
 	if err := c.Validate(); err != nil {
 		return c, err
 	}

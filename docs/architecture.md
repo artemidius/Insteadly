@@ -87,7 +87,7 @@ interface doc comments and must be honored by every adapter.
 - `Storage`: `local`.
 - `Telephony`: `stub`, or `twilio` in `voice-api` mode (C1). `sip-trunk` still returns
   `ports.ErrNotImplemented` (C7).
-- `STT`, `TTS`, `Dialogue`: `stub`; `mistral` returns `ports.ErrNotImplemented` until C2.
+- `STT`, `TTS`, `Dialogue`: `stub`, or `mistral` (C2).
 - `Payments` and `Notify` remain `nil` until C6/C7.
 - `App.Webhooks` carries the telephony adapter's HTTP surface (nil for stub);
   `internal/httpapi` mounts it, so the JSON API package never imports an adapter.
@@ -196,12 +196,32 @@ Media Streams socket cannot send DTMF, so `SendDTMF` updates the call with TwiML
 `<Play digits="…">` and reconnects the stream; the session is reconnect-safe across stream
 IDs. This is a C1 stopgap; C4 may replace it with a more robust IVR flow.
 
+## Mistral adapters (C2)
+
+`internal/adapters/{stt,tts,dialogue}/mistral` implement `ports.SpeechToText`,
+`ports.TextToSpeech`, and `ports.Dialogue` against Mistral's raw HTTP/SSE/WebSocket APIs
+(no Go SDK). Provider concepts (model names, base64 audio, SSE frames, 24 kHz float32 PCM)
+never cross a port boundary.
+
+- **STT** (`stt/mistral`): realtime `TranscriptionStream` over WebSocket (canonical PCM16
+  16 kHz input → cumulative partials → one final on `input_audio.end`), plus batch
+  `TranscribeFile` (raw PCM → in-memory WAV → multipart POST → `domain.Transcript`).
+- **TTS** (`tts/mistral`): realtime `SpeechStream` (incremental text → float32 24 kHz audio
+  → 15-tap anti-alias + 3:2 polyphase resampling → canonical PCM16 16 kHz, 640-byte frames)
+  and an `offline` mode that POSTs `/v1/audio/speech` (`stream=true`) on `Close`.
+- **Dialogue** (`dialogue/mistral`): Chat Completions SSE with local history, fragmented
+  tool-call assembly, exact tool-result continuation, and the reserved `finish_call` outcome
+  (strict `domain.Outcome` decode + validation).
+
+See [mistral.md](mistral.md) for the exact protocols, config surface, tool/outcome contract,
+and live-test recipe.
+
 ## Extension points
 
 | Chunk | Change |
 |---|---|
 | C1 | ✅ (code) `internal/adapters/telephony/twilio` + `buildTelephony` case + `App.Webhooks`; live audio awaits a Twilio account upgrade |
-| C2 | `internal/adapters/{stt,tts,dialogue}/mistral` + three `build*` cases |
+| C2 | ✅ (code) `internal/adapters/{stt,tts,dialogue}/mistral` + three `build*` cases; live Mistral smoke passed |
 | C3 | `internal/core/agent` (loop, VAD) + `internal/core/runner`; consumes existing ports |
 | C5 | Postgres storage adapter, scheduler, SSE endpoint in `httpapi` |
 | C6/C7 | Payments and Notifier adapters; fill the `nil` fields in `app.App` |

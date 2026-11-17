@@ -175,6 +175,9 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 		"dialogue.provider", "storage.provider", "storage.local.dir",
 		"recording.enabled", "transcript.enabled", "audio.enabled",
 		"log.level", "log.format",
+		"mistral.api_base_url", "mistral.stt.realtime_model", "mistral.stt.batch_model",
+		"mistral.stt.streaming_delay_ms", "mistral.tts.model", "mistral.tts.voice",
+		"mistral.tts.mode", "mistral.dialogue.model",
 	}
 	for _, k := range wantKeys {
 		if _, ok := summary[k]; !ok {
@@ -349,5 +352,184 @@ func TestBoolValuesAccepted(t *testing.T) {
 	}
 	if !cfg.Recording.RecordingEnabled || !cfg.Recording.TranscriptEnabled || cfg.Recording.AudioEnabled {
 		t.Errorf("recording flags = %+v", cfg.Recording)
+	}
+}
+
+func TestMistralDefaults(t *testing.T) {
+	cfg, err := load("", nil)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	m := cfg.Mistral
+	if m.BaseURL != "https://api.mistral.ai" {
+		t.Errorf("base_url = %q", m.BaseURL)
+	}
+	if m.STT.RealtimeModel != "voxtral-mini-transcribe-realtime-3" ||
+		m.STT.BatchModel != "voxtral-mini-transcribe-3" || m.STT.StreamingDelayMS != 480 {
+		t.Errorf("stt defaults = %+v", m.STT)
+	}
+	if m.TTS.Model != "voxtral-mini-tts-3-0" || m.TTS.DefaultVoice != "voice_447" || m.TTS.Mode != "realtime" {
+		t.Errorf("tts defaults = %+v", m.TTS)
+	}
+	if m.Dialogue.Model != "mistral-small-2603" {
+		t.Errorf("dialogue model = %q", m.Dialogue.Model)
+	}
+	if m.APIKey != "" {
+		t.Error("api key must default empty")
+	}
+}
+
+func mistralProviderEnv() []string {
+	return []string{
+		"INSTEADLY_MISTRAL_API_KEY=test-key",
+		"INSTEADLY_STT_PROVIDER=mistral",
+		"INSTEADLY_TTS_PROVIDER=mistral",
+		"INSTEADLY_DIALOGUE_PROVIDER=mistral",
+	}
+}
+
+func TestMistralEnvOverrides(t *testing.T) {
+	env := mistralProviderEnv()
+	env = append(env,
+		"INSTEADLY_MISTRAL_API_BASE_URL=https://api.example.test/",
+		"INSTEADLY_MISTRAL_STT_REALTIME_MODEL=rt-model",
+		"INSTEADLY_MISTRAL_STT_BATCH_MODEL=batch-model",
+		"INSTEADLY_MISTRAL_STT_STREAMING_DELAY_MS=900",
+		"INSTEADLY_MISTRAL_TTS_MODEL=tts-model",
+		"INSTEADLY_MISTRAL_TTS_VOICE=voice_999",
+		"INSTEADLY_MISTRAL_TTS_MODE=offline",
+		"INSTEADLY_MISTRAL_DIALOGUE_MODEL=dialogue-model",
+	)
+	cfg, err := load("", env)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	m := cfg.Mistral
+	if m.BaseURL != "https://api.example.test" {
+		t.Errorf("base_url = %q (want trailing slash trimmed)", m.BaseURL)
+	}
+	if m.STT.RealtimeModel != "rt-model" || m.STT.BatchModel != "batch-model" || m.STT.StreamingDelayMS != 900 {
+		t.Errorf("stt = %+v", m.STT)
+	}
+	if m.TTS.Model != "tts-model" || m.TTS.DefaultVoice != "voice_999" || m.TTS.Mode != "offline" {
+		t.Errorf("tts = %+v", m.TTS)
+	}
+	if m.Dialogue.Model != "dialogue-model" {
+		t.Errorf("dialogue model = %q", m.Dialogue.Model)
+	}
+}
+
+func TestMistralBaseURLValidation(t *testing.T) {
+	valid := []string{
+		"https://api.mistral.ai",
+		"https://api.mistral.ai/",
+		"https://example.test:8443",
+	}
+	for _, raw := range valid {
+		t.Run("valid "+raw, func(t *testing.T) {
+			if _, err := load("", []string{"INSTEADLY_MISTRAL_API_BASE_URL=" + raw}); err != nil {
+				t.Fatalf("load(%q): %v", raw, err)
+			}
+		})
+	}
+	invalid := []string{
+		"http://api.mistral.ai", "https://", "https://api.mistral.ai/v1",
+		"https://user:pass@api.mistral.ai", "https://api.mistral.ai?x=1",
+		"https://api.mistral.ai#frag", "",
+	}
+	for _, raw := range invalid {
+		t.Run("invalid "+raw, func(t *testing.T) {
+			_, err := load("", []string{"INSTEADLY_MISTRAL_API_BASE_URL=" + raw})
+			if err == nil || !strings.Contains(err.Error(), "mistral.api_base_url") {
+				t.Fatalf("load(%q) err = %v, want base_url error", raw, err)
+			}
+		})
+	}
+}
+
+func TestMistralDelayValidation(t *testing.T) {
+	accepted := []string{"80", "480", "1200", "2400"}
+	for _, v := range accepted {
+		t.Run("ok "+v, func(t *testing.T) {
+			if _, err := load("", []string{"INSTEADLY_MISTRAL_STT_STREAMING_DELAY_MS=" + v}); err != nil {
+				t.Fatalf("load(%s): %v", v, err)
+			}
+		})
+	}
+	rejected := []string{"79", "1201", "2401", "0", "not-an-int"}
+	for _, v := range rejected {
+		t.Run("bad "+v, func(t *testing.T) {
+			_, err := load("", []string{"INSTEADLY_MISTRAL_STT_STREAMING_DELAY_MS=" + v})
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), "streaming_delay_ms") {
+				t.Fatalf("load(%s) err = %v, want streaming_delay_ms error", v, err)
+			}
+		})
+	}
+}
+
+func TestMistralModelAndVoiceValidation(t *testing.T) {
+	cases := map[string]string{
+		"stt realtime model empty": "INSTEADLY_MISTRAL_STT_REALTIME_MODEL=",
+		"stt realtime model space": "INSTEADLY_MISTRAL_STT_REALTIME_MODEL= model ",
+		"stt batch model empty":    "INSTEADLY_MISTRAL_STT_BATCH_MODEL=",
+		"tts model empty":          "INSTEADLY_MISTRAL_TTS_MODEL=",
+		"tts voice empty":          "INSTEADLY_MISTRAL_TTS_VOICE=",
+		"tts voice space":          "INSTEADLY_MISTRAL_TTS_VOICE= voice_1 ",
+		"dialogue model empty":     "INSTEADLY_MISTRAL_DIALOGUE_MODEL=",
+	}
+	for name, kv := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := load("", []string{kv})
+			if err == nil {
+				t.Fatalf("expected error for %q", kv)
+			}
+		})
+	}
+}
+
+func TestMistralTTSModeValidation(t *testing.T) {
+	if _, err := load("", []string{"INSTEADLY_MISTRAL_TTS_MODE=offline"}); err != nil {
+		t.Fatalf("offline mode rejected: %v", err)
+	}
+	_, err := load("", []string{"INSTEADLY_MISTRAL_TTS_MODE=hybrid"})
+	if err == nil || !strings.Contains(err.Error(), "mistral.tts.mode") {
+		t.Fatalf("err = %v, want tts.mode error", err)
+	}
+}
+
+func TestMistralAPIKeyRequiredPerProvider(t *testing.T) {
+	providers := []string{
+		"INSTEADLY_STT_PROVIDER=mistral",
+		"INSTEADLY_TTS_PROVIDER=mistral",
+		"INSTEADLY_DIALOGUE_PROVIDER=mistral",
+	}
+	for _, kv := range providers {
+		t.Run(kv, func(t *testing.T) {
+			_, err := load("", []string{kv})
+			if err == nil || !strings.Contains(err.Error(), "mistral.api_key") {
+				t.Fatalf("err = %v, want mistral.api_key error", err)
+			}
+		})
+	}
+}
+
+func TestMistralAPIKeyOptionalForAllStub(t *testing.T) {
+	if _, err := load("", nil); err != nil {
+		t.Fatalf("all-stub without key rejected: %v", err)
+	}
+}
+
+func TestUnprefixedMistralKeyIgnored(t *testing.T) {
+	cfg, err := load("", []string{
+		"MISTRAL_API_KEY=unprefixed",
+		"INSTEADLY_STT_PROVIDER=mistral",
+	})
+	if err == nil {
+		t.Fatal("expected missing-key error: unprefixed key must not satisfy app config")
+	} else if !strings.Contains(err.Error(), "mistral.api_key") {
+		t.Fatalf("err = %v, want mistral.api_key error", err)
+	}
+	if cfg.Mistral.APIKey != "" {
+		t.Error("unprefixed MISTRAL_API_KEY must not be read into app config")
 	}
 }

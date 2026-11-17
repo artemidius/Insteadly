@@ -15,6 +15,9 @@ test:
 live-test:
 	go test -tags live -count=1 -run TestLiveCall -v ./internal/app
 
+live-test-mistral:
+	go test -tags live -count=1 -run '^TestLiveMistral$$' -v ./internal/app
+
 cover:
 	go test -race -count=1 -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tail -n 1
