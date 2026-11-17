@@ -37,11 +37,13 @@ func (s *Store) Create(ctx context.Context, o domain.Order) (domain.Order, error
 	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO orders (
 			id, status, clinic, patient, outcome, recording,
-			created_at, updated_at, attempts, next_attempt_at, attempt_history
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			created_at, updated_at, attempts, next_attempt_at, attempt_history,
+			user_id, paid_at, payment_reference
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 		ON CONFLICT (id) DO NOTHING`,
 		string(o.ID), string(o.Status), enc.clinic, enc.patient, enc.outcome, enc.recording,
 		o.CreatedAt, o.UpdatedAt, o.Attempts, o.NextAttemptAt, enc.history,
+		enc.userID, enc.paidAt, enc.paymentReference,
 	)
 	if err != nil {
 		return domain.Order{}, fmt.Errorf("postgres: create order %s: %w", o.ID, err)
@@ -133,10 +135,11 @@ func (s *Store) Update(ctx context.Context, id domain.OrderID, fn func(*domain.O
 		UPDATE orders SET
 			status = $2, clinic = $3, patient = $4, outcome = $5, recording = $6,
 			created_at = $7, updated_at = $8, attempts = $9, next_attempt_at = $10,
-			attempt_history = $11
+			attempt_history = $11, user_id = $12, paid_at = $13, payment_reference = $14
 		WHERE id = $1`,
 		string(order.ID), string(order.Status), enc.clinic, enc.patient, enc.outcome, enc.recording,
 		order.CreatedAt, order.UpdatedAt, order.Attempts, order.NextAttemptAt, enc.history,
+		enc.userID, enc.paidAt, enc.paymentReference,
 	); err != nil {
 		return domain.Order{}, fmt.Errorf("postgres: update order %s: write: %w", id, err)
 	}

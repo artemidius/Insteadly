@@ -71,7 +71,7 @@ func newTestStore(t *testing.T) *pgstore.Store {
 		store.Close()
 		t.Fatalf("pgx.Connect: %v", err)
 	}
-	if _, err := conn.Exec(ctx, `TRUNCATE orders`); err != nil {
+	if _, err := conn.Exec(ctx, `TRUNCATE orders, sessions, users CASCADE`); err != nil {
 		_ = conn.Close(ctx)
 		store.Close()
 		t.Fatalf("truncate orders: %v", err)

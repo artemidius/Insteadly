@@ -31,6 +31,11 @@ type Store struct {
 	mu     sync.RWMutex
 	dir    string
 	leases map[domain.OrderID]lease
+
+	// authMu guards the persisted users file and the in-memory session map. It is
+	// separate from mu so auth traffic cannot contend with order writes.
+	authMu   sync.RWMutex
+	sessions map[string]domain.Session
 }
 
 // lease is one in-memory scheduler claim held by owner until until.
@@ -51,7 +56,11 @@ func New(dir string) (*Store, error) {
 			return nil, fmt.Errorf("local storage: create %s: %w", p, err)
 		}
 	}
-	return &Store{dir: dir, leases: make(map[domain.OrderID]lease)}, nil
+	return &Store{
+		dir:      dir,
+		leases:   make(map[domain.OrderID]lease),
+		sessions: make(map[string]domain.Session),
+	}, nil
 }
 
 // Orders returns the order store (the Store itself).

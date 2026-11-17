@@ -258,8 +258,9 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := conn.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&migrations); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if migrations != 1 {
-		t.Errorf("schema_migrations = %d, want 1", migrations)
+	// 0001_orders + C6's 0002_users.
+	if migrations != 2 {
+		t.Errorf("schema_migrations = %d, want 2", migrations)
 	}
 }
 
