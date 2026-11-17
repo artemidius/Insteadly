@@ -281,7 +281,10 @@ func TestIvrHumanActivityCancelsPostDigitTimeout(t *testing.T) {
 	}}
 	dlg := textOnlyDialogue("Gerne.")
 	cfg.Dialogue = dlg
-	cfg.IVRWaitTimeout = 60 * time.Millisecond
+	// Generous window so CI scheduling cannot fire the menu timeout before the human final
+	// is processed; the invariant under test is that a human turn clears the stale timer,
+	// not that the human final arrives within a few scheduling ticks.
+	cfg.IVRWaitTimeout = time.Second
 	c := startConversation(t, cfg)
 	c.call.push(utteranceAudio()...)
 	waitFor(t, "digit sent", func() bool {
@@ -297,7 +300,7 @@ func TestIvrHumanActivityCancelsPostDigitTimeout(t *testing.T) {
 		return len(dlg.texts) == 1
 	})
 	// Wait past the original IVR deadline: the stale timer must not fire a dead end.
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(1200 * time.Millisecond)
 	select {
 	case r := <-c.done:
 		t.Fatalf("stale IVR timeout fired after a human turn: outcome=%+v err=%v", r.outcome, r.err)

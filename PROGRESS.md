@@ -167,6 +167,11 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
   in the `second` barge utterance. `awaitAudioGrowth` now needs only
   `liveReplyGrowthFrames = 5` new frames (100 ms), so a short-but-real reply is not rejected.
   No production change. Dated details in `plans/05-conversation.md` §13.
+- **CI deflake (test only):** PR #8's first CI run exposed the post-review
+  `TestIvrHumanActivityCancelsPostDigitTimeout` using a 60 ms menu window; under CI
+  scheduling the human final could arrive after the timeout. The window is now 1 s with a
+  1.2 s post-turn wait (the invariant is stale-timer clearing, not tight timing); the test
+  passed `-race -count=100` locally. No production change.
 - **Status:** C4 → 🔵 code complete pending the conductor's next `make live-test-m1` run
   after the pacing and script harness fixes. Real-phone M1 remains blocked by the Twilio
   trial/outbound-DTMF/controlled IVR+hold prerequisites; C1 and the real-phone M0 exit
