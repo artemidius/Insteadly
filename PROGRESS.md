@@ -110,6 +110,29 @@ observed; the real-phone M0 exit still waits on the Twilio account upgrade.
 - **Environment:** no new `.env`/`INSTEADLY_*` keys and no new module dependencies; the
   real key/phone/Twilio config were not read, and no live test or phone call was run. The
   sandbox needed `GOCACHE=/tmp/insteadly-go-cache` for Go builds/tests.
+- **Post-review fixes (PR #3):** added `agent.LimitError`/`agent.IsLimit` so listen/
+  silence timeout, repeated empty transcript, max turns, max tool rounds, and the agent's
+  own max-call duration map to `failed/other` (provider deadlines stay `failed/error`);
+  made the post-answer relay cancelable and drain-until-channel-close with an awaited
+  shutdown on every exit (stack-trace leak test); fixed the `StreamReady` timer so events
+  cannot reset the 20 s bound; rejected JSON `null`/wrong-type optional tool arguments and
+  raw invalid UTF-8 in `capture_info`; wrapped the lost same-`Get` claim race with
+  `domain.ErrInvalidTransition`; asserted the exact integration STT byte sequence and
+  broader log hygiene; fixed the docs `.env` wording, plan whitespace, and the live-test
+  failure text. New tests include `TestRunAgentConversationLimitsMapToFailedOther`,
+  `TestRunProviderDeadlineIsFailedError`, `TestRunClaimLostAfterGetWrapsInvalidTransition`,
+  `TestRunReadinessTimeoutNotResetByEvents`, `TestEventRelayShutdownStopsBlockedDrain`,
+  `TestEventRelayDrainsUntilChannelClose`, `TestRunSilentHangupDoesNotLeakRelay`,
+  `TestOptionalToolFieldsRejectNullAndWrongTypes`,
+  `TestCaptureInfoRejectsNullAndInvalidUTF8`, and the agent limit assertions. No live test
+  was run; C3 remains 🔵.
+- **Post-review verification (observed):** `make verify` green (gofmt/vet, all race tests
+  `ok`, `OK: core imports no adapters`, binary built); `golangci-lint v2.15.0` → **0
+  issues**; `make cover` → **87.3 %** total, **agent 93.3 %**, **runner 93.2 %**;
+  `go test -race -count=10 ./internal/core/agent ./internal/core/runner ./internal/app` →
+  green; both live tests **SKIP**; `go mod tidy` no drift (still only
+  `github.com/coder/websocket v1.8.15`); contract drift empty; `git diff --check
+  main...HEAD` clean (plan whitespace fixed).
 
 ### 2026-11-17 — C2 implementation session (Europe/Vienna)
 

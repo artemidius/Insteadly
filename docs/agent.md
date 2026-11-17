@@ -298,6 +298,8 @@ LIVE_MISTRAL=1 MISTRAL_API_KEY=... make live-test-m0
 LIVE_M0_PHONE=1 LIVE_TWILIO=1 LIVE_MISTRAL=1 ... make live-test-m0-phone
 ```
 
-Live tests read their unprefixed test gates directly and never read `.env`; they must
-compile and SKIP without the gates. There are no new `INSTEADLY_*` variables or `Summary`
+The no-phone live test reads its unprefixed gates directly and never reads `.env` or Twilio
+configuration. The real-phone harness additionally calls `config.Load` (which may read
+`.env`) only after every one of its gates passes. Both must compile and SKIP without their
+gates. There are no new `INSTEADLY_*` variables or `Summary`
 keys, and no new module dependencies.
