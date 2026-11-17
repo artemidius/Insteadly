@@ -5,10 +5,13 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/artemidius/insteadly/internal/core/agent"
 	"github.com/artemidius/insteadly/internal/core/domain"
+	"github.com/artemidius/insteadly/internal/core/events"
 )
 
 func relayTestLogger() *slog.Logger {
@@ -271,4 +274,192 @@ func TestRunnerControlOverflowNeverPersistsAValidOutcome(t *testing.T) {
 	if session.hangups() != 1 {
 		t.Errorf("hangup count = %d, want 1", session.hangups())
 	}
+}
+
+// recordingPublisher captures events for assertions.
+type recordingPublisher struct {
+	mu   sync.Mutex
+	got  []events.OrderEvent
+	note chan struct{}
+}
+
+func newRecordingPublisher() *recordingPublisher {
+	return &recordingPublisher{note: make(chan struct{}, 1)}
+}
+
+func (p *recordingPublisher) Publish(_ context.Context, ev events.OrderEvent) error {
+	p.mu.Lock()
+	p.got = append(p.got, ev)
+	p.mu.Unlock()
+	select {
+	case p.note <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (p *recordingPublisher) events() []events.OrderEvent {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]events.OrderEvent(nil), p.got...)
+}
+
+func (p *recordingPublisher) waitForStatus(t *testing.T, status domain.OrderStatus) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		for _, ev := range p.events() {
+			if ev.Status == status {
+				return
+			}
+		}
+		select {
+		case <-p.note:
+		case <-deadline:
+			t.Fatalf("event %q was not published", status)
+		}
+	}
+}
+
+func testRunnerWithEvents(t *testing.T, store *fakeStore, telephony *fakeTelephony, ag agent.Engine, pub events.Publisher) *Runner {
+	t.Helper()
+	r, err := New(Config{
+		Telephony:      telephony,
+		Orders:         store,
+		Agent:          ag,
+		Events:         pub,
+		CleanupTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return r
+}
+
+func TestRunnerPublishesStatusEvents(t *testing.T) {
+	order := testOrder()
+	store := newFakeStore(order)
+	session := newFakeSession()
+	pub := newRecordingPublisher()
+	r := testRunnerWithEvents(t, store, &fakeTelephony{session: session}, newFakeAgent(bookedOutcome(), nil), pub)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Run(context.Background(), order.ID)
+		done <- err
+	}()
+	session.send(domain.CallEvent{Kind: domain.EventDialing})
+	session.send(domain.CallEvent{Kind: domain.EventRinging})
+	session.send(domain.CallEvent{Kind: domain.EventAnswered})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner did not return")
+	}
+
+	got := pub.events()
+	want := []domain.OrderStatus{domain.OrderDialing, domain.OrderRinging, domain.OrderInCall, domain.OrderFinished}
+	if len(got) != len(want) {
+		t.Fatalf("events = %d (%v), want %d", len(got), statusesOf(got), len(want))
+	}
+	for i, status := range want {
+		if got[i].Status != status {
+			t.Errorf("event[%d] status = %q, want %q", i, got[i].Status, status)
+		}
+		if got[i].OrderID != order.ID {
+			t.Errorf("event[%d] order = %s, want %s", i, got[i].OrderID, order.ID)
+		}
+		if got[i].Attempts != 1 {
+			t.Errorf("event[%d] attempts = %d, want 1", i, got[i].Attempts)
+		}
+		if got[i].At.IsZero() {
+			t.Errorf("event[%d] has no timestamp", i)
+		}
+	}
+	if got[0].Outcome != nil {
+		t.Errorf("dialing event carries an outcome: %+v", got[0].Outcome)
+	}
+	if got[3].Outcome == nil || got[3].Outcome.Kind != domain.OutcomeBooked {
+		t.Errorf("finished event outcome = %+v, want booked", got[3].Outcome)
+	}
+}
+
+func TestRunnerPublishesFailureEvent(t *testing.T) {
+	order := testOrder()
+	store := newFakeStore(order)
+	session := newFakeSession()
+	pub := newRecordingPublisher()
+	r := testRunnerWithEvents(t, store, &fakeTelephony{session: session}, newFakeAgent(domain.Outcome{}, nil), pub)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Run(context.Background(), order.ID)
+		done <- err
+	}()
+	session.send(domain.CallEvent{Kind: domain.EventDialing})
+	session.send(domain.CallEvent{Kind: domain.EventRinging})
+	session.end(domain.EndBusy)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("remote busy is an expected outcome, got err = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not return")
+	}
+
+	got := pub.events()
+	if len(got) != 3 {
+		t.Fatalf("events = %v, want dialing, ringing, finished", statusesOf(got))
+	}
+	last := got[len(got)-1]
+	if last.Status != domain.OrderFinished || last.Outcome == nil ||
+		last.Outcome.Kind != domain.OutcomeFailed || last.Outcome.FailReason != "busy" {
+		t.Fatalf("terminal event = %+v", last)
+	}
+}
+
+func TestRunnerPublishesAbortedOnShutdown(t *testing.T) {
+	order := testOrder()
+	store := newFakeStore(order)
+	session := newFakeSession()
+	pub := newRecordingPublisher()
+	r := testRunnerWithEvents(t, store, &fakeTelephony{session: session}, newFakeAgent(domain.Outcome{}, nil), pub)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Run(context.Background(), order.ID)
+		done <- err
+	}()
+	pub.waitForStatus(t, domain.OrderDialing)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := r.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not return after Close")
+	}
+	got := pub.events()
+	if len(got) < 2 {
+		t.Fatalf("events = %v, want at least dialing+finished", statusesOf(got))
+	}
+	last := got[len(got)-1]
+	if last.Status != domain.OrderFinished || last.Outcome == nil || last.Outcome.Kind != domain.OutcomeAborted {
+		t.Fatalf("terminal event = %+v, want finished/aborted", last)
+	}
+}
+
+func statusesOf(evs []events.OrderEvent) []domain.OrderStatus {
+	out := make([]domain.OrderStatus, len(evs))
+	for i, ev := range evs {
+		out[i] = ev.Status
+	}
+	return out
 }

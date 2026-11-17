@@ -40,6 +40,23 @@ type Order struct {
 	CreatedAt time.Time       `json:"created_at"`
 	UpdatedAt time.Time       `json:"updated_at"`
 	Attempts  int             `json:"attempts"`
+
+	// NextAttemptAt is the due time for the next dial (C5 scheduler). nil/zero means
+	// "due immediately" and is only meaningful while the order is scheduled.
+	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
+	// AttemptHistory is the append-only record of prior finished attempts, oldest
+	// first. It is what makes callback rescheduling a history-preserving requeue.
+	AttemptHistory []AttemptRecord `json:"attempt_history,omitempty"`
+}
+
+// AttemptRecord is one completed dial attempt in the order's durable history. It is
+// append-only; Requeue appends to it so a callback reschedule never erases evidence of
+// earlier attempts.
+type AttemptRecord struct {
+	Number    int       `json:"number"`     // 1-based; equals the order.Attempts at that attempt's claim
+	Outcome   Outcome   `json:"outcome"`    // the terminal outcome of that attempt
+	StartedAt time.Time `json:"started_at"` // when the attempt was claimed (dialing); best-effort
+	EndedAt   time.Time `json:"ended_at"`   // when the attempt finished
 }
 
 // Clinic is the practice to be called.
@@ -130,6 +147,63 @@ func (o *Order) Finish(out Outcome) error {
 	}
 	o.Outcome = &out
 	o.Status = OrderFinished
+	o.UpdatedAt = time.Now()
+	return nil
+}
+
+// Schedule marks a paid order eligible to dial at next. It is the only way an order
+// enters "scheduled" except Requeue. next may be nil (due immediately) or a future time.
+func (o *Order) Schedule(next *time.Time) error {
+	if o.Status == OrderScheduled {
+		return fmt.Errorf("%w: already scheduled", ErrInvalidTransition)
+	}
+	if o.Status != OrderPaid {
+		return fmt.Errorf("%w: schedule from %q", ErrInvalidTransition, o.Status)
+	}
+	o.Status = OrderScheduled
+	o.NextAttemptAt = next
+	o.UpdatedAt = time.Now()
+	return nil
+}
+
+// Requeue re-opens a finished order into a fresh scheduled attempt, preserving history.
+// It is the ONLY path from "finished" back to "scheduled"; the spine transition table is
+// deliberately not extended (see the transitions comment).
+//
+// Guardrails, enforced here and again by the scheduler:
+//  1. Only a FINISHED order may be requeued.
+//  2. The finished outcome must be retryable: callback_needed, or failed with a reason
+//     the scheduler classifies as retryable. booked and aborted are never requeued.
+//  3. callback_needed requires a non-zero CallbackAt.
+//  4. The scheduler enforces the attempt cap; Requeue records history but does not decide
+//     whether another attempt is allowed.
+func (o *Order) Requeue(next *time.Time) error {
+	if o.Status != OrderFinished || o.Outcome == nil {
+		return fmt.Errorf("%w: requeue requires a finished order with an outcome", ErrInvalidTransition)
+	}
+	switch o.Outcome.Kind {
+	case OutcomeCallbackNeeded:
+		if o.Outcome.CallbackAt == nil || o.Outcome.CallbackAt.IsZero() {
+			return fmt.Errorf("%w: callback_needed requires callback_at", ErrInvalidOutcome)
+		}
+	case OutcomeFailed:
+		// FailReason retryability is scheduler policy; Requeue only demands a reason.
+		if o.Outcome.FailReason == "" {
+			return fmt.Errorf("%w: failed requires fail_reason", ErrInvalidOutcome)
+		}
+	default:
+		return fmt.Errorf("%w: outcome %q is not requeueable", ErrInvalidTransition, o.Outcome.Kind)
+	}
+
+	o.AttemptHistory = append(o.AttemptHistory, AttemptRecord{
+		Number:    o.Attempts,
+		Outcome:   *o.Outcome,
+		StartedAt: o.UpdatedAt, // last persisted transition time; best-effort start evidence
+		EndedAt:   time.Now(),
+	})
+	o.Outcome = nil
+	o.Status = OrderScheduled
+	o.NextAttemptAt = next
 	o.UpdatedAt = time.Now()
 	return nil
 }

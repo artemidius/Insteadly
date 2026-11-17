@@ -15,6 +15,7 @@ import (
 
 	"github.com/artemidius/insteadly/internal/core/agent"
 	"github.com/artemidius/insteadly/internal/core/domain"
+	"github.com/artemidius/insteadly/internal/core/events"
 	"github.com/artemidius/insteadly/internal/core/ports"
 )
 
@@ -34,6 +35,11 @@ type Config struct {
 	Orders    ports.OrderStore
 	Agent     agent.Engine
 	Logger    *slog.Logger
+
+	// Events is optional: when set, the runner publishes one OrderEvent after each
+	// persisted status change (dialing, ringing, in_call, finished). A nil publisher
+	// is a no-op, so neither tests nor non-orchestrated callers need a hub.
+	Events events.Publisher
 
 	CallTimeout      time.Duration
 	CleanupTimeout   time.Duration
@@ -121,6 +127,7 @@ func (r *Runner) Run(callerCtx context.Context, id domain.OrderID) (domain.Order
 	if err != nil {
 		return order, fmt.Errorf("runner: claim order %s: %w", id, err)
 	}
+	r.publish(runCtx, claimed)
 
 	callCtx, cancelCall := context.WithTimeout(runCtx, r.cfg.CallTimeout)
 	defer cancelCall()
@@ -294,6 +301,7 @@ func (r *Runner) handlePreAgentEvent(ctx context.Context, id domain.OrderID, st 
 				return fmt.Errorf("runner: order %s ringing: %w", id, err)
 			}
 			st.order = updated
+			r.publish(ctx, st.order)
 		case domain.OrderRinging:
 			// duplicate
 		default:
@@ -307,6 +315,7 @@ func (r *Runner) handlePreAgentEvent(ctx context.Context, id domain.OrderID, st 
 				return fmt.Errorf("runner: order %s answered: %w", id, err)
 			}
 			st.order = updated
+			r.publish(ctx, st.order)
 			st.answered = true
 		case domain.OrderInCall:
 			// duplicate answered; never start a second agent
@@ -400,7 +409,23 @@ func (r *Runner) persist(ctx context.Context, id domain.OrderID, outcome domain.
 	if err != nil {
 		return last, fmt.Errorf("runner: finalize order %s: %w", id, err)
 	}
+	r.publish(fctx, final)
 	return final, nil
+}
+
+// publish emits one optional status event. Event delivery is best-effort: the hub is
+// non-blocking and a nil publisher is valid, so a publish failure never fails a call.
+func (r *Runner) publish(ctx context.Context, o domain.Order) {
+	if r.cfg.Events == nil {
+		return
+	}
+	_ = r.cfg.Events.Publish(ctx, events.OrderEvent{
+		OrderID:  o.ID,
+		Status:   o.Status,
+		Outcome:  o.Outcome,
+		Attempts: o.Attempts,
+		At:       time.Now(),
+	})
 }
 
 // newHangup returns a once-only hangup using a context independent of the canceled call.
