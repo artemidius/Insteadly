@@ -163,6 +163,9 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 		apiKey        = "super-secret-api-key"
 		stripeKey     = "sk_live_super_secret_stripe_key"
 		stripeWebhook = "whsec_super_secret_webhook"
+		telnyxKey     = "KEY_super_secret_telnyx"
+		openAIKey     = "sk-super-secret-openai"
+		notifyURL     = "https://hooks.example.test/super-secret-path"
 	)
 	cfg, err := load("", []string{
 		"INSTEADLY_TWILIO_ACCOUNT_SID=" + sid,
@@ -172,6 +175,10 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 		"INSTEADLY_API_KEY=" + apiKey,
 		"INSTEADLY_STRIPE_SECRET_KEY=" + stripeKey,
 		"INSTEADLY_STRIPE_WEBHOOK_SECRET=" + stripeWebhook,
+		"INSTEADLY_TELNYX_API_KEY=" + telnyxKey,
+		"INSTEADLY_OPENAI_API_KEY=" + openAIKey,
+		"INSTEADLY_NOTIFY_PROVIDER=webhook",
+		"INSTEADLY_NOTIFY_WEBHOOK_URL=" + notifyURL,
 	})
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -193,6 +200,10 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 		"api.idempotency_ttl",
 		"auth.mode", "auth.session_ttl", "auth.cookie_name", "auth.bcrypt_cost",
 		"payments.provider", "stripe.secret_key", "stripe.webhook_secret", "stripe.price_id",
+		"telephony.telnyx.connection_id", "telephony.telnyx.from_number",
+		"telephony.telnyx.ring_timeout_seconds", "telnyx.api_key",
+		"openai.base_url", "openai.dialogue_model", "openai.api_key",
+		"notify.provider", "notify.webhook.channel", "notify.webhook.url",
 	}
 	for _, k := range wantKeys {
 		if _, ok := summary[k]; !ok {
@@ -212,14 +223,14 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 				t.Errorf("summary key %q looks secret but is not redacted: %v", k, v)
 			}
 		}
-		for _, secret := range []string{sid, token, key, dsn, apiKey, stripeKey, stripeWebhook, "super-secret-dsn-password"} {
+		for _, secret := range []string{sid, token, key, dsn, apiKey, stripeKey, stripeWebhook, telnyxKey, openAIKey, notifyURL, "super-secret-dsn-password"} {
 			if strings.Contains(str, secret) {
 				t.Errorf("summary key %q leaks a secret value", k)
 			}
 		}
 	}
 
-	for _, key := range []string{"postgres.dsn", "stripe.secret_key", "stripe.webhook_secret"} {
+	for _, key := range []string{"postgres.dsn", "stripe.secret_key", "stripe.webhook_secret", "telnyx.api_key", "openai.api_key", "notify.webhook.url"} {
 		if got := summary[key]; got != "<redacted>" {
 			t.Errorf("%s = %v, want <redacted>", key, got)
 		}
@@ -232,7 +243,7 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 		}
 		if !strings.Contains(name, "SID") && !strings.Contains(name, "TOKEN") &&
 			!strings.Contains(name, "KEY") && !strings.Contains(name, "DSN") &&
-			!strings.Contains(name, "SECRET") {
+			!strings.Contains(name, "SECRET") && !strings.Contains(name, "URL") {
 			t.Errorf("registry entry %q is marked secret but its name does not look secret", name)
 		}
 	}

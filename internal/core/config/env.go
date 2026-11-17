@@ -39,6 +39,22 @@ var registry = map[string]setter{
 	"INSTEADLY_TWILIO_RING_TIMEOUT_SECONDS": {
 		apply: intSetter(func(c *Config, v int) { c.Telephony.Twilio.RingTimeoutSeconds = v }),
 	},
+	"INSTEADLY_TELNYX_API_KEY": {
+		apply:  strSetter(func(c *Config, v string) { c.Telephony.Telnyx.APIKey = v }),
+		secret: true,
+	},
+	"INSTEADLY_TELNYX_CONNECTION_ID": {
+		apply: strSetter(func(c *Config, v string) { c.Telephony.Telnyx.ConnectionID = v }),
+	},
+	"INSTEADLY_TELNYX_FROM_NUMBER": {
+		apply: strSetter(func(c *Config, v string) { c.Telephony.Telnyx.FromNumber = v }),
+	},
+	"INSTEADLY_TELNYX_RING_TIMEOUT_SECONDS": {
+		apply: intSetter(func(c *Config, v int) { c.Telephony.Telnyx.RingTimeoutSeconds = v }),
+	},
+	"INSTEADLY_TELNYX_WEBHOOK_PUBLIC_KEY": {
+		apply: strSetter(func(c *Config, v string) { c.Telephony.Telnyx.WebhookPublicKey = v }),
+	},
 	"INSTEADLY_STT_PROVIDER":      {apply: strSetter(func(c *Config, v string) { c.STT.Provider = v })},
 	"INSTEADLY_TTS_PROVIDER":      {apply: strSetter(func(c *Config, v string) { c.TTS.Provider = v })},
 	"INSTEADLY_DIALOGUE_PROVIDER": {apply: strSetter(func(c *Config, v string) { c.Dialogue.Provider = v })},
@@ -97,7 +113,27 @@ var registry = map[string]setter{
 	"INSTEADLY_RECORDING_ENABLED":  {apply: boolSetter(func(c *Config, v bool) { c.Recording.RecordingEnabled = v })},
 	"INSTEADLY_TRANSCRIPT_ENABLED": {apply: boolSetter(func(c *Config, v bool) { c.Recording.TranscriptEnabled = v })},
 	"INSTEADLY_AUDIO_ENABLED":      {apply: boolSetter(func(c *Config, v bool) { c.Recording.AudioEnabled = v })},
-	"INSTEADLY_MISTRAL_API_KEY":    {apply: strSetter(func(c *Config, v string) { c.Mistral.APIKey = v }), secret: true},
+	"INSTEADLY_OPENAI_API_KEY": {
+		apply:  strSetter(func(c *Config, v string) { c.OpenAI.APIKey = v }),
+		secret: true,
+	},
+	"INSTEADLY_OPENAI_BASE_URL": {
+		apply: strSetter(func(c *Config, v string) { c.OpenAI.BaseURL = v }),
+	},
+	"INSTEADLY_OPENAI_DIALOGUE_MODEL": {
+		apply: strSetter(func(c *Config, v string) { c.OpenAI.DialogueModel = v }),
+	},
+	"INSTEADLY_NOTIFY_PROVIDER": {
+		apply: strSetter(func(c *Config, v string) { c.Notify.Provider = v }),
+	},
+	"INSTEADLY_NOTIFY_WEBHOOK_URL": {
+		apply:  strSetter(func(c *Config, v string) { c.Notify.Webhook.URL = v }),
+		secret: true,
+	},
+	"INSTEADLY_NOTIFY_WEBHOOK_CHANNEL": {
+		apply: strSetter(func(c *Config, v string) { c.Notify.Webhook.Channel = v }),
+	},
+	"INSTEADLY_MISTRAL_API_KEY": {apply: strSetter(func(c *Config, v string) { c.Mistral.APIKey = v }), secret: true},
 	"INSTEADLY_MISTRAL_API_BASE_URL": {
 		apply: strSetter(func(c *Config, v string) { c.Mistral.BaseURL = v }),
 	},
@@ -188,6 +224,11 @@ func defaults() Config {
 			BcryptCost: 12,
 		},
 		Payments: Payments{Provider: "stub"},
+		Notify:   Notify{Provider: "off", Webhook: NotifyWebhook{Channel: "email"}},
+		OpenAI: OpenAI{
+			BaseURL:       "https://api.openai.com/v1",
+			DialogueModel: "gpt-4o-mini",
+		},
 		Mistral: Mistral{
 			BaseURL: "https://api.mistral.ai",
 			STT: MistralSTT{
@@ -227,14 +268,25 @@ func load(path string, environ []string) (Config, error) {
 	// webhook URLs into "https://host//webhooks/...". Normalize once, before validation.
 	c.HTTP.PublicURL = strings.TrimRight(c.HTTP.PublicURL, "/")
 	c.Mistral.BaseURL = strings.TrimRight(strings.TrimSpace(c.Mistral.BaseURL), "/")
-	// Secret-safe normalization: trim every new C6 string before validation. Values are
-	// never logged or echoed in errors.
+	c.OpenAI.BaseURL = strings.TrimRight(strings.TrimSpace(c.OpenAI.BaseURL), "/")
+	// Secret-safe normalization: trim every new C6/C7 string before validation. Values
+	// are never logged or echoed in errors.
 	c.Auth.Mode = strings.TrimSpace(c.Auth.Mode)
 	c.Auth.CookieName = strings.TrimSpace(c.Auth.CookieName)
 	c.Payments.Provider = strings.TrimSpace(c.Payments.Provider)
 	c.Payments.Stripe.SecretKey = strings.TrimSpace(c.Payments.Stripe.SecretKey)
 	c.Payments.Stripe.WebhookSecret = strings.TrimSpace(c.Payments.Stripe.WebhookSecret)
 	c.Payments.Stripe.PriceID = strings.TrimSpace(c.Payments.Stripe.PriceID)
+	c.Telephony.Telnyx.APIKey = strings.TrimSpace(c.Telephony.Telnyx.APIKey)
+	c.Telephony.Telnyx.ConnectionID = strings.TrimSpace(c.Telephony.Telnyx.ConnectionID)
+	c.Telephony.Telnyx.FromNumber = strings.TrimSpace(c.Telephony.Telnyx.FromNumber)
+	c.Telephony.Telnyx.WebhookPublicKey = strings.TrimSpace(c.Telephony.Telnyx.WebhookPublicKey)
+	c.OpenAI.APIKey = strings.TrimSpace(c.OpenAI.APIKey)
+	// The model is compared verbatim to a provider id; trim would hide a copy/paste
+	// error, so it is validated with checkNonEmptyTrim instead of normalized here.
+	c.Notify.Provider = strings.TrimSpace(c.Notify.Provider)
+	c.Notify.Webhook.URL = strings.TrimSpace(c.Notify.Webhook.URL)
+	c.Notify.Webhook.Channel = strings.TrimSpace(c.Notify.Webhook.Channel)
 	// Config only trims the DSN; parsing/validating it belongs to the adapter, keeping
 	// this package free of pgx.
 	c.Storage.Postgres.DSN = strings.TrimSpace(c.Storage.Postgres.DSN)

@@ -28,8 +28,10 @@ type Config struct {
 	API       API
 	Recording Policy
 	Mistral   Mistral // shared by STT/TTS/Dialogue when their provider == "mistral"
+	OpenAI    OpenAI  // Dialogue alternative provider (C7)
 	Auth      Auth
 	Payments  Payments
+	Notify    Notify
 	Log       Log
 }
 
@@ -45,8 +47,22 @@ type HTTP struct {
 
 // Telephony selects the telephony adapter and holds its settings.
 type Telephony struct {
-	Provider string // "twilio" | "stub"
+	Provider string // "stub" | "twilio" | "telnyx"
 	Twilio   Twilio
+	Telnyx   Telnyx
+}
+
+// Telnyx holds the Telnyx Call Control adapter settings. APIKey is a secret.
+type Telnyx struct {
+	APIKey             string // secret
+	ConnectionID       string // Call Control connection/app id (not a credential)
+	FromNumber         string // caller-id number, E.164
+	RingTimeoutSeconds int    // 0 = Telnyx default, else 5..600
+	// WebhookPublicKey is the account's Ed25519 public key (base64 raw key or PEM) used
+	// to verify Telnyx's webhook and media-stream signatures. Optional: when unset,
+	// signed requests are rejected (fail closed) and only the unguessable per-call path
+	// guards the callback. It is a public key, not a secret.
+	WebhookPublicKey string
 }
 
 // Twilio holds the Twilio adapter settings. AccountSID and AuthToken are secrets.
@@ -150,6 +166,28 @@ type MistralDialogue struct {
 	Model string
 }
 
+// OpenAI holds the OpenAI ChatGPT settings used by the alternative Dialogue adapter.
+// APIKey is a secret; the base URL and model are non-secret protocol settings.
+type OpenAI struct {
+	APIKey        string // secret
+	BaseURL       string
+	DialogueModel string
+}
+
+// Notify selects the notification adapter and holds its settings. Provider "off" is
+// the default: no notifier is built and no worker starts.
+type Notify struct {
+	Provider string // "off" | "log" | "webhook"
+	Webhook  NotifyWebhook
+}
+
+// NotifyWebhook configures the HTTP webhook notifier. URL is a secret (it may carry a
+// bearer-like query token) and is always redacted from Summary.
+type NotifyWebhook struct {
+	URL     string // secret
+	Channel string // "email" | "sms"
+}
+
 // Auth configures user-facing cookie authentication (C6). Mode "off" (the default)
 // preserves the C5 unauthenticated API; "cookie" enables registration/login and scopes
 // order routes to the session user.
@@ -181,15 +219,20 @@ type Log struct {
 }
 
 var (
-	telephonyProviders = []string{"twilio", "stub"}
+	telephonyProviders = []string{"twilio", "stub", "telnyx"}
 	twilioModes        = []string{"voice-api", "sip-trunk"}
 	aiProviders        = []string{"mistral", "stub"}
-	mistralTTSModes    = []string{"realtime", "offline"}
-	storageProviders   = []string{"local", "postgres"}
-	authModes          = []string{"off", "cookie"}
-	paymentProviders   = []string{"stub", "stripe"}
-	logLevels          = []string{"debug", "info", "warn", "error"}
-	logFormats         = []string{"text", "json"}
+	// dialogueProviders is deliberately wider than aiProviders: C7 proves the swap
+	// promise with one alternative AI provider (OpenAI) on the Dialogue port only.
+	dialogueProviders = []string{"mistral", "stub", "openai"}
+	mistralTTSModes   = []string{"realtime", "offline"}
+	storageProviders  = []string{"local", "postgres"}
+	authModes         = []string{"off", "cookie"}
+	paymentProviders  = []string{"stub", "stripe"}
+	notifyProviders   = []string{"off", "log", "webhook"}
+	notifyChannels    = []string{"email", "sms"}
+	logLevels         = []string{"debug", "info", "warn", "error"}
+	logFormats        = []string{"text", "json"}
 
 	accountSIDPattern = regexp.MustCompile(`^AC[0-9a-fA-F]{32}$`)
 	e164Pattern       = regexp.MustCompile(`^\+[1-9][0-9]{6,14}$`)
@@ -238,13 +281,25 @@ func (c Config) Validate() error {
 			return err
 		}
 	}
+	if c.Telephony.Telnyx.RingTimeoutSeconds != 0 &&
+		(c.Telephony.Telnyx.RingTimeoutSeconds < 5 || c.Telephony.Telnyx.RingTimeoutSeconds > 600) {
+		return fmt.Errorf("config: telephony.telnyx.ring_timeout_seconds: must be 0 (Telnyx default) or between 5 and 600")
+	}
+	if c.Telephony.Provider == "telnyx" {
+		if err := validateTelnyx(c.Telephony.Telnyx, c.HTTP.PublicURL); err != nil {
+			return err
+		}
+	}
 	if err := checkEnum("stt.provider", c.STT.Provider, aiProviders); err != nil {
 		return err
 	}
 	if err := checkEnum("tts.provider", c.TTS.Provider, aiProviders); err != nil {
 		return err
 	}
-	if err := checkEnum("dialogue.provider", c.Dialogue.Provider, aiProviders); err != nil {
+	if err := checkEnum("dialogue.provider", c.Dialogue.Provider, dialogueProviders); err != nil {
+		return err
+	}
+	if err := c.validateOpenAI(); err != nil {
 		return err
 	}
 	if err := c.validateScheduler(); err != nil {
@@ -259,7 +314,74 @@ func (c Config) Validate() error {
 	if err := c.validatePayments(); err != nil {
 		return err
 	}
+	if err := c.validateNotify(); err != nil {
+		return err
+	}
 	return c.validateMistral()
+}
+
+// validateTelnyx checks the fields the Call Control adapter cannot run without. It never
+// includes a secret value in its errors.
+func validateTelnyx(t Telnyx, publicURL string) error {
+	if publicURL == "" {
+		return fmt.Errorf("config: http.public_url is required when telephony.provider is telnyx (call-control webhooks)")
+	}
+	if strings.TrimSpace(t.APIKey) == "" {
+		return fmt.Errorf("config: telnyx.api_key: required when telephony.provider is telnyx")
+	}
+	if strings.TrimSpace(t.ConnectionID) == "" {
+		return fmt.Errorf("config: telnyx.connection_id: required when telephony.provider is telnyx")
+	}
+	if !e164Pattern.MatchString(t.FromNumber) {
+		return fmt.Errorf("config: telephony.telnyx.from_number: must be E.164 like +15551234567")
+	}
+	return nil
+}
+
+// validateOpenAI checks the alternative Dialogue provider selection. The base URL and
+// model are validated unconditionally (an explicit bad setting fails even while the
+// provider is stub); only the API key is conditional on the provider being selected.
+func (c Config) validateOpenAI() error {
+	if err := validateOpenAIBaseURL(c.OpenAI.BaseURL); err != nil {
+		return err
+	}
+	if err := checkNonEmptyTrim("openai.dialogue_model", c.OpenAI.DialogueModel); err != nil {
+		return err
+	}
+	if c.Dialogue.Provider == "openai" && strings.TrimSpace(c.OpenAI.APIKey) == "" {
+		return fmt.Errorf("config: openai.api_key: required when dialogue.provider is openai")
+	}
+	return nil
+}
+
+// validateOpenAIBaseURL accepts only an absolute https URL with no query, credentials,
+// or fragment. Unlike the Mistral origin, a path is allowed because the OpenAI API base
+// itself ends in /v1 (`POST {base}/chat/completions`); loopback http is permitted by the
+// adapter for tests, never here, so a real key never travels over plaintext.
+func validateOpenAIBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("config: openai.base_url: invalid URL: %w", err)
+	}
+	if u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("config: openai.base_url: must be an https URL like https://api.openai.com/v1")
+	}
+	return nil
+}
+
+// validateNotify checks the notification adapter selection. The channel is validated
+// unconditionally; the webhook URL is required only for the webhook adapter.
+func (c Config) validateNotify() error {
+	if err := checkEnum("notify.provider", c.Notify.Provider, notifyProviders); err != nil {
+		return err
+	}
+	if err := checkEnum("notify.webhook.channel", c.Notify.Webhook.Channel, notifyChannels); err != nil {
+		return err
+	}
+	if c.Notify.Provider == "webhook" && strings.TrimSpace(c.Notify.Webhook.URL) == "" {
+		return fmt.Errorf("config: notify.webhook.url: required when notify.provider is webhook")
+	}
+	return nil
 }
 
 // validateAuth checks the cookie-auth surface. It rejects a TTL or bcrypt cost that would
@@ -519,9 +641,19 @@ func (c Config) Summary() map[string]any {
 		"telephony.provider":                    c.Telephony.Provider,
 		"telephony.twilio.mode":                 c.Telephony.Twilio.Mode,
 		"telephony.twilio.ring_timeout_seconds": c.Telephony.Twilio.RingTimeoutSeconds,
+		"telephony.telnyx.connection_id":        c.Telephony.Telnyx.ConnectionID,
+		"telephony.telnyx.from_number":          c.Telephony.Telnyx.FromNumber,
+		"telephony.telnyx.ring_timeout_seconds": c.Telephony.Telnyx.RingTimeoutSeconds,
+		"telnyx.api_key":                        redacted(c.Telephony.Telnyx.APIKey),
 		"stt.provider":                          c.STT.Provider,
 		"tts.provider":                          c.TTS.Provider,
 		"dialogue.provider":                     c.Dialogue.Provider,
+		"openai.base_url":                       c.OpenAI.BaseURL,
+		"openai.dialogue_model":                 c.OpenAI.DialogueModel,
+		"openai.api_key":                        redacted(c.OpenAI.APIKey),
+		"notify.provider":                       c.Notify.Provider,
+		"notify.webhook.channel":                c.Notify.Webhook.Channel,
+		"notify.webhook.url":                    redacted(c.Notify.Webhook.URL),
 		"storage.provider":                      c.Storage.Provider,
 		"storage.local.dir":                     c.Storage.Local.Dir,
 		"postgres.dsn":                          redacted(c.Storage.Postgres.DSN),
