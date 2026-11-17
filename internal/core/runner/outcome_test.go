@@ -214,3 +214,53 @@ func TestRunOneFinishOneHangup(t *testing.T) {
 		t.Errorf("Hangup calls = %d, want 1", session.hangups())
 	}
 }
+
+func TestRunAgentConversationLimitsMapToFailedOther(t *testing.T) {
+	limits := map[string]error{
+		"silence/listen timeout":  errors.New("agent: listen timeout with no speech"),
+		"two empty transcripts":   errors.New("agent: empty final transcript"),
+		"max user turns":          errors.New("agent: maximum user turns exceeded"),
+		"max tool rounds":         errors.New("agent: maximum tool continuations exceeded"),
+		"agent max call duration": context.DeadlineExceeded,
+	}
+	for name, underlying := range limits {
+		t.Run(name, func(t *testing.T) {
+			order := testOrder()
+			store := newFakeStore(order)
+			session := newFakeSession()
+			preload(session, progress(true)...)
+			limitErr := &agent.LimitError{Err: underlying}
+			ag := newFakeAgent(domain.Outcome{}, limitErr)
+			r := testRunner(t, store, &fakeTelephony{session: session}, ag)
+			got, err := r.Run(context.Background(), order.ID)
+			if !errors.Is(err, limitErr) {
+				t.Fatalf("err = %v, want the limit error", err)
+			}
+			if !errors.Is(err, underlying) {
+				t.Errorf("underlying limit error lost: %v", err)
+			}
+			if got.Outcome == nil || got.Outcome.Kind != domain.OutcomeFailed || got.Outcome.FailReason != "other" {
+				t.Fatalf("outcome = %+v, want failed/other", got.Outcome)
+			}
+			if session.hangups() != 1 || store.finishCount != 1 {
+				t.Errorf("hangup/finish = %d/%d", session.hangups(), store.finishCount)
+			}
+		})
+	}
+}
+
+func TestRunProviderDeadlineIsFailedError(t *testing.T) {
+	order := testOrder()
+	store := newFakeStore(order)
+	session := newFakeSession()
+	preload(session, progress(true)...)
+	ag := newFakeAgent(domain.Outcome{}, context.DeadlineExceeded)
+	r := testRunner(t, store, &fakeTelephony{session: session}, ag)
+	got, err := r.Run(context.Background(), order.ID)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v", err)
+	}
+	if got.Outcome == nil || got.Outcome.FailReason != "error" {
+		t.Fatalf("provider deadline mapped to %+v, want failed/error", got.Outcome)
+	}
+}

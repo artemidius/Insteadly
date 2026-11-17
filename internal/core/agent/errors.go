@@ -21,3 +21,32 @@ var (
 	// errToolRoundsExceeded means the consecutive tool-continuation limit was reached.
 	errToolRoundsExceeded = errors.New("agent: maximum tool continuations exceeded")
 )
+
+// LimitError marks a conversation/inactivity limit rather than a provider or adapter
+// failure. The runner maps it to failed/other, as required by the C3 plan §3.4; the
+// underlying error stays available through errors.Is/errors.As.
+type LimitError struct {
+	Err error
+}
+
+func (e *LimitError) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the underlying limit error.
+func (e *LimitError) Unwrap() error { return e.Err }
+
+// IsLimit reports whether err was produced by an agent conversation/inactivity limit
+// (listen/silence timeout, repeated empty transcript, turn/tool-round bound, or the
+// agent's own maximum call duration). It never matches an arbitrary provider
+// context.DeadlineExceeded.
+func IsLimit(err error) bool {
+	var limitErr *LimitError
+	return errors.As(err, &limitErr)
+}
+
+// markLimit wraps err once. It is a no-op for nil/already-classified errors.
+func markLimit(err error) error {
+	if err == nil || IsLimit(err) {
+		return err
+	}
+	return &LimitError{Err: err}
+}

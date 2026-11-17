@@ -305,3 +305,33 @@ func TestExecuteHonorsContext(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 }
+
+func TestOptionalToolFieldsRejectNullAndWrongTypes(t *testing.T) {
+	now := fixedNow
+	exec, _ := newTestExecutor(t, testOrder(), &now)
+	cases := []struct {
+		name string
+		tool string
+		args string
+	}{
+		{"propose doctor null", ToolProposeSlot, `{"start":"` + slotStart + `","end":"` + slotEnd + `","doctor":null}`},
+		{"propose practice null", ToolProposeSlot, `{"start":"` + slotStart + `","end":"` + slotEnd + `","practice":null}`},
+		{"propose doctor number", ToolProposeSlot, `{"start":"` + slotStart + `","end":"` + slotEnd + `","doctor":5}`},
+		{"confirm doctor null", ToolConfirmBooking, `{"start":"` + slotStart + `","end":"` + slotEnd + `","doctor":null}`},
+		{"confirm practice null", ToolConfirmBooking, `{"start":"` + slotStart + `","end":"` + slotEnd + `","practice":null}`},
+		{"confirm code null", ToolConfirmBooking, `{"start":"` + slotStart + `","end":"` + slotEnd + `","confirmation_code":null}`},
+		{"escalate urgent null", ToolEscalateToHuman, `{"reason":"x","urgent":null}`},
+		{"escalate urgent string", ToolEscalateToHuman, `{"reason":"x","urgent":"yes"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := string(execute(t, exec, tc.tool, tc.args)); got != `{"ok":false,"error":"invalid_arguments"}` {
+				t.Errorf("result = %s", got)
+			}
+		})
+	}
+	// A normal optional field still works.
+	if got := string(execute(t, exec, ToolProposeSlot, `{"start":"`+slotStart+`","end":"`+slotEnd+`","doctor":"Dr. A"}`)); !strings.Contains(got, `"ok":true`) {
+		t.Errorf("valid optional doctor rejected: %s", got)
+	}
+}

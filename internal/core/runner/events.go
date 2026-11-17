@@ -22,8 +22,10 @@ var (
 )
 
 // eventRelay is the single post-answer consumer of the telephony event channel. It never
-// drives order transitions; it forwards the terminal event to the agent and records the
-// terminal reason plus any provider error for the runner's outcome fallback.
+// drives order transitions; it forwards the terminal event to the agent, records the
+// terminal reason/provider error, and — per the port contract — keeps draining until the
+// adapter closes the channel. shutdown() is the bounded escape hatch for a broken adapter
+// that never closes the channel, so no relay goroutine can outlive Run/Close.
 type eventRelay struct {
 	log *slog.Logger
 
@@ -34,47 +36,66 @@ type eventRelay struct {
 
 	agentCh chan domain.CallEvent
 	done    chan struct{}
+
+	stopCtx  context.Context
+	stop     context.CancelFunc
+	stopOnce sync.Once
 }
 
 func newEventRelay(log *slog.Logger) *eventRelay {
+	stopCtx, stop := context.WithCancel(context.Background())
 	return &eventRelay{
 		log:     log,
 		agentCh: make(chan domain.CallEvent, 1),
 		done:    make(chan struct{}),
+		stopCtx: stopCtx,
+		stop:    stop,
 	}
 }
 
 // agentChannel delivers the terminal event (if any) and is closed when the relay stops.
 func (r *eventRelay) agentChannel() <-chan domain.CallEvent { return r.agentCh }
 
-// run drains events until EventEnded or channel closure. DTMF is debug-only and late
-// progress events are ignored rather than re-driving the state machine.
+// run drains events until the channel closes or shutdown is requested. EventEnded is
+// recorded and forwarded, but draining continues until channel closure as the port
+// requires; shutdown() bounds a provider that never closes the channel.
 func (r *eventRelay) run(events <-chan domain.CallEvent) {
 	defer close(r.done)
 	defer close(r.agentCh)
-	for ev := range events {
-		switch ev.Kind {
-		case domain.EventEnded:
-			r.mu.Lock()
-			r.terminalEvent = ev
-			r.haveTerm = true
-			r.mu.Unlock()
-			select {
-			case r.agentCh <- ev:
-			default:
-			}
+	for {
+		select {
+		case <-r.stopCtx.Done():
 			return
-		case domain.EventError:
-			r.mu.Lock()
-			r.providerErr = true
-			r.mu.Unlock()
-		case domain.EventDTMF:
-			r.log.Debug("runner: dtmf ignored", "call_id", ev.CallID, "dtmf_len", len(ev.DTMF))
-		case domain.EventDialing, domain.EventRinging, domain.EventAnswered:
-			// Late progress after the agent started; the order already reflects it.
-		default:
-			r.log.Warn("runner: ignoring unexpected call event", "kind", ev.Kind)
+		case ev, open := <-events:
+			if !open {
+				return
+			}
+			r.handle(ev)
 		}
+	}
+}
+
+func (r *eventRelay) handle(ev domain.CallEvent) {
+	switch ev.Kind {
+	case domain.EventEnded:
+		r.mu.Lock()
+		r.terminalEvent = ev
+		r.haveTerm = true
+		r.mu.Unlock()
+		select {
+		case r.agentCh <- ev:
+		default:
+		}
+	case domain.EventError:
+		r.mu.Lock()
+		r.providerErr = true
+		r.mu.Unlock()
+	case domain.EventDTMF:
+		r.log.Debug("runner: dtmf ignored", "call_id", ev.CallID, "dtmf_len", len(ev.DTMF))
+	case domain.EventDialing, domain.EventRinging, domain.EventAnswered:
+		// Late progress after the agent started; the order already reflects it.
+	default:
+		r.log.Warn("runner: ignoring unexpected call event", "kind", ev.Kind)
 	}
 }
 
@@ -84,6 +105,13 @@ func (r *eventRelay) wait(ctx context.Context) {
 	case <-r.done:
 	case <-ctx.Done():
 	}
+}
+
+// shutdown cancels the drain and waits for the relay goroutine to exit. It is idempotent
+// and safe on every Run/Close exit path.
+func (r *eventRelay) shutdown() {
+	r.stopOnce.Do(r.stop)
+	<-r.done
 }
 
 func (r *eventRelay) terminal() (domain.CallEvent, bool) {

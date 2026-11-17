@@ -110,7 +110,7 @@ func (r *Runner) Run(callerCtx context.Context, id domain.OrderID) (domain.Order
 
 	claimed, err := r.cfg.Orders.Update(runCtx, id, func(o *domain.Order) error {
 		if o.Status != domain.OrderScheduled {
-			return fmt.Errorf("order is %q, want scheduled", o.Status)
+			return fmt.Errorf("order is %q, want scheduled: %w", o.Status, domain.ErrInvalidTransition)
 		}
 		if err := o.Transition(domain.OrderDialing); err != nil {
 			return err
@@ -147,19 +147,26 @@ func (r *Runner) Run(callerCtx context.Context, id domain.OrderID) (domain.Order
 		readyCh = withReady.StreamReady()
 	}
 
+	var readinessTimer *time.Timer
+	var readinessDeadline <-chan time.Time
+
 preAgent:
 	for {
 		if state.answered {
 			if readyCh == nil {
 				break
 			}
-			timer := time.NewTimer(r.cfg.ReadinessTimeout)
+			// One fixed deadline for the whole readiness wait: recurring events must not
+			// postpone the failure until the overall call deadline.
+			if readinessTimer == nil {
+				readinessTimer = time.NewTimer(r.cfg.ReadinessTimeout)
+				readinessDeadline = readinessTimer.C
+				defer readinessTimer.Stop()
+			}
 			select {
 			case <-readyCh:
-				timer.Stop()
 				break preAgent
 			case ev, open := <-events:
-				timer.Stop()
 				if !open {
 					return r.finishWithFailure(callerCtx, id, hangup, state.order, errMissingEnded)
 				}
@@ -172,15 +179,12 @@ preAgent:
 					return final, errors.Join(runErr, finErr)
 				}
 			case <-callerCtx.Done():
-				timer.Stop()
 				return r.finishAbort(callerCtx, runCtx, callCtx, id, hangup, state.order)
 			case <-runCtx.Done():
-				timer.Stop()
 				return r.finishAbort(callerCtx, runCtx, callCtx, id, hangup, state.order)
 			case <-callCtx.Done():
-				timer.Stop()
 				return r.finishAbort(callerCtx, runCtx, callCtx, id, hangup, state.order)
-			case <-timer.C:
+			case <-readinessDeadline:
 				return r.finishWithFailure(callerCtx, id, hangup, state.order, errReadinessTimeout)
 			}
 			continue
@@ -211,15 +215,19 @@ preAgent:
 	// Agent handoff: from here a single relay goroutine owns the event channel.
 	relay := newEventRelay(r.log)
 	go relay.run(events)
+	// The relay must never outlive Run, including when a broken adapter neither ends the
+	// call nor closes the event channel.
+	defer relay.shutdown()
 
 	agentOutcome, agentErr := r.cfg.Agent.Run(callCtx, state.order, session, relay.agentChannel())
 
 	// Always hang up once after a successful Dial, using a context independent of the
-	// canceled call, then give the provider a bounded chance to deliver EventEnded.
+	// canceled call, then give the provider a bounded chance to close the event stream.
 	hangup()
 	waitCtx, cancelWait := context.WithTimeout(context.WithoutCancel(callerCtx), r.cfg.CleanupTimeout)
 	relay.wait(waitCtx)
 	cancelWait()
+	relay.shutdown()
 
 	terminal, haveTerminal := relay.terminal()
 	providerErr := relay.providerError()
@@ -237,6 +245,9 @@ preAgent:
 	default:
 		if ctxOutcome, ctxErr, classified := r.contextAbort(callerCtx, runCtx, callCtx); classified {
 			outcome, runErr = ctxOutcome, ctxErr
+		} else if agent.IsLimit(agentErr) {
+			outcome = failedOutcome("other", detailLimit)
+			runErr = agentErr
 		} else {
 			outcome = failedOutcome("error", "the call failed during the conversation")
 			runErr = agentErr

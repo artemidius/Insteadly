@@ -123,6 +123,55 @@ func decodeStrictObject(raw []byte, v any) error {
 	return nil
 }
 
+// isJSONNull reports whether an optional raw JSON field is explicitly null.
+func isJSONNull(raw json.RawMessage) bool {
+	return len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null"
+}
+
+// decodeOptionalString decodes an optional JSON string, rejecting null and wrong types.
+// A missing field is a valid empty value; every present field must be a real string.
+func decodeOptionalString(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 {
+		return "", true
+	}
+	if isJSONNull(raw) {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+// decodeRequiredRawString decodes a present JSON string token, rejecting null and wrong
+// types. Invalid UTF-8 is checked by the caller on the raw token before decoding.
+func decodeRequiredRawString(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 || isJSONNull(raw) {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+// decodeOptionalBool decodes an optional JSON boolean, rejecting null and wrong types.
+func decodeOptionalBool(raw json.RawMessage) (bool, bool) {
+	if len(raw) == 0 {
+		return false, true
+	}
+	if isJSONNull(raw) {
+		return false, false
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false, false
+	}
+	return value, true
+}
+
 // jsonValidObject reports whether b is exactly one JSON object.
 func jsonValidObject(b []byte) bool {
 	if len(b) == 0 || b[0] != '{' || !json.Valid(b) {

@@ -173,3 +173,49 @@ func TestEscalateToHumanAlwaysUnavailable(t *testing.T) {
 		t.Error("urgent should default false")
 	}
 }
+
+func TestCaptureInfoRejectsNullAndInvalidUTF8(t *testing.T) {
+	now := fixedNow
+	exec, store := newTestExecutor(t, testOrder(), &now)
+	for name, args := range map[string]string{
+		"null value":  `{"field":"reason","value":null}`,
+		"null field":  `{"field":null,"value":"x"}`,
+		"wrong type":  `{"field":"reason","value":5}`,
+		"empty value": `{"field":"reason","value":""}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			want := `{"ok":false,"error":"invalid_arguments"}`
+			if name == "empty value" {
+				want = `{"ok":false,"error":"invalid_value"}`
+			}
+			if got := string(execute(t, exec, ToolCaptureInfo, args)); got != want {
+				t.Errorf("result = %s, want %s", got, want)
+			}
+		})
+	}
+
+	// encoding/json would replace 0xff with U+FFFD; the raw token check must reject it.
+	invalid := []byte("{\"field\":\"reason\",\"value\":\"bad\xffutf8\"}")
+	result, err := exec.Execute(context.Background(), ports.ToolCall{
+		ID: "c1", Name: ToolCaptureInfo, Arguments: invalid,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if string(result) != `{"ok":false,"error":"invalid_value"}` {
+		t.Errorf("invalid UTF-8 result = %s", result)
+	}
+	if store.updateCount() != 0 {
+		t.Error("invalid UTF-8 was persisted")
+	}
+
+	// Valid multibyte UTF-8 is still accepted and stored unchanged.
+	valid := `{"field":"reason","value":"Kontrolle äöü"}`
+	if got := string(execute(t, exec, ToolCaptureInfo, valid)); got != `{"ok":true,"field":"reason"}` {
+		t.Errorf("valid UTF-8 rejected: %s", got)
+	}
+	stored, _ := store.Get(context.Background(), exec.orderID)
+	if stored.Patient.Reason != "Kontrolle äöü" {
+		t.Errorf("valid UTF-8 was mutated: %q", stored.Patient.Reason)
+	}
+}

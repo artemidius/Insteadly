@@ -151,7 +151,7 @@ func TestLiveM0NoPhone(t *testing.T) {
 	t.Logf("live no-phone: outcome=%s fail_reason=%q attempts=%d", final.Outcome.Kind, final.Outcome.FailReason, final.Attempts)
 
 	if final.Patient.Reason != "Kontrolle" {
-		t.Fatal("capture_info did not persist reason=Kontrolle (model/tool round failed; investigate, do not retry)")
+		t.Fatal("capture_info did not persist the expected reason (model/tool round failed; investigate, do not retry)")
 	}
 	if final.Outcome.Kind != domain.OutcomeAborted {
 		t.Fatalf("outcome = %q, want aborted", final.Outcome.Kind)

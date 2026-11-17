@@ -533,25 +533,28 @@ func TestM0IntegrationBookedFullChain(t *testing.T) {
 	if sttEnds != 1 {
 		t.Errorf("STT input_audio.end count = %d, want 1", sttEnds)
 	}
-	if len(sttAudio) == 0 {
-		t.Fatal("STT received no audio")
+	// The gate must replay exactly the delimited utterance: 10 active frames followed by
+	// the 30 frames of end-silence. No pre-roll silence exists here, so the byte sequence
+	// is deterministic and asserted exactly (never printed).
+	expected := make([]byte, 0, 40*domain.FrameBytes)
+	for i := 0; i < 10; i++ {
+		expected = append(expected, pcmFrame(3000)...)
 	}
+	for i := 0; i < 30; i++ {
+		expected = append(expected, make([]byte, domain.FrameBytes)...)
+	}
+	var gotAudio []byte
 	for _, chunk := range sttAudio {
 		if len(chunk) != domain.FrameBytes {
 			t.Fatalf("STT audio chunk length = %d, want %d", len(chunk), domain.FrameBytes)
 		}
+		gotAudio = append(gotAudio, chunk...)
 	}
-	nonZero := false
-	for _, chunk := range sttAudio {
-		for _, b := range chunk {
-			if b != 0 {
-				nonZero = true
-				break
-			}
-		}
+	if len(sttAudio) != 40 {
+		t.Errorf("STT chunks = %d, want 40", len(sttAudio))
 	}
-	if !nonZero {
-		t.Error("STT received only silence")
+	if !bytes.Equal(gotAudio, expected) {
+		t.Fatal("STT audio bytes differ from the expected 10 active + 30 silence frames")
 	}
 	if language != "de" {
 		t.Errorf("STT language = %q, want de", language)
@@ -633,12 +636,18 @@ func TestM0IntegrationBookedFullChain(t *testing.T) {
 		t.Errorf("audio after hangup: sent at hangup %d, total %d", audioAtHangup, len(sent))
 	}
 
-	// Hygiene: the fake API key never appears in logs.
-	if strings.Contains(h.logs.String(), integrationAPIKey) {
-		t.Error("API key leaked into logs")
-	}
-	if strings.Contains(h.logs.String(), "api.mistral.ai") {
-		t.Error("test attempted to contact the real Mistral endpoint")
+	// Hygiene: no fake secret, patient value, outcome detail, or real endpoint appears in
+	// the captured logs (failure messages name only the category, never the value).
+	for category, value := range map[string]string{
+		"API key":        integrationAPIKey,
+		"patient name":   "Synthetic Patient",
+		"patient reason": "Kontrolle",
+		"outcome detail": "Termin bestätigt",
+		"real endpoint":  "api.mistral.ai",
+	} {
+		if strings.Contains(h.logs.String(), value) {
+			t.Errorf("%s leaked into logs", category)
+		}
 	}
 }
 

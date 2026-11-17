@@ -223,7 +223,7 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 }
 
 // Run executes the answered-call loop for one order. All per-call state is local.
-func (a *Agent) Run(ctx context.Context, order domain.Order, call AudioSession, ended <-chan domain.CallEvent) (domain.Outcome, error) {
+func (a *Agent) Run(ctx context.Context, order domain.Order, call AudioSession, ended <-chan domain.CallEvent) (final domain.Outcome, runErr error) {
 	if call == nil {
 		return domain.Outcome{}, errors.New("agent: nil audio session")
 	}
@@ -236,6 +236,17 @@ func (a *Agent) Run(ctx context.Context, order domain.Order, call AudioSession, 
 
 	callCtx, cancelCall := context.WithTimeout(ctx, a.cfg.MaxCallDuration)
 	defer cancelCall()
+	// The agent's own maximum call duration is a conversation limit, not a provider
+	// failure. Only classify it when the caller's context is still live; a runner
+	// deadline or external cancellation keeps its own meaning.
+	defer func() {
+		if runErr == nil || errors.Is(runErr, ErrCallEnded) {
+			return
+		}
+		if callCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			runErr = markLimit(runErr)
+		}
+	}()
 
 	runCtx, cancelRun := context.WithCancel(callCtx)
 	var endedSeen atomic.Bool
@@ -426,5 +437,13 @@ func (a *Agent) mapError(ended bool, err error) error {
 	if ended {
 		return ErrCallEnded
 	}
-	return err
+	switch {
+	case errors.Is(err, errListenTimeout),
+		errors.Is(err, errEmptyTranscript),
+		errors.Is(err, errUserTurnsExceeded),
+		errors.Is(err, errToolRoundsExceeded):
+		return markLimit(err)
+	default:
+		return err
+	}
 }

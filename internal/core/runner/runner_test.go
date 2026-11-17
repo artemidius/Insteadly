@@ -552,3 +552,79 @@ func TestRunAgentOperationalError(t *testing.T) {
 		t.Fatalf("final = %+v", got)
 	}
 }
+
+func TestRunClaimLostAfterGetWrapsInvalidTransition(t *testing.T) {
+	order := testOrder()
+	store := newFakeStore(order)
+	// Simulate another runner claiming between Get and the update callback.
+	store.beforeUpdate = func(o *domain.Order) {
+		store.beforeUpdate = nil
+		o.Status = domain.OrderDialing
+	}
+	telephony := &fakeTelephony{session: newFakeSession()}
+	ag := newFakeAgent(bookedOutcome(), nil)
+	r := testRunner(t, store, telephony, ag)
+	_, err := r.Run(context.Background(), order.ID)
+	if !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Fatalf("err = %v, want ErrInvalidTransition", err)
+	}
+	if telephony.dials() != 0 {
+		t.Error("dialed after losing the claim race")
+	}
+	if ag.runCount() != 0 {
+		t.Error("agent started after losing the claim race")
+	}
+}
+
+func TestRunReadinessTimeoutNotResetByEvents(t *testing.T) {
+	order := testOrder()
+	store := newFakeStore(order)
+	session := newFakeSession()
+	session.autoEndOnHangup = false // keep the channel open for the event ticker
+	preload(session, progress(true)...)
+	ready := make(chan struct{}) // never closes
+	ag := newFakeAgent(bookedOutcome(), nil)
+	r, err := New(Config{
+		Telephony:        &fakeTelephony{session: session, ready: ready},
+		Orders:           store,
+		Agent:            ag,
+		CleanupTimeout:   100 * time.Millisecond,
+		ReadinessTimeout: 50 * time.Millisecond,
+		CallTimeout:      3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	stop := make(chan struct{})
+	tickerDone := make(chan struct{})
+	go func() {
+		defer close(tickerDone)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				select {
+				case session.events <- domain.CallEvent{Kind: domain.EventDTMF, DTMF: "1"}:
+				default:
+				}
+			}
+		}
+	}()
+	start := time.Now()
+	_, err = r.Run(context.Background(), order.ID)
+	elapsed := time.Since(start)
+	close(stop)
+	<-tickerDone
+	if !errors.Is(err, errReadinessTimeout) {
+		t.Fatalf("err = %v, want errReadinessTimeout", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("readiness wait took %v; a recurring event reset the 50ms bound", elapsed)
+	}
+	if ag.runCount() != 0 {
+		t.Error("agent started before readiness")
+	}
+}

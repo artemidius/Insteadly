@@ -313,6 +313,9 @@ func TestRunToolRoundLimit(t *testing.T) {
 	if !errors.Is(err, errToolRoundsExceeded) {
 		t.Fatalf("err = %v, want errToolRoundsExceeded", err)
 	}
+	if !IsLimit(err) {
+		t.Fatalf("tool-round limit not classified as a conversation limit: %v", err)
+	}
 	dlg.mu.Lock()
 	submissions := len(dlg.results)
 	dlg.mu.Unlock()
@@ -334,6 +337,9 @@ func TestRunUserTurnLimit(t *testing.T) {
 	_, err := a.Run(context.Background(), order, call, nil)
 	if !errors.Is(err, errUserTurnsExceeded) {
 		t.Fatalf("err = %v, want errUserTurnsExceeded", err)
+	}
+	if !IsLimit(err) {
+		t.Fatalf("user-turn limit not classified as a conversation limit: %v", err)
 	}
 	dlg.mu.Lock()
 	defer dlg.mu.Unlock()
@@ -358,6 +364,9 @@ func TestRunEmptyTranscriptPolicy(t *testing.T) {
 	_, err := a.Run(context.Background(), order, call, nil)
 	if !errors.Is(err, errEmptyTranscript) {
 		t.Fatalf("err = %v, want errEmptyTranscript", err)
+	}
+	if !IsLimit(err) {
+		t.Fatalf("empty-transcript limit not classified as a conversation limit: %v", err)
 	}
 	if stt.opens != 2 {
 		t.Errorf("STT opens = %d, want 2", stt.opens)
@@ -555,6 +564,8 @@ func TestRunListenTimeout(t *testing.T) {
 	cfg.ListenTimeout = 20 * time.Millisecond
 	if _, err := fastAgent(t, cfg).Run(context.Background(), order, newFakeCall(), nil); !errors.Is(err, errListenTimeout) {
 		t.Fatalf("err = %v, want listen timeout", err)
+	} else if !IsLimit(err) {
+		t.Fatalf("listen timeout not classified as a conversation limit: %v", err)
 	}
 }
 
@@ -567,6 +578,24 @@ func TestRunMaxCallDuration(t *testing.T) {
 	cfg.ListenTimeout = time.Second
 	if _, err := fastAgent(t, cfg).Run(context.Background(), order, newFakeCall(), nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	} else if !IsLimit(err) {
+		t.Fatalf("agent max-call deadline not classified as a conversation limit: %v", err)
+	}
+}
+
+func TestRunProviderDeadlineIsNotConversationLimit(t *testing.T) {
+	order := testOrder()
+	store := newFakeStore(order)
+	cfg := testConfig(store)
+	cfg.STT = &fakeSTT{script: fakeSTTScript{openErr: context.DeadlineExceeded}}
+	cfg.Dialogue = textOnlyDialogue("ok")
+	call := newFakeCall(utteranceChunks()...)
+	_, err := fastAgent(t, cfg).Run(context.Background(), order, call, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	}
+	if IsLimit(err) {
+		t.Fatal("a provider deadline must not be classified as an agent conversation limit")
 	}
 }
 

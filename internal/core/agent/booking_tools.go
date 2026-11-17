@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -76,10 +77,10 @@ func (e *bookingExecutor) Execute(ctx context.Context, call ports.ToolCall) ([]b
 // --- propose_slot ---------------------------------------------------------------
 
 type proposeArgs struct {
-	Start    *string `json:"start"`
-	End      *string `json:"end"`
-	Doctor   string  `json:"doctor"`
-	Practice string  `json:"practice"`
+	Start    *string         `json:"start"`
+	End      *string         `json:"end"`
+	Doctor   json.RawMessage `json:"doctor"`
+	Practice json.RawMessage `json:"practice"`
 }
 
 func (e *bookingExecutor) proposeSlot(raw []byte) ([]byte, error) {
@@ -88,6 +89,14 @@ func (e *bookingExecutor) proposeSlot(raw []byte) ([]byte, error) {
 		return res, nil
 	}
 	if args.Start == nil || args.End == nil {
+		return errorResult(errCodeInvalidArguments), nil
+	}
+	doctor, ok := decodeOptionalString(args.Doctor)
+	if !ok {
+		return errorResult(errCodeInvalidArguments), nil
+	}
+	practice, ok := decodeOptionalString(args.Practice)
+	if !ok {
 		return errorResult(errCodeInvalidArguments), nil
 	}
 	start, end, ok := parseInterval(*args.Start, *args.End)
@@ -100,8 +109,8 @@ func (e *bookingExecutor) proposeSlot(raw []byte) ([]byte, error) {
 	e.proposal = &proposedSlot{
 		start:    start,
 		end:      end,
-		doctor:   strings.TrimSpace(args.Doctor),
-		practice: strings.TrimSpace(args.Practice),
+		doctor:   strings.TrimSpace(doctor),
+		practice: strings.TrimSpace(practice),
 	}
 	return marshalResult(proposeResult{OK: true, Start: start.Format(time.RFC3339), End: end.Format(time.RFC3339)}), nil
 }
@@ -109,11 +118,11 @@ func (e *bookingExecutor) proposeSlot(raw []byte) ([]byte, error) {
 // --- confirm_booking ------------------------------------------------------------
 
 type confirmArgs struct {
-	Start            *string `json:"start"`
-	End              *string `json:"end"`
-	Doctor           string  `json:"doctor"`
-	Practice         string  `json:"practice"`
-	ConfirmationCode string  `json:"confirmation_code"`
+	Start            *string         `json:"start"`
+	End              *string         `json:"end"`
+	Doctor           json.RawMessage `json:"doctor"`
+	Practice         json.RawMessage `json:"practice"`
+	ConfirmationCode json.RawMessage `json:"confirmation_code"`
 }
 
 func (e *bookingExecutor) confirmBooking(raw []byte) ([]byte, error) {
@@ -122,6 +131,18 @@ func (e *bookingExecutor) confirmBooking(raw []byte) ([]byte, error) {
 		return res, nil
 	}
 	if args.Start == nil || args.End == nil {
+		return errorResult(errCodeInvalidArguments), nil
+	}
+	doctor, ok := decodeOptionalString(args.Doctor)
+	if !ok {
+		return errorResult(errCodeInvalidArguments), nil
+	}
+	practice, ok := decodeOptionalString(args.Practice)
+	if !ok {
+		return errorResult(errCodeInvalidArguments), nil
+	}
+	code, ok := decodeOptionalString(args.ConfirmationCode)
+	if !ok {
 		return errorResult(errCodeInvalidArguments), nil
 	}
 	start, end, ok := parseInterval(*args.Start, *args.End)
@@ -143,10 +164,10 @@ func (e *bookingExecutor) confirmBooking(raw []byte) ([]byte, error) {
 		proposedSlot: proposedSlot{
 			start:    start,
 			end:      end,
-			doctor:   firstNonBlank(strings.TrimSpace(args.Doctor), e.proposal.doctor),
-			practice: firstNonBlank(strings.TrimSpace(args.Practice), e.proposal.practice),
+			doctor:   firstNonBlank(strings.TrimSpace(doctor), e.proposal.doctor),
+			practice: firstNonBlank(strings.TrimSpace(practice), e.proposal.practice),
 		},
-		code: strings.TrimSpace(args.ConfirmationCode),
+		code: strings.TrimSpace(code),
 	}
 	return marshalResult(confirmResult{OK: true, ConfirmationCode: e.confirmation.code}), nil
 }
@@ -154,8 +175,8 @@ func (e *bookingExecutor) confirmBooking(raw []byte) ([]byte, error) {
 // --- capture_info ---------------------------------------------------------------
 
 type captureArgs struct {
-	Field *string `json:"field"`
-	Value *string `json:"value"`
+	Field *string         `json:"field"`
+	Value json.RawMessage `json:"value"`
 }
 
 func (e *bookingExecutor) captureInfo(ctx context.Context, raw []byte) ([]byte, error) {
@@ -163,11 +184,20 @@ func (e *bookingExecutor) captureInfo(ctx context.Context, raw []byte) ([]byte, 
 	if res := decodeToolArguments(raw, &args); res != nil {
 		return res, nil
 	}
-	if args.Field == nil || args.Value == nil {
+	if args.Field == nil || len(args.Value) == 0 || isJSONNull(args.Value) {
+		return errorResult(errCodeInvalidArguments), nil
+	}
+	// encoding/json replaces invalid UTF-8 with U+FFFD, so reject it on the raw token
+	// before decoding rather than silently persisting a mutated value.
+	if !utf8.Valid(args.Value) {
+		return errorResult(errCodeInvalidValue), nil
+	}
+	decodedValue, ok := decodeRequiredRawString(args.Value)
+	if !ok {
 		return errorResult(errCodeInvalidArguments), nil
 	}
 	field := *args.Field
-	value := strings.TrimSpace(*args.Value)
+	value := strings.TrimSpace(decodedValue)
 	if !allowedCaptureField(field) || !validCaptureValue(field, value) {
 		return errorResult(errCodeInvalidValue), nil
 	}
@@ -227,8 +257,8 @@ func validCaptureValue(field, value string) bool {
 // --- escalate_to_human ----------------------------------------------------------
 
 type escalateArgs struct {
-	Reason *string `json:"reason"`
-	Urgent *bool   `json:"urgent"`
+	Reason *string         `json:"reason"`
+	Urgent json.RawMessage `json:"urgent"`
 }
 
 func (e *bookingExecutor) escalate(raw []byte) []byte {
@@ -236,12 +266,16 @@ func (e *bookingExecutor) escalate(raw []byte) []byte {
 	if res := decodeToolArguments(raw, &args); res != nil {
 		return res
 	}
+	urgent, ok := decodeOptionalBool(args.Urgent)
+	if !ok {
+		return errorResult(errCodeInvalidArguments)
+	}
 	if args.Reason == nil || strings.TrimSpace(*args.Reason) == "" {
 		return errorResult(errCodeInvalidArguments)
 	}
 	// Record only the fact/urgency; never the free-text reason.
 	e.escalated = true
-	e.urgent = args.Urgent != nil && *args.Urgent
+	e.urgent = urgent
 	// No transfer target or telephony transfer port exists in C3, so the only truthful
 	// validation result is unavailable. The model apologizes and finishes normally.
 	return errorResult(errCodeUnavailable)

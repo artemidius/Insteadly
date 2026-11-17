@@ -19,6 +19,7 @@ type fakeStore struct {
 	orders       map[domain.OrderID]domain.Order
 	history      []domain.Order
 	updates      int
+	beforeUpdate func(o *domain.Order)
 	failOnFinish bool
 	finishErr    error
 	finishCount  int
@@ -72,6 +73,9 @@ func (s *fakeStore) Update(_ context.Context, id domain.OrderID, fn func(*domain
 	o, ok := s.orders[id]
 	if !ok {
 		return domain.Order{}, ports.ErrNotFound
+	}
+	if s.beforeUpdate != nil {
+		s.beforeUpdate(&o)
 	}
 	if err := fn(&o); err != nil {
 		return domain.Order{}, err

@@ -15,6 +15,7 @@ const (
 	detailCallError     = "the call failed"
 	detailCompleted     = "the call ended before a dialogue outcome"
 	detailUnknownReason = "the call ended without a usable reason"
+	detailLimit         = "the conversation reached a limit"
 )
 
 func abortedOutcome() domain.Outcome {
