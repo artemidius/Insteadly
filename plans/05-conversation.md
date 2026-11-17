@@ -1156,3 +1156,28 @@ were fixed on `feat/c4-conversation` before merge; no live test was run.
 Verification after these fixes is recorded in `PROGRESS.md`; `make verify`, `make cover`,
 `-race -count=10` on the required packages, live-test compile/SKIP, lint, dependency and drift
 checks were re-run. No live test was run and no secret was read.
+
+### 2026-11-17 — live no-phone harness pacing correction (post-merge)
+
+The conductor ran the gated `TestLiveM1NoPhone` on merged `main` and it failed with
+`agent: utterance queue overflow` (then a secondary canceled STT open). Instrumentation showed
+this was a **test-harness artifact**, not a production VAD/queue defect: the live harness wrote
+the whole synthesized caller utterance (~600 canonical frames) in a tight burst; the worker's
+bounded 64-frame feed queue (1.28 s) could not drain while the real STT WebSocket handshake ran
+(0.6–0.9 s), so the pump correctly reported overflow. Real telephony delivers 20 ms/frame
+(50 fps), which the queue is sized for.
+
+Correction (harness only; **no production VAD/queue/`audioFeedBuffer` change**):
+
+- `integrationSession.trySendFrame` is the shared safe enqueue. `sendFrames` remains the
+  instant burst used by credential-free integration tests.
+- `internal/app/m1_live_test.go` now feeds the live no-phone caller audio with
+  `feedPacedWhileRunning`: one canonical frame per `liveFramePace = 20 ms`, stopping early if
+  the runner finishes. Both scripted utterances use the paced path.
+- Comments in both harness files record that the live path paces at canonical real time and
+  that a multi-second burst is a harness artifact, not a VAD/queue defect.
+
+No live test was run in this fix session. Verification before re-running the gate: `make
+verify`, `go test -race -count=10 ./internal/app -run 'TestM1Integration'`, live-tag
+compile/SKIP, lint, module and drift checks (recorded in `PROGRESS.md`). The gate remains
+pending a fresh conductor run.

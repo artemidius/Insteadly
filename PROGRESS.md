@@ -13,7 +13,9 @@
 - **Phase:** C0 ✅; **C1 code complete** (live audio + outbound DTMF blocked by Twilio
   trial); **C2 ✅** (Mistral adapters, fake suites green, live smoke passed); **C3 ✅ code
   complete** (call runner + agent engine v0; real-Mistral no-phone live gate passed);
-  **C4 🔵 code complete pending the real-Mistral no-phone live gate** — streaming
+  **C4 🔵 code complete pending the real-Mistral no-phone live gate** — the first gate
+  attempt exposed a live-harness burst-feed pacing bug (fixed; production unchanged); the
+  gate needs a re-run — streaming
   VAD/turn-taking, barge-in with Twilio `clear`/`mark`, deterministic IVR, hold detection,
   and bounded structured-outcome repair are implemented with credential-free fake-Mistral /
   fake-telephony integration coverage. DESIGN's **real-phone M0 and M1 exits** remain
@@ -147,9 +149,19 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
   required `-race -count=10` PASS (agent 112.2 s, app 15.0 s, others 2.4–5.8 s); live M1
   tests SKIP/SKIP; `go vet -tags live ./...` clean; golangci-lint v2.15.0 **0 issues**;
   `go.mod`/`go.sum`, config/httpapi/api drift, and `git diff --check` unchanged/clean.
-- **Status:** C4 → 🔵 code complete pending the conductor's `make live-test-m1` no-phone
-  gate. Real-phone M1 remains blocked by the Twilio trial/outbound-DTMF/controlled
-  IVR+hold prerequisites; C1 and the real-phone M0 exit remain blocked as before.
+- **Post-merge live-gate pacing fix (harness only):** the conductor's first
+  `TestLiveM1NoPhone` run on merged `main` (`750dffe`) failed with
+  `agent: utterance queue overflow`. The live harness had burst-written the whole ~600-frame
+  synthesized caller utterance; the 64-frame STT worker queue cannot drain during a real
+  0.6–0.9 s WebSocket handshake. Real telephony feeds 20 ms/frame. `m1_live_test.go` now uses
+  `feedPacedWhileRunning` (one frame per 20 ms, stops on `runDone`) for both scripted
+  utterances; `sendFrames` remains the instant burst for credential-free integration tests.
+  No production VAD/queue/`audioFeedBuffer` change. Dated details in
+  `plans/05-conversation.md` §13. The no-phone gate remains pending a fresh conductor run.
+- **Status:** C4 → 🔵 code complete pending the conductor's re-run of `make live-test-m1`
+  after the harness pacing fix. Real-phone M1 remains blocked by the Twilio
+  trial/outbound-DTMF/controlled IVR+hold prerequisites; C1 and the real-phone M0 exit
+  remain blocked as before.
 
 
 ### 2026-11-17 — C3 conductor live-gate session (Europe/Vienna)

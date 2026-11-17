@@ -116,11 +116,11 @@ func TestLiveM1NoPhone(t *testing.T) {
 	session.sendProgress()
 	awaitMarks(t, session, 2, 90*time.Second)
 	sentBefore := sentFrames(session)
-	feedWhileRunning(t, session, first, runDone)
+	feedPacedWhileRunning(t, session, first, runDone)
 	// Wait for the assistant to start speaking the first reply, then barge with the second
 	// scripted caller utterance.
 	awaitAudioGrowth(t, session, sentBefore, 90*time.Second, runDone)
-	feedWhileRunning(t, session, second, runDone)
+	feedPacedWhileRunning(t, session, second, runDone)
 	select {
 	case <-runDone:
 	case <-time.After(4 * time.Minute):
@@ -241,12 +241,27 @@ func awaitAudioGrowth(t *testing.T, session *integrationSession, baseline int, t
 	t.Fatal("assistant never produced audio for the barge scenario")
 }
 
-func feedWhileRunning(t *testing.T, session *integrationSession, frames [][]byte, runDone <-chan struct{}) {
+// liveFramePace is the canonical 20 ms frame rate (50 fps). A real caller's audio reaches
+// the agent at this rate, which is what the bounded STT worker queue was sized for. Feeding
+// a whole synthesized utterance as a tight burst here would be a harness artifact: a real
+// WebSocket handshake (0.6–0.9 s) cannot drain a ~600-frame burst through a 64-frame queue.
+// The credential-free integration tests keep the instant burst; only this live path paces.
+const liveFramePace = 20 * time.Millisecond
+
+// feedPacedWhileRunning writes one canonical frame per 20 ms, stopping early if the runner
+// finishes. This mirrors real telephony and prevents a harness-induced queue overflow.
+func feedPacedWhileRunning(t *testing.T, session *integrationSession, frames [][]byte, runDone <-chan struct{}) {
 	t.Helper()
-	select {
-	case <-runDone:
-		t.Fatal("call ended before scripted audio could be fed")
-	default:
+	ticker := time.NewTicker(liveFramePace)
+	defer ticker.Stop()
+	for _, frame := range frames {
+		select {
+		case <-runDone:
+			return
+		case <-ticker.C:
+		}
+		if !session.trySendFrame(frame) {
+			return
+		}
 	}
-	session.sendFrames(frames)
 }
