@@ -10,19 +10,22 @@
 
 ## Status at a glance (update every session)
 
-- **Phase:** C0 ✅; **C1 code complete** (live audio blocked by Twilio trial); **C2 ✅
-  code complete** — Mistral STT/TTS/dialogue adapters implemented, fake-provider suites
-  green, and the optional live smoke **passed** (TTS→STT→dialogue; float32 PCM encoding
-  confirmed).
-- **Current chunk:** C2 — Mistral STT/TTS/dialogue adapters (done). Next: write
-  `plans/04-m0-e2e.md` and start C3.
-- **First action of the next session:** write the C3 plan (call runner + agent engine,
-  M0 end-to-end), which consumes the C2 adapters and the C1 Twilio adapter; the first real
-  end-to-end phone call still needs an upgraded Twilio account plus the real Mistral key.
-- **Blockers:** Twilio trial account strips `<Stream>` (live Media Streams audio) — C1 🔵;
-  no code blocker. Operational: `golangci-lint` absent (optional; CI installs v2.15.0);
+- **Phase:** C0 ✅; **C1 code complete** (live audio blocked by Twilio trial); **C2 ✅**
+  (Mistral adapters, fake suites green, live smoke passed); **C3 code complete** (call
+  runner + agent engine v0, credential-free full fake-Mistral chain green) but **🔵 pending
+  its real-Mistral no-phone live gate**, which this session was instructed not to run.
+- **Current chunk:** C3 — call runner + agent engine v0. Next: the conductor runs
+  `LIVE_MISTRAL=1 make live-test-m0`; only then may C3 move to ✅. C4 is planned after that.
+- **First action of the next session:** run the C3 no-phone live gate with explicit
+  approval and record the observed result; then write `plans/05-conversation.md`.
+- **Blockers:** the C3 live no-phone gate has not been run yet (requires explicit approval
+  and spends real Mistral credit); DESIGN's real-phone M0 exit remains blocked by the
+  Twilio trial stripping `<Stream>` — C1 🔵. Operational: `golangci-lint` absent locally
+  (optional; CI installs v2.15.0; the C3 session used the /tmp v2.15.0 binary);
   `/usr/bin/make` broken by the Xcode 16.2/macOS 26 issue — use
-  `/Library/Developer/CommandLineTools/usr/bin/make`.
+  `/Library/Developer/CommandLineTools/usr/bin/make`. Build/test commands may need
+  `GOCACHE=/tmp/insteadly-go-cache` in this sandbox because `~/Library/Caches/go-build` is
+  not writable here.
 
 ---
 
@@ -33,7 +36,7 @@
 | **C0** | M0 | Foundation: Go module, hexagon skeleton (domain, all 6 port contracts, config loader, local storage adapter, stub providers, composition root, HTTP API). Zero external deps, zero credentials. | [plans/01-foundation.md](plans/01-foundation.md) | ✅ |
 | **C1** | M0 | Twilio telephony adapter (voice-api): webhooks, Media Streams WebSocket, µ-law→PCM16, DTMF. | [plans/02-twilio-telephony.md](plans/02-twilio-telephony.md) | 🔵 code complete; live audio blocked by Twilio trial |
 | **C2** | M0 | Mistral adapters for STT / TTS / Dialogue (raw WS/JSON APIs, no Go SDK exists). | [plans/03-mistral-ai.md](plans/03-mistral-ai.md) | ✅ code complete; live smoke passed |
-| **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | `plans/04-m0-e2e.md` (TBD) | ⬜ |
+| **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | [plans/04-m0-e2e.md](plans/04-m0-e2e.md) | 🔵 code complete; real-Mistral no-phone gate not yet run; real phone blocked by Twilio trial |
 | **C4** | M1 | Conversation: VAD / turn-taking, barge-in, DTMF through IVRs, structured outcome extraction. | `plans/05-conversation.md` (TBD) | ⬜ |
 | **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE. | `plans/06-orchestration.md` (TBD) | ⬜ |
 | **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | `plans/07-web-app.md` (TBD) | ⬜ |
@@ -41,11 +44,72 @@
 
 Chunk plans are written **one chunk ahead** in the same style as the C0 plan (scope,
 preconditions, exact contracts, steps with verify commands, test plan, definition of done).
-C1's plan is ready; before starting C2, write `plans/03-mistral-ai.md`.
+C4's plan (`plans/05-conversation.md`) is written only after the C3 live no-phone gate is
+observed; the real-phone M0 exit still waits on the Twilio account upgrade.
 
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C3 implementation session (Europe/Vienna)
+
+- Implemented [plans/04-m0-e2e.md](plans/04-m0-e2e.md) end to end **without running any
+  live test** (per explicit instruction). Committed on `feat/c3-call-runner-agent` and PR #3
+  opened against `main`; **not merged**.
+- **New core packages:**
+  - `internal/core/agent/`: `agent.go` (Config/New/Engine/Run, turn loop, limits),
+    `gate.go` (bounded PCM16LE RMS/pre-roll/start/min/silence/max utterance delimiter),
+    `transcribe.go` (one STT stream per utterance, 20 ms/frame replay, exactly one final),
+    `speak.go` (lazy TTS, verbatim text, concurrent `SendAudio` drainer, Close ordering),
+    `tools.go` + `booking_tools.go` (strict tool schemas/decoding/results, per-call
+    proposal/confirmation/capture/escalation state, booked-outcome consistency),
+    `prompt.go` (fixed German policy + deterministic order JSON + greeting),
+    `schema.go` (canonical outcome schema), `errors.go`; 92.9 % statements covered.
+  - `internal/core/runner/`: `runner.go` (claim `scheduled→dialing`/attempts++, one
+    call-lifetime `Dial`, event-driven transitions, optional `StreamReady`, agent handoff),
+    `events.go` (post-answer relay + stable sentinels), `outcome.go` (outcome precedence and
+    fixed fallbacks), `shutdown.go` (active-call cancellation/wait); 90.3 % covered.
+- **Wiring/lifecycle:** `internal/app` constructs one stateless agent + one runner, exposes
+  `App.Agent`/`App.Runner`, and `App.Close` drains the runner. `cmd/insteadly` closes the
+  runner **before** `http.Server.Shutdown` on both the signal and listener-error paths.
+  No new HTTP route, env key, `Summary` key, or module dependency.
+- **Tests:** exhaustive core fakes (no adapter imports); `internal/app/m0_integration_test.go`
+  composes the real C2 STT/TTS/dialogue adapters against loopback fake WS/SSE Mistral
+  servers plus fake telephony and proves the booked chain (dial/events/statuses → canonical
+  inbound → STT final → propose/confirm execution + exact results → streamed dialogue/TTS →
+  non-silent canonical outbound → booked Finish/Hangup/attempts=1), plus
+  callback_needed/failed/aborted and remote busy/no-answer variants.
+- **Live harnesses (compile/skip only; NOT run):** `m0_live_test.go`
+  (`TestLiveM0NoPhone`, double-gated on `LIVE_MISTRAL=1` + `MISTRAL_API_KEY`) and
+  `m0_phone_live_test.go` (`TestLiveM0Phone`, additionally `LIVE_M0_PHONE=1` +
+  `LIVE_TWILIO=1` + `TEST_PHONE` + full Twilio/tunnel config). New Makefile targets
+  `live-test-m0` and `live-test-m0-phone`; both excluded from `verify`/CI.
+- **Automated verification (observed):**
+  - `/Library/Developer/CommandLineTools/usr/bin/make verify` → gofmt/vet clean,
+    `go test -race -count=1 ./...` all packages `ok`, `OK: core imports no adapters`,
+    binary built.
+  - `golangci-lint v2.15.0` (from `/tmp`) → **0 issues**.
+  - `make cover` → **87.0 %** total; **agent 92.9 %**, **runner 90.3 %**.
+  - `go test -race -count=10 ./internal/core/agent ./internal/core/runner ./internal/app`
+    → green.
+  - `go test -tags live -count=1 -run 'TestLiveM0(NoPhone|Phone)$' -v ./internal/app`
+    → both **SKIP** without gates.
+  - `go mod tidy` + `git diff --exit-code -- go.mod go.sum` → no drift; still exactly
+    `github.com/coder/websocket v1.8.15`.
+  - `git diff main -- internal/core/domain internal/core/ports internal/httpapi docs/api.md`
+    → empty.
+  - No-env boot: `/healthz` 200 (`stub`/`local`), `POST /api/v1/orders` 201 `created`,
+    `POST /api/v1/orders/abc/call` → 404 (no call route), SIGTERM → `shutting down`,
+    exit 0.
+- **Deviations (also in plan §13):** no live test was run (conductor runs the no-phone
+  gate), so C3 is 🔵 not ✅; test-only constructor knobs `agent.Config.Sleep`,
+  `agent.Config.CleanupTimeout`, and `runner.Config.ReadinessTimeout`; an active run
+  canceled by `Runner.Close` returns both `ErrClosed` and `context.Canceled`; the gate
+  discards sub-minimum noise and keeps listening, while the "please repeat" prompt is for
+  an empty **final transcript**; `App` exposes both `Agent` and `Runner`.
+- **Environment:** no new `.env`/`INSTEADLY_*` keys and no new module dependencies; the
+  real key/phone/Twilio config were not read, and no live test or phone call was run. The
+  sandbox needed `GOCACHE=/tmp/insteadly-go-cache` for Go builds/tests.
 
 ### 2026-11-17 — C2 implementation session (Europe/Vienna)
 
@@ -304,6 +368,13 @@ C1's plan is ready; before starting C2, write `plans/03-mistral-ai.md`.
   the voice route requires a known call ID plus matching `AccountSid`/`CallSid`. The WSS
   handshake is validated by AccountSID + call ID + media format. Trial accounts strip
   `<Stream>`; live audio needs an upgraded account.
+- **C3 execution surface:** `internal/core/runner.Runner.Run` is the only invocation path;
+  there is **no** public place-call/status endpoint. `internal/core/agent` owns the M0
+  energy/silence gate (640 B frames, RMS≥500, 200 ms pre-roll, 30-frame end silence,
+  15 s max utterance, 20 s listen timeout) and exactly four executed tools; `finish_call`
+  stays adapter-intercepted. The full rules live in `docs/agent.md`. The credential-free
+  fake-Mistral chain is the CI proof; `make live-test-m0` (real Mistral, no phone) is the
+  remaining C3 gate and `make live-test-m0-phone` stays deferred behind the Twilio upgrade.
 
 ---
 
@@ -350,5 +421,5 @@ C1's plan is ready; before starting C2, write `plans/03-mistral-ai.md`.
 | 4 | Payments provider confirmation (Stripe assumed) | before C6 |
 | 5 | Deployment target (EU region preferred) | before C7 |
 | 6 | Compliance gate (EU AI Act, GDPR, TKG, abuse prevention) | before production, per design |
-| 7 | Coarse `DialogueEngine` port — adopt now or later | C3 decision point |
+| 7 | Coarse `DialogueEngine` port — adopt now or later | **Resolved in C3:** not adopted; the fine-grained STT/TTS/Dialogue ports were sufficient. Revisit only for a real managed-pipeline adapter. |
 
