@@ -1181,3 +1181,31 @@ No live test was run in this fix session. Verification before re-running the gat
 verify`, `go test -race -count=10 ./internal/app -run 'TestM1Integration'`, live-tag
 compile/SKIP, lint, module and drift checks (recorded in `PROGRESS.md`). The gate remains
 pending a fresh conductor run.
+
+### 2026-11-17 — live no-phone script correction (test content only)
+
+The conductor re-ran the gate on merged `main` (`92d8cdf`, with the pacing fix) and it failed
+for a different, content-only reason: the first scripted utterance asked the model to book
+**and** abort, so the real model returned `finish_call(aborted)` with **no assistant text**.
+With zero assistant audio there was nothing to barge, and `awaitAudioGrowth` correctly saw the
+call end first (`clears=0`, only greeting frames sent). The STT/dialogue/outcome chain itself
+worked.
+
+Correction (test content only; no production change):
+
+- `first` is now exactly `"Guten Tag. Ich möchte bitte einen Termin vereinbaren."` — it
+  elicits a spoken reply instead of instructing the model to finish.
+- The abort instruction remains only in `second`
+  (`"Stopp, ich möchte noch etwas sagen. Bitte beenden Sie den Anruf jetzt mit dem Ergebnis abgebrochen."`),
+  fed after the assistant starts speaking so the barge → clear → `finish_call(aborted)` flow
+  is exercised.
+- `awaitAudioGrowth` now requires only `liveReplyGrowthFrames = 5` new canonical frames
+  (100 ms) above the greeting baseline, so a short-but-real first reply is not rejected as
+  "no audio".
+- The comment above the scripts records why the first utterance must not contain the abort
+  instruction.
+
+No live test was run in this fix session. Verification before re-running the gate: `make
+verify`, `go test -race -count=10 ./internal/app -run 'TestM1Integration'`, live-tag
+compile/SKIP, lint, module and drift checks are recorded in `PROGRESS.md`. The gate remains
+pending a fresh conductor run.
