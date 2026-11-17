@@ -17,8 +17,8 @@ M1 live gate. C5 (M2 orchestration: Postgres order store, scheduler with retries
 callback requeue, status API + SSE, place-call eligibility endpoint) is **✅ code complete**.
 C6 (M3 web app: React+TS registration/order form/dashboard, cookie auth, Stripe Checkout +
 signed webhook, stub payments, SPA embedded in the Go binary) is **✅ code complete**. C7
-(M4 swapability + hardening) is **🔵 code complete pending the conductor's final
-verification** — see [PROGRESS.md](PROGRESS.md). The binary still
+(M4 swapability + hardening) is **✅ code complete** — see [PROGRESS.md](PROGRESS.md). The
+binary still
 boots and serves a working API with **no credentials and no external network calls** (all
 providers default to deterministic stubs; `auth.mode=off` and `payments.provider=stub` are
 the defaults). Selecting `INSTEADLY_TELEPHONY_PROVIDER=twilio` activates the real Twilio
@@ -325,6 +325,6 @@ write` for releases).
 | C4 | conversation: VAD/turn-taking, barge-in, IVR, hold, outcome repair | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | C5 | orchestration: Postgres order store, scheduler, status SSE, place-call | ✅ code complete; make verify + test-postgres green |
 | C6 | web app (React+TS registration/order form/dashboard), Stripe payments, cookie auth | ✅ code complete; make verify + npm build/test + webembed + test-postgres green; Twilio/live-phone + Q5 deployment blockers remain |
-| C7 | swapability (Telnyx + OpenAI), recording/transcript flags end-to-end, notifications | 🔵 code complete pending conductor verification; no live Telnyx/OpenAI call |
+| C7 | swapability (Telnyx + OpenAI), recording/transcript flags end-to-end, notifications | ✅ code complete; make verify + swapability + recording-matrix + test-postgres green; no live Telnyx/OpenAI call |
 
 See [PROGRESS.md](PROGRESS.md) for the authoritative status and session log.

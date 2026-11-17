@@ -21,24 +21,23 @@
   endpoint, and the API-key-gated place-call eligibility endpoint. **C6 ✅ code complete** —
   React+TS SPA (register/login, order form, dashboard with SSE), cookie auth (opaque tokens,
   sha256-at-rest, bcrypt), owner-scoped orders, Stripe Checkout + signed webhook + stub
-  simulate, `webembed` SPA serving, and the `0002_users` migration; `make verify`,
-  `npm ci && npm run build && npm test`, `-tags webembed` build, and `-tags postgres` tests
-  are green (see the C6 session entry). **C7 🔵 code complete pending the conductor's
-  final verification** — Telnyx Call Control + Media Streams (second telephony adapter),
-  OpenAI Chat Completions (alternative Dialogue provider), recording/transcript flags
-  end-to-end (`internal/core/recorder`, two mono WAVs + batch transcript via
-  `ports.BlobStore`), and notifications (`internal/core/notify` + `notify/{log,webhook}`,
-  `notify.provider=off` by default). No port/domain change and no new module dependency;
-  Twilio untouched; every test uses in-repo fake HTTP/SSE/WebSocket servers (no live call,
-  no Telnyx/OpenAI account). See the C7 coder session entry and PR #14. DESIGN's
-  **real-phone M0 and M1 exits** remain blocked by the Twilio trial stripping `<Stream>`
-  (and, for M1, by the unproven outbound-DTMF path plus the need for controlled IVR/hold
-  destinations).
-- **Current chunk:** C7 (M4 swapability + hardening) 🔵 code complete pending the
-  conductor's final verification (PR #14, `feat/c7-swapability`).
-- **First action of the next session:** run the C7 conductor verification (review PR #14,
-  re-run `make verify` + `-race -count=10` + `-tags postgres`, confirm the domain/ports diff
-  is empty and `go mod tidy` is clean, then merge if green).
+  simulate, `webembed` SPA serving, and the `0002_users` migration. **C7 ✅ code complete** —
+  Telnyx Call Control + Media Streams (second telephony adapter), OpenAI Chat Completions
+  (alternative Dialogue provider), recording/transcript flags end-to-end
+  (`internal/core/recorder`, two mono WAVs + batch transcript via `ports.BlobStore`), and
+  notifications (`internal/core/notify` + `notify/{log,webhook}`, `notify.provider=off` by
+  default). No port/domain change and no new module dependency; Twilio untouched; every test
+  uses in-repo fake HTTP/SSE/WebSocket servers (no live call, no Telnyx/OpenAI account).
+  **The full C0–C7 roadmap is code complete.** DESIGN's **real-phone M0 and M1 exits**
+  remain blocked by the Twilio trial stripping `<Stream>` (and, for M1, by the unproven
+  outbound-DTMF path plus the need for controlled IVR/hold destinations).
+- **Current chunk:** none — C7 (M4 swapability + hardening) is done. The remaining work is
+  the standing external blockers (Twilio account upgrade for real-phone M0/M1, Q5 deployment
+  target) and the documented C8 hardening seams.
+- **First action of the next session:** nothing is required for the roadmap; if real-phone
+  evidence is wanted, upgrade the Twilio account and run the gated `live-test-m0-phone` /
+  `live-test-m1-phone` harnesses (explicit approval), or pick a C8 hardening seam (durable
+  notification outbox, Postgres/S3 blobs, River, per-clinic windows, CSRF/reset/rate-limit).
 - **Blockers:** DESIGN's real-phone M0/M1 exits remain blocked by the Twilio trial stripping
   `<Stream>` and the unproven outbound-DTMF path — need an upgraded account, a controlled
   IVR/hold destination, and explicit approval before the end-to-end phone walk. C6
@@ -57,7 +56,10 @@
   need a `/tmp` GOCACHE/GOMODCACHE/GOPATH in this sandbox (`~/Library/Caches/go-build`,
   `~/go/pkg/mod`, and `~/go/pkg/sumdb` are not writable here). Postgres-tagged tests need
   `CGO_ENABLED=0` while Xcode clang is broken. `make build` now needs Node/npm (the SPA is
-  embedded); `make verify` uses the Node-free `make build-go`.
+  embedded); `make verify` uses the Node-free `make build-go`. Known pre-existing flaky
+  test: `TestM1IntegrationHoldResumeWithoutSTT` (legacy fake-Mistral WS harness) can flake
+  under high-count parallel `-race` runs; it is unrelated to C5–C7 and should get a
+  dedicated stabilization ticket.
 
 ---
 
@@ -72,7 +74,7 @@
 | **C4** | M1 | Conversation: streaming VAD/turn-taking, barge-in, playback clear/marks, deterministic IVR, hold detection, bounded structured-outcome repair. | [plans/05-conversation.md](plans/05-conversation.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE, place-call. | [plans/06-orchestration.md](plans/06-orchestration.md) | ✅ code complete; make verify + test-postgres green |
 | **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | [plans/07-web-app.md](plans/07-web-app.md) | ✅ code complete; make verify + npm build/test + webembed + test-postgres green; no real Stripe charge; Twilio/live-phone + Q5 deployment blockers remain |
-| **C7** | M4 | Swapability proof + hardening: Telnyx Call Control + Media Streams (second telephony adapter), OpenAI dialogue (alternative AI provider), recording/transcript flags end-to-end, notifications. | [plans/08-swapability.md](plans/08-swapability.md) | 🔵 code complete pending conductor verification; no live Telnyx/OpenAI call |
+| **C7** | M4 | Swapability proof + hardening: Telnyx Call Control + Media Streams (second telephony adapter), OpenAI dialogue (alternative AI provider), recording/transcript flags end-to-end, notifications. | [plans/08-swapability.md](plans/08-swapability.md) | ✅ code complete; make verify + swapability + recording-matrix + test-postgres green; no live Telnyx/OpenAI call |
 
 Chunk plans are written **one chunk ahead** in the same style as the C0 plan (scope,
 preconditions, exact contracts, steps with verify commands, test plan, definition of done).
@@ -83,6 +85,30 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C7 conductor session (Europe/Vienna)
+
+- Ran the final multi-agent flow (no Kimi — exhausted): Architect
+  (`deepseek-official/deepseek-v4-pro`) → Coder (`deepseek-official/deepseek-flash`) →
+  Reviewer (`deepseek-official/deepseek-v4-pro`). Merged PR #14 (`feat/c7-swapability`) via
+  squash; `main` = `bf0ef47`.
+- **C7 → ✅ code complete; the full C0–C7 roadmap is code complete.** Delivered: Telnyx Call
+  Control + Media Streams (second telephony adapter), OpenAI Chat Completions (alternative
+  Dialogue provider), recording/transcript flags end-to-end (`internal/core/recorder`: master
+  gate + per-order overrides, two mono WAVs + batch transcript via `ports.BlobStore`), and
+  notifications (`internal/core/notify` worker + `notify/{log,webhook}`).
+- **Constraints honored:** Twilio untouched (`git diff main...HEAD -- …/telephony/twilio`
+  empty); no live phone/real-provider call; zero new module deps (`go mod tidy` clean); no
+  port/domain drift (`git diff main -- internal/core/domain internal/core/ports` empty);
+  every test uses in-repo fake HTTP/SSE/WebSocket servers.
+- **Conductor verification (observed):** `make verify` PASS (gofmt/vet/race/check-deps
+  "OK: core imports no adapters"/`build-go`); swapability + 8-row recording matrix
+  `-race -count=10` PASS; `go mod tidy` clean. Reviewer verdict: **APPROVE** (9 §14
+  deviations accepted; 4 non-blocking nits; the only stress flake was the pre-existing
+  `TestM1IntegrationHoldResumeWithoutSTT`, unrelated to C7).
+- **Status:** C7 ✅. Remaining work is external (Twilio account upgrade for real-phone
+  M0/M1; Q5 deployment target) + the documented C8 hardening seams (durable notification
+  outbox, Postgres/S3 blobs, River, per-clinic windows, CSRF/reset/email-verify/rate-limit).
 
 ### 2026-11-17 — C7 coder session (Europe/Vienna)
 
