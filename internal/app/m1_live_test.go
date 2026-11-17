@@ -57,12 +57,12 @@ func TestLiveM1NoPhone(t *testing.T) {
 
 	// The barge is deliberately against the fixed greeting, not a model reply. The greeting
 	// is a deterministic ~8.8 s assistant-audio window; a real reply can be short and quiet,
-	// so an acoustic barge onset may arrive only after it finished (the earlier harness even
-	// saw STT drop the initial "Stopp"). We feed one paced caller utterance during that
-	// window. "Stopp, Stopp!" gives a stronger acoustic cue without changing production
-	// policy. No transcript is logged.
+	// so an acoustic barge onset may arrive only after it finished. Measured real-TTS
+	// "Stopp, Stopp! …" begins with ~12 near-silent frames; "Guten Tag. …" starts with
+	// measurable speech energy. Feed this paced cue during the greeting. No transcript is
+	// logged.
 	bargeUtterance := synthesizeInbound(t, ctx, tts,
-		"Stopp, Stopp! Bitte beenden Sie den Anruf jetzt mit dem Ergebnis abgebrochen, denn das ist ein automatischer Test.")
+		"Guten Tag. Bitte beenden Sie den Anruf jetzt mit dem Ergebnis abgebrochen, denn das ist ein automatischer Test.")
 
 	storage, err := local.New(t.TempDir())
 	if err != nil {

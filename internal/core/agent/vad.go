@@ -11,7 +11,7 @@ import (
 const (
 	defaultPreRollFrames       = 15
 	defaultStartFrames         = 3
-	defaultBargeInFrames       = 5
+	defaultBargeInFrames       = 3
 	defaultMinActiveFrames     = 10
 	defaultEndSilenceFrames    = 35
 	defaultMaxUtteranceFrames  = 750
@@ -226,16 +226,24 @@ func (v *vad) bargeThreshold() float64 {
 	return math.Max(math.Max(v.energyThreshold(), v.cfg.BargeInNoiseRatio*v.noise), v.cfg.BargeInMinRMS)
 }
 
-// onsetFrame reports whether f is a speech-onset frame under the selected mode.
+// onsetFrame reports whether f is a speech-onset frame under the selected mode. Normal
+// listening onset still requires spectral flux so sustained background/music does not open
+// turns. Barge onset deliberately does not: real synthesized/telephone speech has short
+// loud runs (3–4 frames) that dip at consonant/phoneme boundaries, and flux only spikes at
+// transitions. The stronger barge energy floor (4·noise / 0.024) plus tone and flatness
+// checks preserve echo asymmetry without requiring an impossible run of flux transients.
 func (v *vad) onsetFrame(f frameFeatures, mode vadMode) bool {
 	threshold := v.energyThreshold()
 	if mode == vadBarge {
 		threshold = v.bargeThreshold()
 	}
-	return f.rms >= threshold &&
-		f.flatness < v.cfg.MaxSpectralFlatness &&
-		f.flux >= v.cfg.MinSpectralFlux &&
-		!f.strong
+	if f.rms < threshold || f.flatness >= v.cfg.MaxSpectralFlatness || f.strong {
+		return false
+	}
+	if mode == vadBarge {
+		return true
+	}
+	return f.flux >= v.cfg.MinSpectralFlux
 }
 
 // continuationFrame reports sustained speech: energy above the normal threshold and no

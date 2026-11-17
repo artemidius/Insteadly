@@ -291,7 +291,7 @@ user is speaking:
 |---|---|---|
 | `listening` | normal VAD; no outbound assistant audio | 60 ms confirmed speech onset opens one utterance worker; listen timeout remains 20 s |
 | `utterance` | pre-roll + live frames feed STT; results drain concurrently | 700 ms hangover after ≥200 ms active speech closes STT end-of-input; 15 s forces a boundary |
-| `assistant` | full-duplex VAD from `SendUserTurn`/`SubmitToolResults` start through final playback mark | 100 ms stronger speech onset emits barge-in; cancel model/TTS and clear playback |
+| `assistant` | full-duplex VAD from `SendUserTurn`/`SubmitToolResults` start through final playback mark | 60 ms stronger speech onset emits barge-in; cancel model/TTS and clear playback |
 | `tools` | keep receiving/transcribing at most one bounded pending utterance; never cancel an already-started atomic tool mutation | finish tool result continuation before a resulting assistant can speak; pending speech can then interrupt it |
 | `holding` | detect speech/silence/DTMF, but do not send hold audio to STT or dialogue | speech resumes normal VAD; 500 ms silence returns to listening; 90 s continuous hold ends with `failed/other` |
 | `ivr_wait` | after an evidence-backed digit, wait for a new menu, hold, or human speech | repeated/ambiguous/looping menus and the 15 s post-digit timeout follow §3.9 |
@@ -336,9 +336,13 @@ For every complete 20 ms canonical frame:
 - A speech-onset frame requires energy above threshold, spectral flatness `<0.75`, flux `>=0.04`,
   and no strong hold-tone match. While already in an utterance, continuation requires energy above
   threshold and no hold-tone match; flux is not required for sustained vowels.
-- During `assistant`, barge-in instead requires **5 consecutive onset frames / 100 ms** above
-  `max(normalThreshold, 4*noise, 0.024)`, with the same flux/flatness/tone checks. This asymmetric
-  threshold reduces false interruptions but is not echo cancellation.
+- During `assistant`, barge-in requires **3 consecutive barge frames / 60 ms** above
+  `max(normalThreshold, 4*noise, 0.024)`, with flatness/tone checks but **no per-frame spectral
+  flux requirement**. Normal listening onset keeps flux. Measured real Mistral TTS speech runs
+  are only 3–4 loud frames before consonant/phoneme dips (e.g. RMS 0.0046, 0.0373, 0.0946,
+  0.0897, 0.0366, 0.0035, …), so a 5-frame AND-flux rule was effectively unreachable for real
+  speech; the stronger energy floor plus tone exclusion preserves barge asymmetry. This is not
+  echo cancellation.
 - In the normal listening state, start after **3 consecutive onset frames (60 ms)**. Prepend exactly
   **15 frames / 300 ms** of bounded pre-roll, including the onset frames exactly once. Require
   **10 total active frames /
@@ -668,7 +672,7 @@ integration, and live tests. Group the superseded M0 gate knobs rather than addi
 type VADConfig struct {
 	PreRollFrames       int           // 15
 	StartFrames         int           // 3
-	BargeInFrames       int           // 5
+	BargeInFrames       int           // 3 (60 ms; no per-frame flux)
 	MinActiveFrames     int           // 10
 	EndSilenceFrames    int           // 35
 	MaxUtteranceFrames  int           // 750
@@ -884,7 +888,7 @@ needed). Never edit `.env` or print credentials.
 | `agent/vad_test.go` | 60 ms onset; cough/60 ms noise rejected; 200 ms minimum; 300 ms pre-roll exactly once; 700 ms hangover; 15 s force and continuing-speech restart; quiet speech over rising/falling noise; frozen floor in playback/hold; tones never speech; malformed audio and timeout |
 | `agent/listen_test.go` / `transcribe_test.go` | STT opens at onset; pre-roll burst then live order; partial before Close; cumulative partials not concatenated; early final does not endpoint; exactly one final; empty/multiple final; handshake/feed/close errors; one active + one closing worker; pending-final bound; terminal/cancel and no goroutine leak |
 | `agent/speak_test.go` | sentence/240-rune/Unicode segmentation; lazy empty/tool-only TTS; normal close while draining; Abort never flushes; mark after final audio; normal confirmed sequence; ack timeout; late/duplicate/out-of-order mark; TTS/feed/send/abort errors; no tool execution before playback completes |
-| `agent/bargein_test.go` | speech while model streams and while TTS plays; 100 ms threshold; tone/cough no barge; cancel before clear; clear once; old audio discarded; new utterance pre-roll retained; confirmed text only; current unmarked segment omitted; empty confirmed text; clear failure; terminal race; no repeated prior tools |
+| `agent/bargein_test.go` | speech while model streams and while TTS plays; 60 ms/no-flux barge threshold; tone/cough no barge; cancel before clear; clear once; old audio discarded; new utterance pre-roll retained; confirmed text only; current unmarked segment omitted; empty confirmed text; clear failure; terminal race; no repeated prior tools |
 | `agent/ivr_test.go` | German/English digit-before/after-purpose; number words, `*`, `#`; date/phone/hour not a menu; unrelated/emergency/ambiguous choices; unique target; one send per menu; new menu after reconnect; human exit; repeat/loop/four-step/15 s dead ends; send failure = error; inbound DTMF never auto-echoed; pure IVR creates no booking |
 | `agent/hold_test.go` | silence ≠ hold; 350/440/480/620 continuous/cadence fixtures; music-like fixture; speech/noise rejection; 3 s entry; cancel greeting/assistant on hold; no STT/dialogue while holding; speech and 500 ms silence exits; 90 s continuous timeout; DTMF/terminal while holding; max call still wins |
 | `agent/recovery_test.go` | schema/domain invalid; tool/outcome mismatch; empty turn; model-only 45 s deadline; fixed control content; first and second recovery success; third need exhausted; per-call budget not reset; tool/capture not duplicated; operational/caller/terminal errors not repaired; valid booked still needs C3 confirmation |
@@ -989,7 +993,7 @@ outbound DTMF, and does not clear the earlier real-phone M0 blocker.
 
 | Risk/gate | Required handling |
 |---|---|
-| Assistant echo falsely triggers barge-in; no AEC | Stronger 100 ms/4× noise onset, tone exclusion, frozen noise floor; document speakerphone limitation; require handset real-phone evidence before tuning or claiming robustness |
+| Assistant echo falsely triggers barge-in; no AEC | Stronger 60 ms/4× noise barge onset (energy/tone/flatness, no per-frame flux), tone exclusion, frozen noise floor; document speakerphone limitation; require handset real-phone evidence before tuning or claiming robustness |
 | Mark mistaken for human hearing or exact partial text | Confirm whole segments only; omit unmarked partial text; docs/tests say provider-played, not heard |
 | Per-segment TTS adds handshake latency or unnatural prosody | Keep segments bounded but punctuation-first; measure in no-phone live test; do not silently revert to duration-based text guessing |
 | Old media races after `clear`; old mark arrives late | Adapter epoch + serialized writes + core generation/sequence IDs; explicit race tests |
@@ -1238,3 +1242,37 @@ Correction (test content only; no production change):
 No live test was run in this fix session. Verification before re-running the gate: `make
 verify`, `go test -race -count=10 ./internal/app -run 'TestM1Integration'`, live-tag
 compile/SKIP, lint, module and drift checks are recorded in `PROGRESS.md`.
+
+### 2026-11-17 — barge-onset VAD tuning (production change)
+
+The conductor's gate run on merged `main` (`35d3512`, greeting barge) still reported `clears=0`.
+Direct measurement of real Mistral TTS frames showed the barge rule itself was unreachable for
+real speech:
+
+- `"Stopp, Stopp! …"` had ~12 leading near-silent frames (RMS ≈ 0.0001–0.0036) before speech.
+- `"Guten Tag. …"` RMS was 0.0046, **0.0373, 0.0946, 0.0897, 0.0366**, 0.0035, 0.0014,
+  0.0054, **0.1160, 0.1388, 0.1509, 0.1167** — only 3–4 consecutive loud frames before
+  consonant/phoneme dips.
+- The old barge rule required **5 consecutive** frames that each also satisfied
+  `flux >= 0.04`. Flux only spikes at transitions, so the rule essentially never matched real
+  speech; synthetic multi-tone fixtures passed only because their flux stayed high every frame.
+
+Production tuning (authorized by the conductor):
+
+1. Barge onset no longer requires per-frame spectral flux: a barge frame needs
+   `rms >= max(normalThreshold, 4·noise, 0.024)`, `flatness < 0.75`, and no strong hold tone.
+   Normal listening onset still requires `flux >= 0.04`; ordinary turn-taking is unchanged.
+2. `BargeInFrames` default is now **3 (60 ms)** instead of 5 (100 ms), because measured real
+   speech offers only 3–4 loud consecutive frames. The barge energy floor remains strictly
+   stronger than normal onset, so echo/background asymmetry is retained; this is still not
+   acoustic echo cancellation.
+3. The live no-phone cue now starts with measurable speech energy:
+   `"Guten Tag. Bitte beenden Sie den Anruf jetzt mit dem Ergebnis abgebrochen, denn das ist ein automatischer Test."`
+   (the previous `"Stopp, Stopp!"` cue began with ~240 ms near-silence).
+
+Added regression tests: `TestVADBargeFiresOnSteadyLoudVoicedFramesWithoutFlux` (stationary loud
+frames have near-zero flux, yet 3 barge frames fire) and
+`TestVADBargeFiresOnMeasuredSpeechProfile` (the measured RMS envelope with a consonant dip).
+Existing synthetic VAD/listener/barge tests were updated for the 60 ms threshold. `docs/agent.md`
+and the plan's §3.7/§5/§7/§9 text now state the tuned rule. No live test was run in this fix
+session; fake-only verification is recorded in `PROGRESS.md`.
