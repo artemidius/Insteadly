@@ -16,14 +16,18 @@ bounded structured-outcome repair) is **✅ code complete** after its real-Mistr
 M1 live gate. C5 (M2 orchestration: Postgres order store, scheduler with retries and
 callback requeue, status API + SSE, place-call eligibility endpoint) is **✅ code complete**.
 C6 (M3 web app: React+TS registration/order form/dashboard, cookie auth, Stripe Checkout +
-signed webhook, stub payments, SPA embedded in the Go binary) is **✅ code complete** — see
-[PROGRESS.md](PROGRESS.md). The binary still
+signed webhook, stub payments, SPA embedded in the Go binary) is **✅ code complete**. C7
+(M4 swapability + hardening) is **🔵 code complete pending the conductor's final
+verification** — see [PROGRESS.md](PROGRESS.md). The binary still
 boots and serves a working API with **no credentials and no external network calls** (all
 providers default to deterministic stubs; `auth.mode=off` and `payments.provider=stub` are
 the defaults). Selecting `INSTEADLY_TELEPHONY_PROVIDER=twilio` activates the real Twilio
-Voice + Media Streams adapter; selecting `INSTEADLY_{STT,TTS,DIALOGUE}_PROVIDER=mistral`
-activates the real Mistral speech and dialogue adapters (see
-[docs/mistral.md](docs/mistral.md)).
+Voice + Media Streams adapter; `INSTEADLY_TELEPHONY_PROVIDER=telnyx` selects the C7 Telnyx
+Call Control + Media Streams adapter (see [docs/telnyx.md](docs/telnyx.md)); selecting
+`INSTEADLY_{STT,TTS}_PROVIDER=mistral` and
+`INSTEADLY_DIALOGUE_PROVIDER={mistral,openai}` activates the real Mistral speech adapters
+and the selected dialogue provider (see [docs/mistral.md](docs/mistral.md) and
+[docs/openai.md](docs/openai.md)).
 
 C4's conversation engine is proven credential-free against loopback fake Mistral servers and
 scripted fake telephony, and the full C4 unit/race suite is green, plus a real-Mistral
@@ -47,7 +51,19 @@ on the current **trial** account, so DESIGN's real-phone M1 exit (and the earlie
 M0 exit) is still deferred. C6 deliberately does **not** implement River/a job queue,
 per-clinic opening hours (Q3), notifications, refunds/subscriptions, recording persistence,
 or production hardening (CSRF token, password reset, email verification, rate limiting).
-See [docs/architecture.md](docs/architecture.md) and [PROGRESS.md](PROGRESS.md).
+
+C7 proves the DESIGN §1.2 swap-anytime promise with a second adapter per capability — Telnyx
+for telephony and OpenAI for dialogue — and closes the two deferred hardening gaps:
+**recording/transcript flags end-to-end** (two mono WAVs + a post-call transcript through
+`ports.BlobStore`, flags default off) and **notifications** (`log`/`webhook` adapters behind
+the existing `ports.Notifier`, driven by a deduped hub worker; `notify.provider=off` remains
+the default). It changes **no port or domain contract** and adds no module dependency: the
+core gains only `internal/core/recorder`, `internal/core/notify`, and one optional
+`runner.Config.Recorder` field. Twilio is untouched, and every C7 test runs against in-repo
+fake HTTP/SSE/WebSocket servers — **no live call or Telnyx/OpenAI account was used**. Still
+out of scope: River/durable outbox, CSRF/reset/email-verify/rate limiting, a Postgres/S3 blob
+store, and the Q5 deployment target. See [docs/architecture.md](docs/architecture.md),
+[docs/recording.md](docs/recording.md), and [docs/notifications.md](docs/notifications.md).
 
 Design of record: [DESIGN.md](DESIGN.md). Chunk plans live in [`plans/`](plans/).
 
@@ -123,15 +139,23 @@ ignored.
 | `INSTEADLY_HTTP_PUBLIC_URL` | — | public **https** origin Twilio reaches (tunnel URL); required when telephony is twilio in `voice-api` mode |
 | `INSTEADLY_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `INSTEADLY_LOG_FORMAT` | `text` | `text`, `json` |
-| `INSTEADLY_TELEPHONY_PROVIDER` | `stub` | `stub`, `twilio` |
+| `INSTEADLY_TELEPHONY_PROVIDER` | `stub` | `stub`, `twilio`, `telnyx` |
 | `INSTEADLY_TWILIO_ACCOUNT_SID` | — | **secret** |
 | `INSTEADLY_TWILIO_AUTH_TOKEN` | — | **secret** |
 | `INSTEADLY_TWILIO_PHONE_NUMBER` | — | caller ID, E.164 |
-| `INSTEADLY_TWILIO_MODE` | `voice-api` | `voice-api`, `sip-trunk` (SIP trunk lands in C7) |
+| `INSTEADLY_TWILIO_MODE` | `voice-api` | `voice-api`, `sip-trunk` (not implemented; returns `ErrNotImplemented`) |
 | `INSTEADLY_TWILIO_RING_TIMEOUT_SECONDS` | `0` | Twilio `Timeout` (0 = Twilio default ~60 s); trial accounts reject this parameter |
+| `INSTEADLY_TELNYX_API_KEY` | — | **secret**; required when provider is `telnyx` |
+| `INSTEADLY_TELNYX_CONNECTION_ID` | — | Call Control application/connection id; required when `telnyx` |
+| `INSTEADLY_TELNYX_FROM_NUMBER` | — | caller ID, E.164; required when `telnyx` |
+| `INSTEADLY_TELNYX_RING_TIMEOUT_SECONDS` | `0` | `timeout_secs` (0 = Telnyx default 30 s, else 5..600) |
+| `INSTEADLY_TELNYX_WEBHOOK_PUBLIC_KEY` | — | optional Ed25519 public key (base64 or PEM) for webhook/WebSocket signature checks; signed requests fail closed without it |
 | `INSTEADLY_STT_PROVIDER` | `stub` | `stub`, `mistral` |
 | `INSTEADLY_TTS_PROVIDER` | `stub` | `stub`, `mistral` |
-| `INSTEADLY_DIALOGUE_PROVIDER` | `stub` | `stub`, `mistral` |
+| `INSTEADLY_DIALOGUE_PROVIDER` | `stub` | `stub`, `mistral`, `openai` |
+| `INSTEADLY_OPENAI_API_KEY` | — | **secret**; required only when `dialogue.provider=openai` |
+| `INSTEADLY_OPENAI_BASE_URL` | `https://api.openai.com/v1` | absolute **https** URL (a path is allowed; no query/userinfo) |
+| `INSTEADLY_OPENAI_DIALOGUE_MODEL` | `gpt-4o-mini` | |
 | `INSTEADLY_STORAGE_PROVIDER` | `local` | `local`, `postgres` |
 | `INSTEADLY_STORAGE_LOCAL_DIR` | `./data` | storage root; also hosts blobs in postgres mode |
 | `INSTEADLY_POSTGRES_DSN` | — | **secret**; full libpq/URL DSN, required when provider is `postgres` |
@@ -154,9 +178,9 @@ ignored.
 | `INSTEADLY_STRIPE_SECRET_KEY` | — | **secret**; required when provider is `stripe` |
 | `INSTEADLY_STRIPE_WEBHOOK_SECRET` | — | **secret**; required when provider is `stripe`; `whsec_…` |
 | `INSTEADLY_STRIPE_PRICE_ID` | — | one Stripe Price id for the prototype Checkout Session |
-| `INSTEADLY_RECORDING_ENABLED` | `false` | global default (DESIGN.md §3.4) |
-| `INSTEADLY_TRANSCRIPT_ENABLED` | `false` | global default |
-| `INSTEADLY_AUDIO_ENABLED` | `false` | global default |
+| `INSTEADLY_RECORDING_ENABLED` | `false` | master recording gate (DESIGN.md §3.4); C7 makes it effective |
+| `INSTEADLY_TRANSCRIPT_ENABLED` | `false` | persist a post-call transcript (requires the master gate) |
+| `INSTEADLY_AUDIO_ENABLED` | `false` | persist WAV audio (requires the master gate); see [docs/recording.md](docs/recording.md) |
 | `INSTEADLY_MISTRAL_API_KEY` | — | **secret**; required only when a Mistral provider is selected |
 | `INSTEADLY_MISTRAL_API_BASE_URL` | `https://api.mistral.ai` | absolute **https** origin |
 | `INSTEADLY_MISTRAL_STT_REALTIME_MODEL` | `voxtral-mini-transcribe-realtime-3` | |
@@ -166,6 +190,9 @@ ignored.
 | `INSTEADLY_MISTRAL_TTS_VOICE` | `voice_447` | |
 | `INSTEADLY_MISTRAL_TTS_MODE` | `realtime` | `realtime`, `offline` |
 | `INSTEADLY_MISTRAL_DIALOGUE_MODEL` | `mistral-small-2603` | |
+| `INSTEADLY_NOTIFY_PROVIDER` | `off` | `off` (no notifier/worker), `log`, `webhook` |
+| `INSTEADLY_NOTIFY_WEBHOOK_URL` | — | **secret**; required when provider is `webhook` |
+| `INSTEADLY_NOTIFY_WEBHOOK_CHANNEL` | `email` | `email`, `sms` |
 
 Stripe mode additionally requires `INSTEADLY_HTTP_PUBLIC_URL` (Checkout success/cancel URLs
 are absolute) and is the only configuration that mounts the signed webhook route. The stub
@@ -205,10 +232,12 @@ contract, and the live-test recipe are described in [docs/mistral.md](docs/mistr
 | `make fmt` | `gofmt -w .` |
 | `make clean` / `make clean-data` | remove `bin/` / `data/` |
 
-Dependencies (Go): `github.com/coder/websocket` v1.8.15 (Twilio Media Streams and Mistral
-realtime WebSockets), `github.com/jackc/pgx/v5` v5.13.0 (Postgres driver/pool, C5), and
-`github.com/stripe/stripe-go/v87` v87.1.0 (Checkout + signed webhooks, C6). C6 also promotes
-`golang.org/x/crypto` v0.58.0 to a direct dependency for bcrypt.
+Dependencies (Go): `github.com/coder/websocket` v1.8.15 (Twilio and Telnyx Media Streams and
+Mistral realtime WebSockets), `github.com/jackc/pgx/v5` v5.13.0 (Postgres driver/pool, C5),
+and `github.com/stripe/stripe-go/v87` v87.1.0 (Checkout + signed webhooks, C6). C6 also
+promotes `golang.org/x/crypto` v0.58.0 to a direct dependency for bcrypt. **C7 adds no
+module dependency** (Telnyx/OpenAI/recorder/notifier use only stdlib + the existing
+`coder/websocket`).
 `github.com/testcontainers/testcontainers-go` v0.45.0 and its Postgres module are
 **test-only** and build-tagged `postgres`. No ORM and no second SQL driver. Frontend
 dependencies are pinned in `web/package-lock.json` (React 19, Vite 8, TypeScript 7, Vitest
@@ -226,10 +255,13 @@ internal/core/agent/      answered-call loop: greeting, M0 gate, STT, tools, TTS
 internal/core/runner/     single-attempt call runner: claim, dial, events, Finish, Hangup
 internal/core/scheduler/  eligibility loop, windows, retries, callback requeue
 internal/core/events/     in-process order-status hub (runner/scheduler → SSE)
+internal/core/recorder/   recording-flag resolution, WAV/transcript capture + persistence (C7)
+internal/core/notify/     terminal-outcome → notification worker with dedupe (C7)
 internal/core/auth/       register/login/logout, opaque sessions, sha256-at-rest
 internal/core/config/     env loader, validation, secret-safe summary
 internal/adapters/        implementations: storage/local, storage/postgres, stub,
-                          telephony/twilio, stt/mistral, tts/mistral, dialogue/mistral,
+                          telephony/{twilio,telnyx}, stt/mistral, tts/mistral,
+                          dialogue/{mistral,openai}, notify/{log,webhook},
                           password/bcrypt, payments/{stub,stripe}
 internal/app/             composition root (the only core+adapters importer)
 internal/httpapi/         JSON API, auth/checkout/webhook routes, middleware, error envelope
@@ -293,6 +325,6 @@ write` for releases).
 | C4 | conversation: VAD/turn-taking, barge-in, IVR, hold, outcome repair | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | C5 | orchestration: Postgres order store, scheduler, status SSE, place-call | ✅ code complete; make verify + test-postgres green |
 | C6 | web app (React+TS registration/order form/dashboard), Stripe payments, cookie auth | ✅ code complete; make verify + npm build/test + webembed + test-postgres green; Twilio/live-phone + Q5 deployment blockers remain |
-| C7 | swapability, recording, notifications, production hardening | ⬜ |
+| C7 | swapability (Telnyx + OpenAI), recording/transcript flags end-to-end, notifications | 🔵 code complete pending conductor verification; no live Telnyx/OpenAI call |
 
 See [PROGRESS.md](PROGRESS.md) for the authoritative status and session log.

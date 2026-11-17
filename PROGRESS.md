@@ -23,22 +23,34 @@
   sha256-at-rest, bcrypt), owner-scoped orders, Stripe Checkout + signed webhook + stub
   simulate, `webembed` SPA serving, and the `0002_users` migration; `make verify`,
   `npm ci && npm run build && npm test`, `-tags webembed` build, and `-tags postgres` tests
-  are green (see the C6 session entry). DESIGN's **real-phone M0 and M1 exits** remain
-  blocked by the Twilio trial stripping `<Stream>` (and, for M1, by the unproven
-  outbound-DTMF path plus the need for controlled IVR/hold destinations).
-- **Current chunk:** C6 done (M3 web app + payments + auth). Next: write
-  `plans/08-swapability.md` and start C7 (swapability proof + hardening: second telephony
-  adapter, alternative AI provider, recording/storage flags, notifications).
-- **First action of the next session:** write the C7 plan (`plans/08-swapability.md`).
+  are green (see the C6 session entry). **C7 🔵 code complete pending the conductor's
+  final verification** — Telnyx Call Control + Media Streams (second telephony adapter),
+  OpenAI Chat Completions (alternative Dialogue provider), recording/transcript flags
+  end-to-end (`internal/core/recorder`, two mono WAVs + batch transcript via
+  `ports.BlobStore`), and notifications (`internal/core/notify` + `notify/{log,webhook}`,
+  `notify.provider=off` by default). No port/domain change and no new module dependency;
+  Twilio untouched; every test uses in-repo fake HTTP/SSE/WebSocket servers (no live call,
+  no Telnyx/OpenAI account). See the C7 coder session entry and PR #14. DESIGN's
+  **real-phone M0 and M1 exits** remain blocked by the Twilio trial stripping `<Stream>`
+  (and, for M1, by the unproven outbound-DTMF path plus the need for controlled IVR/hold
+  destinations).
+- **Current chunk:** C7 (M4 swapability + hardening) 🔵 code complete pending the
+  conductor's final verification (PR #14, `feat/c7-swapability`).
+- **First action of the next session:** run the C7 conductor verification (review PR #14,
+  re-run `make verify` + `-race -count=10` + `-tags postgres`, confirm the domain/ports diff
+  is empty and `go mod tidy` is clean, then merge if green).
 - **Blockers:** DESIGN's real-phone M0/M1 exits remain blocked by the Twilio trial stripping
   `<Stream>` and the unproven outbound-DTMF path — need an upgraded account, a controlled
   IVR/hold destination, and explicit approval before the end-to-end phone walk. C6
   deployment blockers (not code-complete blockers): no real Stripe charge/test-mode run
-  (the stub provider and a fake httptest Stripe server are the C6 evidence); CSRF tokens,
-  password reset, email verification, and rate limiting are C7 hardening; local-storage
-  sessions are in memory; Q5 (deployment target) is still open. C5 blockers carry over: no
-  real-phone/Mistral evidence was produced or re-run by C6, the scheduler is still
-  single-process with no River, and multi-instance runner draining is untested.
+  (the stub provider and a fake httptest Stripe server are the C6 evidence); local-storage
+  sessions are in memory; Q5 (deployment target) is still open. C7 is deliberately
+  account-free: no live Telnyx call, no real OpenAI request, no Telnyx/OpenAI key was read
+  or configured — the evidence is the in-repo fake-server suites. The C7 hardening still
+  deferred: CSRF tokens, password reset, email verification, rate limiting, a durable
+  notification outbox/retry + webhook signing, a Postgres/S3 blob store, and River. C5
+  blockers carry over: no real-phone/Mistral evidence was produced or re-run, the scheduler
+  is still single-process, and multi-instance runner draining is untested.
   Operational: `golangci-lint` absent locally (optional; CI installs v2.15.0; the /tmp
   v2.15.0 binary was run with 0 issues); `/usr/bin/make` broken by the Xcode 16.2/macOS 26
   issue — use `/Library/Developer/CommandLineTools/usr/bin/make`. Build/test commands may
@@ -60,7 +72,7 @@
 | **C4** | M1 | Conversation: streaming VAD/turn-taking, barge-in, playback clear/marks, deterministic IVR, hold detection, bounded structured-outcome repair. | [plans/05-conversation.md](plans/05-conversation.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE, place-call. | [plans/06-orchestration.md](plans/06-orchestration.md) | ✅ code complete; make verify + test-postgres green |
 | **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | [plans/07-web-app.md](plans/07-web-app.md) | ✅ code complete; make verify + npm build/test + webembed + test-postgres green; no real Stripe charge; Twilio/live-phone + Q5 deployment blockers remain |
-| **C7** | M4 | Swapability proof + hardening: second telephony adapter (Telnyx or Twilio SIP trunk), one alternative AI provider, recording/storage flags end-to-end, notifications. | `plans/08-swapability.md` (TBD) | ⬜ |
+| **C7** | M4 | Swapability proof + hardening: Telnyx Call Control + Media Streams (second telephony adapter), OpenAI dialogue (alternative AI provider), recording/transcript flags end-to-end, notifications. | [plans/08-swapability.md](plans/08-swapability.md) | 🔵 code complete pending conductor verification; no live Telnyx/OpenAI call |
 
 Chunk plans are written **one chunk ahead** in the same style as the C0 plan (scope,
 preconditions, exact contracts, steps with verify commands, test plan, definition of done).
@@ -71,6 +83,72 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C7 coder session (Europe/Vienna)
+
+- Implemented `plans/08-swapability.md` §10 steps 1–11 on `feat/c7-swapability` (PR #14,
+  not merged). No Twilio file was modified, no live call was placed, and no Telnyx/OpenAI
+  account or key was used or read.
+- **Step 1 — config:** `config.Telnyx` (`api_key`, `connection_id`, `from_number`,
+  `ring_timeout_seconds`, optional `webhook_public_key`), `config.OpenAI`
+  (`api_key`/`base_url`/`dialogue_model`), `config.Notify`/`NotifyWebhook`; env registry +
+  defaults + validation; `dialogueProviders = {mistral, stub, openai}` while STT/TTS keep
+  `{mistral, stub}`; secret-safe `Summary` (`telnyx.api_key`, `openai.api_key`,
+  `notify.webhook.url` redacted; connection id/from/base url/model/channel visible).
+- **Step 2 — `internal/core/recorder`:** verbatim `Policy`/`Decision`/`Resolve` (recording
+  is the master gate), 44-byte PCM16 16 kHz mono WAV writer, teeing `ports.CallSession`
+  (inbound relay + outbound `SendAudio` append, every method forwarded incl.
+  `StreamReady`), `sync.Once` best-effort finalize, blob keys
+  `<callID>-{inbound,outbound}.wav` / `<callID>-transcript.txt`, `TranscribeFile` over raw
+  inbound PCM with `Language:"de"`. Flags off ⇒ identical session, no goroutine, zero bytes.
+- **Step 3 — runner seam:** optional `runner.Config.Recorder`; one wrap immediately after a
+  successful `Dial`, using the claimed order. No other runner/agent change.
+- **Step 4 — `internal/adapters/telephony/telnyx`:** Call Control REST (`POST /v2/calls`,
+  `streaming_start`, `send_dtmf`, `hangup` with `90018` idempotency), call-control webhook
+  handler + normalization, bidirectional Media Streams server (start/media/dtmf/mark/stop),
+  self-contained G.711 + 8↔16 kHz codec, Ed25519 webhook + WS-handshake verification
+  (fail closed; optional public key), capability checks (unguessable path +
+  `call_control_id`/`connection_id`). Fake REST + loopback WS tests, including a full fake
+  call.
+- **Step 5 — `internal/adapters/dialogue/openai`:** Chat Completions SSE (text, fragmented
+  tool calls, `finish_call` outcome, truncation/error/interrupt/control), OpenAI request
+  field `max_completion_tokens`, loopback-http guard. Fake SSE tests.
+- **Step 6 — `internal/adapters/notify/{log,webhook}`:** log envelope with a redacted body;
+  single JSON POST with bounded timeout, sanitized URL-free errors, configured channel as
+  default.
+- **Step 7 — `internal/core/notify`:** hub subscriber, reacts only to
+  `finished` + non-nil `Outcome`, dedupe `(OrderID, Attempts)` with bounded FIFO, recipient
+  resolution (user email → patient phone → empty email), fixed non-secret summaries,
+  best-effort bounded `Send` (log, no infinite retry).
+- **Step 8 — wiring:** `buildTelephony` telnyx, `buildDialogue` openai, `buildNotifier`,
+  `buildRecorder` (always wired so per-order overrides work); `App.Notify` + notify worker
+  lifecycle (`Start` starts worker then scheduler; `Close` stops scheduler → runner →
+  worker → hub); `/healthz` gains `notify`.
+- **Step 9 — integration:** `internal/app/swapability_test.go` boots the real Telnyx
+  telephony + real OpenAI dialogue through the real runner/agent with a log notifier and
+  recording on (deterministic fake STT/TTS, fake Telnyx REST, loopback media-stream WS,
+  fake OpenAI SSE; dial → answered → canonical audio → dialogue tools → booked), asserting
+  the two WAVs, transcript contents, raw transcript PCM, and a fired notification.
+  `internal/app/recording_matrix_test.go` covers every §7.4 row through the real runner +
+  recorder + local storage and asserts the exact blob set.
+- **Verification (observed):** `make verify` → PASS (gofmt clean, `go vet`, race suite,
+  `check-deps` `OK: core imports no adapters`, `build-go`); `go test -race -count=10` on
+  recorder/notify/telnyx/openai/app → PASS; `CGO_ENABLED=0 go test -tags postgres
+  -count=1 ./...` → PASS (Docker/testcontainers); `go mod tidy` + `git diff --exit-code --
+  go.mod go.sum` → clean; `git diff main -- internal/core/domain internal/core/ports` →
+  empty; golangci-lint v2.15.0 → 0 issues; Twilio package suite unchanged and green.
+- **Plan deviations (recorded in plan §14):** Telnyx webhook signatures are Ed25519
+  (`telnyx-signature-ed25519`/`telnyx-timestamp`, `{ts}|{body}`), not
+  HMAC-SHA256/`X-Telnyx-Signature`, plus an optional
+  `INSTEADLY_TELNYX_WEBHOOK_PUBLIC_KEY`; media-stream marks are provider echoes, not local;
+  `streaming_start` must set `stream_bidirectional_mode=rtp` /
+  `stream_bidirectional_codec=PCMU`; `openai.base_url` allows a path (its documented default
+  is `https://api.openai.com/v1`); the transcript header's `outcome=` is empty at capture
+  time because the terminal outcome is persisted after the call; unexpected inbound Telnyx
+  calls are hung up.
+- **Not done (intentionally):** no live Telnyx/OpenAI call, no Twilio change, no durable
+  outbox/webhook signing, no Postgres/S3 blob store, no CSRF/reset/email-verify/rate limit,
+  no Q5 deployment. C7 stays 🔵 until the conductor's final verification.
 
 ### 2026-11-17 — C6 conductor session (Europe/Vienna)
 
