@@ -353,7 +353,9 @@ func (s *transcriptionStream) setCloseErr(err error) {
 }
 
 // Feed accepts canonical PCM16 audio. It rejects empty/odd chunks and returns ErrStreamClosed
-// (or a stored failure) after Close.
+// (or a stored failure) after Close or a terminal provider failure. The accept-and-enqueue
+// decision is atomic with Close so a Feed racing Close either enqueues before input_audio.end
+// is sent or returns an error — never enqueues-after-end.
 func (s *transcriptionStream) Feed(ctx context.Context, chunk domain.AudioChunk) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -364,34 +366,30 @@ func (s *transcriptionStream) Feed(ctx context.Context, chunk domain.AudioChunk)
 	if len(chunk.Data)%2 != 0 {
 		return errors.New("mistral stt: odd-length audio chunk (not PCM16)")
 	}
+
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeErr != nil {
+		return s.closeErr
+	}
 	if s.feedClosed {
-		err := s.closeErr
-		s.mu.Unlock()
-		if err != nil {
-			return err
-		}
 		return ErrStreamClosed
 	}
-	s.mu.Unlock()
 
 	data := bytesClone(chunk.Data)
-
-	// Bounded queue with drop-oldest backpressure.
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case s.audioQ <- data:
-			return nil
-		default:
-			select {
-			case <-s.audioQ:
-				s.dropped.Add(1)
-			default:
-			}
-		}
+	// Bounded queue with drop-oldest backpressure (non-blocking).
+	select {
+	case s.audioQ <- data:
+		return nil
+	default:
 	}
+	select {
+	case <-s.audioQ:
+		s.dropped.Add(1)
+	default:
+	}
+	s.audioQ <- data
+	return nil
 }
 
 // Results returns the transcript event channel. It is closed by the reader goroutine.

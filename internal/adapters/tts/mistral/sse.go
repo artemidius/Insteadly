@@ -10,44 +10,87 @@ import (
 // maxSSEEventBytes bounds a single SSE event's accumulated data.
 const maxSSEEventBytes = 1 << 20 // 1 MiB
 
-// readSSEEvent reads one SSE event's data payload (repeated data: lines joined by \n).
-// It accepts LF and CRLF, ignores `:` comments and unknown fields, and returns io.EOF at
-// end of stream. `[DONE]` is returned verbatim as data for the caller to interpret.
-func readSSEEvent(br *bufio.Reader, maxBytes int) ([]byte, error) {
+// readSSEEvent reads one SSE event, returning its accumulated data payload (repeated
+// data: lines joined by \n) and the event name (empty when absent). It accepts LF and
+// CRLF, ignores `:` comments and unknown fields, preserves a trailing non-newline-terminated
+// data line, and enforces the size cap while reading (never after an unbounded ReadBytes).
+// io.EOF is returned at end of stream.
+func readSSEEvent(br *bufio.Reader, maxBytes int) ([]byte, string, error) {
 	var data []byte
+	var event string
 	sawData := false
 	for {
-		line, err := br.ReadBytes('\n')
-		line = bytes.TrimSuffix(bytes.TrimSuffix(line, []byte("\n")), []byte("\r"))
-		if len(line) > 0 && err == nil {
-			if line[0] == ':' {
-				continue
+		line, err := readSSELine(br, maxBytes)
+		if errors.Is(err, io.EOF) {
+			if sawData {
+				return data, event, nil
 			}
-			field, value := splitSSEField(line)
-			if field == "data" {
-				if sawData {
-					data = append(data, '\n')
-				}
-				data = append(data, value...)
-				sawData = true
-				if len(data) > maxBytes {
-					return nil, errors.New("mistral: sse event exceeds size limit")
-				}
+			return nil, "", io.EOF
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		if len(line) == 0 {
+			// Blank line dispatches the event.
+			if sawData {
+				return data, event, nil
 			}
 			continue
 		}
-		// len(line) == 0 (blank dispatch) or err != nil (EOF).
-		if err != nil && err != io.EOF {
-			return nil, err
+		if line[0] == ':' {
+			continue // comment / keepalive
 		}
-		if sawData {
-			return data, nil
+		field, value := splitSSEField(line)
+		switch field {
+		case "data":
+			if sawData {
+				data = append(data, '\n')
+			}
+			data = append(data, value...)
+			sawData = true
+			if len(data) > maxBytes {
+				return nil, "", errors.New("mistral tts: sse event exceeds size limit")
+			}
+		case "event":
+			event = string(value)
 		}
-		if err == io.EOF {
-			return nil, io.EOF
-		}
-		// blank line with no data: keepalive/comment-only event; skip.
 	}
+}
+
+// readSSELine reads one line (trailing \n and \r stripped) with a hard cap so a newline-free
+// line cannot allocate unbounded memory. A final unterminated line is returned as a line.
+func readSSELine(br *bufio.Reader, maxBytes int) ([]byte, error) {
+	var line []byte
+	sawAny := false
+	for {
+		frag, err := br.ReadSlice('\n')
+		if len(frag) > 0 {
+			sawAny = true
+		}
+		line = append(line, frag...)
+		if len(line) > maxBytes {
+			return nil, errors.New("mistral tts: sse line exceeds size limit")
+		}
+		if err == nil {
+			return trimLineEnding(line), nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue // line continues past the buffer
+		}
+		if errors.Is(err, io.EOF) {
+			if !sawAny {
+				return nil, io.EOF
+			}
+			return trimLineEnding(line), nil
+		}
+		return nil, err
+	}
+}
+
+func trimLineEnding(b []byte) []byte {
+	b = bytes.TrimSuffix(b, []byte("\n"))
+	b = bytes.TrimSuffix(b, []byte("\r"))
+	return b
 }
 
 func splitSSEField(line []byte) (string, []byte) {

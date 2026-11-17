@@ -129,7 +129,7 @@ func (s *offlineStream) consumeSSE(ctx context.Context, r io.Reader) error {
 	sawDone := false
 
 	for {
-		payload, err := readSSEEvent(br, maxSSEEventBytes)
+		payload, eventName, err := readSSEEvent(br, maxSSEEventBytes)
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -143,6 +143,10 @@ func (s *offlineStream) consumeSSE(ctx context.Context, r io.Reader) error {
 		if err := json.Unmarshal(payload, &ev); err != nil {
 			return fmt.Errorf("mistral tts: malformed sse data: %w", err)
 		}
+		// Cross-check the SSE event name against the authoritative JSON type when present.
+		if eventName != "" && ev.Type != "" && eventName != ev.Type {
+			return &ProtocolError{Code: "sse event/type mismatch"}
+		}
 		switch ev.Type {
 		case "speech.audio.delta":
 			raw, err := base64Decode(ev.AudioData)
@@ -153,7 +157,9 @@ func (s *offlineStream) consumeSSE(ctx context.Context, r io.Reader) error {
 			if err != nil {
 				return &ProtocolError{Code: "malformed audio delta"}
 			}
-			s.emit(fr.push(int16LE(res.feed(samples))))
+			if err := s.emit(ctx, fr.push(int16LE(res.feed(samples)))); err != nil {
+				return err
+			}
 		case "speech.audio.done":
 			sawDone = true
 		case "error":
@@ -170,14 +176,20 @@ func (s *offlineStream) consumeSSE(ctx context.Context, r io.Reader) error {
 	if pad := fr.flush(); pad != nil {
 		frames = append(frames, pad)
 	}
-	s.emit(frames)
-	return nil
+	return s.emit(ctx, frames)
 }
 
-func (s *offlineStream) emit(frames [][]byte) {
+// emit applies backpressure and is interruptible by the request context, so Close honors a
+// canceled context even when the audio buffer is full.
+func (s *offlineStream) emit(ctx context.Context, frames [][]byte) error {
 	for _, f := range frames {
-		s.audio <- domain.AudioChunk{Data: f}
+		select {
+		case s.audio <- domain.AudioChunk{Data: f}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+	return nil
 }
 
 func base64Decode(s string) ([]byte, error) {

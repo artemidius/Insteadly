@@ -59,9 +59,13 @@ type realtimeStream struct {
 	fr  *framer
 
 	mu         sync.Mutex
-	closeErr   error
 	feedClosed bool
 	totalText  int
+
+	// errMu guards closeErr separately from mu so fail() (called from the reader/writer)
+	// never contends with a FeedText holding mu during a blocking enqueue.
+	errMu    sync.Mutex
+	closeErr error
 
 	closeOnce   sync.Once
 	closeResult error
@@ -143,7 +147,10 @@ func (a *Adapter) handshake(ctx context.Context, conn *websocket.Conn, voice str
 		var s struct {
 			ResponseFormat string `json:"response_format"`
 		}
-		if json.Unmarshal(ev.Session, &s) == nil && s.ResponseFormat != "" && s.ResponseFormat != "pcm" {
+		if err := json.Unmarshal(ev.Session, &s); err != nil {
+			return fmt.Errorf("mistral tts: session updated: %w", err)
+		}
+		if s.ResponseFormat != "" && s.ResponseFormat != "pcm" {
 			return &ProtocolError{Code: "unexpected response format"}
 		}
 	}
@@ -290,16 +297,26 @@ func (s *realtimeStream) emitFrames(frames [][]byte) {
 }
 
 func (s *realtimeStream) fail(err error) {
-	s.mu.Lock()
+	s.errMu.Lock()
 	if s.closeErr == nil {
 		s.closeErr = err
 	}
-	s.mu.Unlock()
+	s.errMu.Unlock()
 	s.cancel()
 }
 
+// readCloseErr returns the stored terminal error, or nil.
+func (s *realtimeStream) readCloseErr() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.closeErr
+}
+
 // FeedText enqueues one verbatim text delta (including surrounding spaces). It rejects
-// invalid UTF-8 and enforces per-delta and per-session caps.
+// invalid UTF-8 and enforces per-delta and per-session caps. The accept-and-enqueue decision
+// is atomic with Close: a FeedText racing Close either enqueues before input_text.end is
+// sent or returns ErrStreamClosed (never enqueues-after-end), and after a terminal failure
+// it returns the stored error.
 func (s *realtimeStream) FeedText(ctx context.Context, text string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -313,32 +330,28 @@ func (s *realtimeStream) FeedText(ctx context.Context, text string) error {
 	if len(text) > maxTextDelta {
 		return errors.New("mistral tts: text delta exceeds 64 KiB")
 	}
+
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.readCloseErr(); err != nil {
+		return err
+	}
 	if s.feedClosed {
-		err := s.closeErr
-		s.mu.Unlock()
-		if err != nil {
-			return err
-		}
 		return ErrStreamClosed
 	}
 	if s.totalText+len(text) > maxTotalText {
-		s.mu.Unlock()
 		return errors.New("mistral tts: total text exceeds 64 KiB")
 	}
 	s.totalText += len(text)
-	s.mu.Unlock()
 
+	// Blocking enqueue (backpressure), interruptible by caller ctx or terminal failure.
 	select {
 	case s.textQ <- text:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.ctx.Done():
-		s.mu.Lock()
-		err := s.closeErr
-		s.mu.Unlock()
-		if err != nil {
+		if err := s.readCloseErr(); err != nil {
 			return err
 		}
 		return ErrStreamClosed
@@ -364,11 +377,9 @@ func (s *realtimeStream) Close(ctx context.Context) error {
 		}
 
 		var err error
-		s.mu.Lock()
-		if s.closeErr != nil {
-			err = s.closeErr
+		if cerr := s.readCloseErr(); cerr != nil {
+			err = cerr // early write/provider failure
 		}
-		s.mu.Unlock()
 
 		if err == nil {
 			timer := time.NewTimer(finalDrainLimit)
@@ -393,9 +404,7 @@ func (s *realtimeStream) Close(ctx context.Context) error {
 		s.cancel()
 
 		if err == nil {
-			s.mu.Lock()
-			err = s.closeErr
-			s.mu.Unlock()
+			err = s.readCloseErr()
 		}
 		s.closeResult = err
 	})

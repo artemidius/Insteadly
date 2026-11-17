@@ -40,7 +40,18 @@ func newTurn() *turn {
 
 func (t *turn) TextChunks() <-chan string { return t.textChunks }
 
-func (t *turn) emit(text string) { t.textChunks <- text }
+// emit streams one text delta with backpressure, interruptible by ctx so a stalled
+// consumer cannot leak the reader goroutine.
+func (t *turn) emit(ctx context.Context, text string) error {
+	select {
+	case t.textChunks <- text:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.done:
+		return context.Canceled
+	}
+}
 
 func (t *turn) finish(res ports.TurnResult, err error) {
 	t.mu.Lock()
@@ -129,11 +140,11 @@ func (a *Adapter) chat(ctx context.Context, msgs []chatMessage, tools []chatTool
 	if !strings.HasPrefix(ct, "text/event-stream") {
 		return chatMessage{}, ports.TurnResult{}, errors.New("mistral dialogue: expected text/event-stream response")
 	}
-	return a.readChatStream(bufio.NewReader(resp.Body), tools, t)
+	return a.readChatStream(ctx, bufio.NewReader(resp.Body), tools, t)
 }
 
 // readChatStream parses the SSE response into streamed text and assembled tool calls.
-func (a *Adapter) readChatStream(br *bufio.Reader, tools []chatTool, t *turn) (chatMessage, ports.TurnResult, error) {
+func (a *Adapter) readChatStream(ctx context.Context, br *bufio.Reader, tools []chatTool, t *turn) (chatMessage, ports.TurnResult, error) {
 	allowed := map[string]bool{reservedToolName: true}
 	for _, tool := range tools {
 		allowed[tool.Function.Name] = true
@@ -144,7 +155,7 @@ func (a *Adapter) readChatStream(br *bufio.Reader, tools []chatTool, t *turn) (c
 	finishReason := ""
 
 	for {
-		payload, err := readSSEEvent(br, maxSSEEventBytes)
+		payload, _, err := readSSEEvent(br, maxSSEEventBytes)
 		if errors.Is(err, io.EOF) {
 			return chatMessage{}, ports.TurnResult{}, ErrTurnTruncated // EOF before [DONE]/terminal
 		}
@@ -179,7 +190,9 @@ func (a *Adapter) readChatStream(br *bufio.Reader, tools []chatTool, t *turn) (c
 				return chatMessage{}, ports.TurnResult{}, errors.New("mistral dialogue: assistant text exceeds 64 KiB")
 			}
 			text.WriteString(delta)
-			t.emit(delta)
+			if err := t.emit(ctx, delta); err != nil {
+				return chatMessage{}, ports.TurnResult{}, err
+			}
 		}
 
 		for _, tc := range choice.Delta.ToolCalls {

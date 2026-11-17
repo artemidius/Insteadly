@@ -14,12 +14,10 @@ import (
 // session implements ports.DialogueSession: committed history, one in-flight turn at a
 // time, exact tool-result continuation, and terminal finish_call state.
 type session struct {
-	adapter       *Adapter
-	orderID       domain.OrderID
-	prompt        string
-	tools         []chatTool
-	callerTools   []domain.Tool
-	outcomeSchema []byte
+	adapter *Adapter
+	orderID domain.OrderID
+	prompt  string
+	tools   []chatTool
 
 	mu           sync.Mutex
 	messages     []chatMessage

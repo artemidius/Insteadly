@@ -302,6 +302,16 @@ func TestTranscribeFileContextCancelled(t *testing.T) {
 	}
 }
 
+func TestTranscribeFileRejectsTrailingJSON(t *testing.T) {
+	a, _ := batchServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResp(w, http.StatusOK, map[string]any{"text": "hi"})
+		_, _ = io.WriteString(w, `{"extra":1}`)
+	})
+	if _, err := a.TranscribeFile(context.Background(), strings.NewReader(string(make([]byte, 640))), ports.BatchOptions{}); err == nil {
+		t.Fatal("trailing JSON after the top-level object must error")
+	}
+}
+
 func TestAdapterNewValidation(t *testing.T) {
 	if _, err := New(Config{APIKey: ""}); err == nil {
 		t.Error("empty api key must error")

@@ -108,7 +108,9 @@ const defaultSystemPrompt = `Du bist Insteadly, ein KI-Assistent, der einen Arzt
 
 const protocolSentence = ` Beende den Anruf immer mit genau einem Aufruf der Funktion finish_call mit einem vollständigen, gültigen Ergebnis.`
 
-// NewSession validates the request (no HTTP call) and returns a session.
+// NewSession validates the request (no HTTP call) and returns a session. Caller-owned byte
+// slices (tool Parameters, OutcomeSchema) are deep-copied before use so later mutation of
+// the caller's slices cannot change requests made by this session.
 func (a *Adapter) NewSession(ctx context.Context, req ports.SessionRequest) (ports.DialogueSession, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -116,7 +118,10 @@ func (a *Adapter) NewSession(ctx context.Context, req ports.SessionRequest) (por
 	if strings.TrimSpace(string(req.OrderID)) == "" {
 		return nil, errors.New("mistral dialogue: order id is required")
 	}
-	if !isJSONObjectSchema(req.OutcomeSchema) {
+
+	outcomeSchema := cloneBytes(req.OutcomeSchema)
+	reqTools := copyTools(req.Tools)
+	if !isJSONObjectSchema(outcomeSchema) {
 		return nil, errors.New("mistral dialogue: outcome schema must be a JSON object schema")
 	}
 	prompt := strings.TrimSpace(req.SystemPrompt)
@@ -125,24 +130,39 @@ func (a *Adapter) NewSession(ctx context.Context, req ports.SessionRequest) (por
 	}
 	prompt += protocolSentence
 
-	tools, err := translateTools(req.Tools, req.OutcomeSchema)
+	tools, err := translateTools(reqTools, outcomeSchema)
 	if err != nil {
 		return nil, err
 	}
 
 	sessCtx, sessCancel := context.WithCancel(context.Background())
 	s := &session{
-		adapter:       a,
-		orderID:       req.OrderID,
-		prompt:        prompt,
-		tools:         tools,
-		callerTools:   append([]domain.Tool(nil), req.Tools...),
-		outcomeSchema: append([]byte(nil), req.OutcomeSchema...),
-		messages:      []chatMessage{{Role: "system", Content: prompt}},
-		baseCtx:       sessCtx,
-		baseCancel:    sessCancel,
+		adapter:    a,
+		orderID:    req.OrderID,
+		prompt:     prompt,
+		tools:      tools,
+		messages:   []chatMessage{{Role: "system", Content: prompt}},
+		baseCtx:    sessCtx,
+		baseCancel: sessCancel,
 	}
 	return s, nil
+}
+
+// copyTools deep-copies the caller's tool slice, including each Parameters byte slice.
+func copyTools(in []domain.Tool) []domain.Tool {
+	out := make([]domain.Tool, len(in))
+	for i, t := range in {
+		out[i] = t
+		out[i].Parameters = cloneBytes(t.Parameters)
+	}
+	return out
+}
+
+func cloneBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append([]byte(nil), b...)
 }
 
 // --- tool validation error helpers (name the tool, never the schema contents) ---

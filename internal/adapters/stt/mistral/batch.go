@@ -87,11 +87,29 @@ func (a *Adapter) transcribeFile(ctx context.Context, r io.Reader, opts ports.Ba
 		return domain.Transcript{}, decodeAPIError(resp)
 	}
 
+	respBody, err := readCapped(resp.Body, maxBatchResponseBytes)
+	if err != nil {
+		return domain.Transcript{}, fmt.Errorf("mistral stt: read batch response: %w", err)
+	}
 	var out batchResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBatchResponseBytes)).Decode(&out); err != nil {
+	if err := decodeSingleJSON(respBody, &out); err != nil {
 		return domain.Transcript{}, fmt.Errorf("mistral stt: decode batch response: %w", err)
 	}
 	return mapTranscript(out, opts.Timestamps || opts.Diarization)
+}
+
+// decodeSingleJSON decodes exactly one top-level JSON value, rejecting trailing data but
+// ignoring unknown fields (forward compatibility).
+func decodeSingleJSON(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("trailing JSON data")
+	}
+	return nil
 }
 
 // buildBatchBody assembles the multipart/form-data body for batch transcription.
