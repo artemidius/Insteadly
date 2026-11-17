@@ -28,6 +28,8 @@ type Config struct {
 	API       API
 	Recording Policy
 	Mistral   Mistral // shared by STT/TTS/Dialogue when their provider == "mistral"
+	Auth      Auth
+	Payments  Payments
 	Log       Log
 }
 
@@ -148,6 +150,30 @@ type MistralDialogue struct {
 	Model string
 }
 
+// Auth configures user-facing cookie authentication (C6). Mode "off" (the default)
+// preserves the C5 unauthenticated API; "cookie" enables registration/login and scopes
+// order routes to the session user.
+type Auth struct {
+	Mode       string        // "off" | "cookie"
+	SessionTTL time.Duration // login lifetime, also the cookie Max-Age
+	CookieName string        // session cookie name
+	BcryptCost int           // password hash cost, 4..31 (default 12)
+}
+
+// Payments selects the payment adapter.
+type Payments struct {
+	Provider string // "stub" | "stripe"
+	Stripe   Stripe
+}
+
+// Stripe holds the Stripe adapter settings. SecretKey and WebhookSecret are secrets and
+// are never logged; config only trims and non-empty-checks them (the adapter parses them).
+type Stripe struct {
+	SecretKey     string // secret
+	WebhookSecret string // secret
+	PriceID       string // one Stripe Price id for the prototype
+}
+
 // Log configures structured logging.
 type Log struct {
 	Level  string // debug|info|warn|error
@@ -160,11 +186,14 @@ var (
 	aiProviders        = []string{"mistral", "stub"}
 	mistralTTSModes    = []string{"realtime", "offline"}
 	storageProviders   = []string{"local", "postgres"}
+	authModes          = []string{"off", "cookie"}
+	paymentProviders   = []string{"stub", "stripe"}
 	logLevels          = []string{"debug", "info", "warn", "error"}
 	logFormats         = []string{"text", "json"}
 
 	accountSIDPattern = regexp.MustCompile(`^AC[0-9a-fA-F]{32}$`)
 	e164Pattern       = regexp.MustCompile(`^\+[1-9][0-9]{6,14}$`)
+	cookieNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 )
 
 // Validate checks enum values and required fields. It does NOT check whether an
@@ -224,7 +253,55 @@ func (c Config) Validate() error {
 	if c.API.IdempotencyTTL <= 0 {
 		return fmt.Errorf("config: api.idempotency_ttl: must be positive")
 	}
+	if err := c.validateAuth(); err != nil {
+		return err
+	}
+	if err := c.validatePayments(); err != nil {
+		return err
+	}
 	return c.validateMistral()
+}
+
+// validateAuth checks the cookie-auth surface. It rejects a TTL or bcrypt cost that would
+// create unusable sessions or hashes.
+func (c Config) validateAuth() error {
+	if err := checkEnum("auth.mode", c.Auth.Mode, authModes); err != nil {
+		return err
+	}
+	if c.Auth.SessionTTL <= 0 {
+		return fmt.Errorf("config: auth.session_ttl: must be positive")
+	}
+	if !cookieNamePattern.MatchString(c.Auth.CookieName) {
+		return fmt.Errorf("config: auth.cookie_name: must be 1-64 letters, digits, underscores, or hyphens")
+	}
+	if c.Auth.BcryptCost < 4 || c.Auth.BcryptCost > 31 {
+		return fmt.Errorf("config: auth.bcrypt_cost: must be between 4 and 31")
+	}
+	return nil
+}
+
+// validatePayments checks the payments adapter selection. Stripe mode requires all three
+// settings and a public origin, because Checkout needs absolute success/cancel URLs.
+func (c Config) validatePayments() error {
+	if err := checkEnum("payments.provider", c.Payments.Provider, paymentProviders); err != nil {
+		return err
+	}
+	if c.Payments.Provider != "stripe" {
+		return nil
+	}
+	if strings.TrimSpace(c.Payments.Stripe.SecretKey) == "" {
+		return fmt.Errorf("config: stripe.secret_key: required when payments.provider is stripe")
+	}
+	if strings.TrimSpace(c.Payments.Stripe.WebhookSecret) == "" {
+		return fmt.Errorf("config: stripe.webhook_secret: required when payments.provider is stripe")
+	}
+	if strings.TrimSpace(c.Payments.Stripe.PriceID) == "" {
+		return fmt.Errorf("config: stripe.price_id: required when payments.provider is stripe")
+	}
+	if c.HTTP.PublicURL == "" {
+		return fmt.Errorf("config: http.public_url is required when payments.provider is stripe (checkout redirect URLs)")
+	}
+	return nil
 }
 
 // validateScheduler rejects zero/negative timing knobs and malformed opening windows.
@@ -458,6 +535,14 @@ func (c Config) Summary() map[string]any {
 		"scheduler.error_backoff":               c.Scheduler.ErrorBackoff.String(),
 		"scheduler.windows":                     c.Scheduler.WindowsJSON,
 		"api.idempotency_ttl":                   c.API.IdempotencyTTL.String(),
+		"auth.mode":                             c.Auth.Mode,
+		"auth.session_ttl":                      c.Auth.SessionTTL.String(),
+		"auth.cookie_name":                      c.Auth.CookieName,
+		"auth.bcrypt_cost":                      c.Auth.BcryptCost,
+		"payments.provider":                     c.Payments.Provider,
+		"stripe.secret_key":                     redacted(c.Payments.Stripe.SecretKey),
+		"stripe.webhook_secret":                 redacted(c.Payments.Stripe.WebhookSecret),
+		"stripe.price_id":                       c.Payments.Stripe.PriceID,
 		"recording.enabled":                     c.Recording.RecordingEnabled,
 		"transcript.enabled":                    c.Recording.TranscriptEnabled,
 		"audio.enabled":                         c.Recording.AudioEnabled,
