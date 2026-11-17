@@ -55,16 +55,14 @@ func TestLiveM1NoPhone(t *testing.T) {
 		t.Fatalf("dialogue New: %v", err)
 	}
 
-	// Real TTS creates two scripted caller utterances. The first deliberately only asks for
-	// an appointment so the model must SPEAK a reply; an abort instruction here made a real
-	// model finish immediately with no assistant text, leaving nothing to barge. The abort
-	// instruction lives only in the second utterance, which is fed once the assistant is
-	// speaking to prove real barge/ClearAudio rather than a polite follow-up turn. No
-	// transcript is logged.
-	first := synthesizeInbound(t, ctx, tts,
-		"Guten Tag. Ich möchte bitte einen Termin vereinbaren.")
-	second := synthesizeInbound(t, ctx, tts,
-		"Stopp, ich möchte noch etwas sagen. Bitte beenden Sie den Anruf jetzt mit dem Ergebnis abgebrochen.")
+	// The barge is deliberately against the fixed greeting, not a model reply. The greeting
+	// is a deterministic ~8.8 s assistant-audio window; a real reply can be short and quiet,
+	// so an acoustic barge onset may arrive only after it finished (the earlier harness even
+	// saw STT drop the initial "Stopp"). We feed one paced caller utterance during that
+	// window. "Stopp, Stopp!" gives a stronger acoustic cue without changing production
+	// policy. No transcript is logged.
+	bargeUtterance := synthesizeInbound(t, ctx, tts,
+		"Stopp, Stopp! Bitte beenden Sie den Anruf jetzt mit dem Ergebnis abgebrochen, denn das ist ein automatischer Test.")
 
 	storage, err := local.New(t.TempDir())
 	if err != nil {
@@ -117,13 +115,10 @@ func TestLiveM1NoPhone(t *testing.T) {
 	}()
 
 	session.sendProgress()
-	awaitMarks(t, session, 2, 90*time.Second)
-	sentBefore := sentFrames(session)
-	feedPacedWhileRunning(t, session, first, runDone)
-	// Wait for the assistant to start speaking the first reply, then barge with the second
-	// scripted caller utterance.
-	awaitAudioGrowth(t, session, sentBefore, 90*time.Second, runDone)
-	feedPacedWhileRunning(t, session, second, runDone)
+	// Wait only for the first audible greeting frame (not the two greeting marks) so the
+	// barge hits real assistant audio while the ~8.8 s greeting is still playing.
+	awaitOutboundStart(t, session, 30*time.Second, runDone)
+	feedPacedWhileRunning(t, session, bargeUtterance, runDone)
 	select {
 	case <-runDone:
 	case <-time.After(4 * time.Minute):
@@ -134,6 +129,9 @@ func TestLiveM1NoPhone(t *testing.T) {
 	}
 	if final.Outcome == nil {
 		t.Fatal("live runner returned no structured outcome")
+	}
+	if final.Outcome.Kind != domain.OutcomeAborted {
+		t.Fatalf("live outcome = %+v, want aborted", final.Outcome)
 	}
 	if final.Attempts != 1 {
 		t.Errorf("attempts = %d, want 1", final.Attempts)
@@ -206,47 +204,30 @@ func synthesizeInbound(t *testing.T, ctx context.Context, tts ports.TextToSpeech
 	return frames
 }
 
-func awaitMarks(t *testing.T, session *integrationSession, n int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		session.mu.Lock()
-		marks := session.marksAcked
-		session.mu.Unlock()
-		if marks >= n {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %d playback marks (greeting)", n)
-}
-
 func sentFrames(session *integrationSession) int {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	return len(session.sentAudio)
 }
 
-// liveReplyGrowthFrames is 100 ms of new canonical audio. It is enough to prove the
-// assistant actually started speaking, while a short-but-real reply must not fail the
-// harness (the greeting is counted in the baseline before it).
-const liveReplyGrowthFrames = 5
-
-func awaitAudioGrowth(t *testing.T, session *integrationSession, baseline int, timeout time.Duration, runDone <-chan struct{}) {
+// awaitOutboundStart waits for the greeting's first outbound frame. It deliberately does not
+// wait for the greeting marks: the barge must land inside the fixed multi-second greeting
+// window, not after a model reply whose length and loudness vary.
+func awaitOutboundStart(t *testing.T, session *integrationSession, timeout time.Duration, runDone <-chan struct{}) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
 		case <-runDone:
-			t.Fatal("call ended before the assistant started speaking")
+			t.Fatal("call ended before the greeting produced assistant audio")
 		default:
 		}
-		if sentFrames(session) > baseline+liveReplyGrowthFrames {
+		if sentFrames(session) > 0 {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatal("assistant never produced audio for the barge scenario")
+	t.Fatal("greeting produced no outbound assistant audio")
 }
 
 // liveFramePace is the canonical 20 ms frame rate (50 fps). A real caller's audio reaches

@@ -172,8 +172,19 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
   scheduling the human final could arrive after the timeout. The window is now 1 s with a
   1.2 s post-turn wait (the invariant is stale-timer clearing, not tight timing); the test
   passed `-race -count=100` locally. No production change.
+- **Post-merge live-gate barge-target fix (test content only):** the `b114c4f` gate run
+  reached the barge step but observed `clears=0`. Both STT finals were correct, but the real
+  assistant reply was short (~2.9 s) and quiet, so the acoustic barge onset did not confirm
+  before it finished (STT also dropped the initial "Stopp"). `TestLiveM1NoPhone` now barges
+  during the fixed ~8.8 s greeting: it waits only for the first audible greeting frame (not
+  the two marks), then feeds one paced
+  `"Stopp, Stopp! Bitte beenden Sie den Anruf jetzt mit dem Ergebnis abgebrochen, …"`
+  utterance. The test asserts aborted/attempts=1/clears>=1/non-silent audio/one hangup and
+  drops the model-reply `awaitMarks`/`awaitAudioGrowth` gating. Production barge is
+  unchanged; the synthetic M1 scenario still covers it. Dated details in
+  `plans/05-conversation.md` §13.
 - **Status:** C4 → 🔵 code complete pending the conductor's next `make live-test-m1` run
-  after the pacing and script harness fixes. Real-phone M1 remains blocked by the Twilio
+  with the greeting-barge harness. Real-phone M1 remains blocked by the Twilio
   trial/outbound-DTMF/controlled IVR+hold prerequisites; C1 and the real-phone M0 exit
   remain blocked as before.
 
