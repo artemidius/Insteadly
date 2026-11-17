@@ -10,17 +10,23 @@
 
 ## Status at a glance (update every session)
 
-- **Phase:** C0 ✅; **C1 code complete** (live audio blocked by Twilio trial); **C2 ✅**
-  (Mistral adapters, fake suites green, live smoke passed); **C3 ✅ code complete** — call
-  runner + agent engine v0 with the credential-free full fake-Mistral chain green AND the
-  real-Mistral no-phone live gate **passed** (`capture_info` persisted, terminal `aborted`,
-  non-silent outbound). DESIGN's **real-phone M0 exit** is still blocked by the Twilio
-  trial stripping `<Stream>` (C1 🔵).
-- **Current chunk:** C3 done (code complete). Next: write `plans/05-conversation.md` and
-  start C4 (real VAD / turn-taking, barge-in, DTMF through IVRs, structured-outcome repair).
-- **First action of the next session:** write the C4 plan (`plans/05-conversation.md`).
-- **Blockers:** DESIGN's real-phone M0 exit remains blocked by the Twilio trial stripping
-  `<Stream>` — needs an upgraded account before the end-to-end phone walk. Operational:
+- **Phase:** C0 ✅; **C1 code complete** (live audio + outbound DTMF blocked by Twilio
+  trial); **C2 ✅** (Mistral adapters, fake suites green, live smoke passed); **C3 ✅ code
+  complete** (call runner + agent engine v0; real-Mistral no-phone live gate passed);
+  **C4 🔵 code complete pending the real-Mistral no-phone live gate** — streaming
+  VAD/turn-taking, barge-in with Twilio `clear`/`mark`, deterministic IVR, hold detection,
+  and bounded structured-outcome repair are implemented with credential-free fake-Mistral /
+  fake-telephony integration coverage. DESIGN's **real-phone M0 and M1 exits** remain
+  blocked by the Twilio trial stripping `<Stream>` (and, for M1, by the unproven outbound
+  DTMF path plus the need for controlled IVR/hold destinations).
+- **Current chunk:** C4 code complete (🔵). Next: conductor runs `make live-test-m1`
+  (`TestLiveM1NoPhone`) with explicit approval; only an observed pass marks C4 ✅. Then write
+  `plans/06-orchestration.md` and start C5.
+- **First action of the next session:** run the C4 no-phone live gate; if it passes, mark C4
+  ✅ and proceed to C5 planning. Do not run the real-phone M1 harness.
+- **Blockers:** DESIGN's real-phone M0/M1 exits remain blocked by the Twilio trial stripping
+  `<Stream>` and the unproven outbound-DTMF path — need an upgraded account, a controlled
+  IVR/hold destination, and explicit approval before the end-to-end phone walk. Operational:
   `golangci-lint` absent locally (optional; CI installs v2.15.0; the C3 session used the
   /tmp v2.15.0 binary); `/usr/bin/make` broken by the Xcode 16.2/macOS 26 issue — use
   `/Library/Developer/CommandLineTools/usr/bin/make`. Build/test commands may need a
@@ -37,19 +43,82 @@
 | **C1** | M0 | Twilio telephony adapter (voice-api): webhooks, Media Streams WebSocket, µ-law→PCM16, DTMF. | [plans/02-twilio-telephony.md](plans/02-twilio-telephony.md) | 🔵 code complete; live audio blocked by Twilio trial |
 | **C2** | M0 | Mistral adapters for STT / TTS / Dialogue (raw WS/JSON APIs, no Go SDK exists). | [plans/03-mistral-ai.md](plans/03-mistral-ai.md) | ✅ code complete; live smoke passed |
 | **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | [plans/04-m0-e2e.md](plans/04-m0-e2e.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
-| **C4** | M1 | Conversation: VAD / turn-taking, barge-in, DTMF through IVRs, structured outcome extraction. | `plans/05-conversation.md` (TBD) | ⬜ |
+| **C4** | M1 | Conversation: streaming VAD/turn-taking, barge-in, playback clear/marks, deterministic IVR, hold detection, bounded structured-outcome repair. | [plans/05-conversation.md](plans/05-conversation.md) | 🔵 code complete pending the real-Mistral no-phone gate; real phone blocked by Twilio trial |
 | **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE. | `plans/06-orchestration.md` (TBD) | ⬜ |
 | **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | `plans/07-web-app.md` (TBD) | ⬜ |
 | **C7** | M4 | Swapability proof + hardening: second telephony adapter (Telnyx or Twilio SIP trunk), one alternative AI provider, recording/storage flags end-to-end, notifications. | `plans/08-swapability.md` (TBD) | ⬜ |
 
 Chunk plans are written **one chunk ahead** in the same style as the C0 plan (scope,
 preconditions, exact contracts, steps with verify commands, test plan, definition of done).
-C4's plan (`plans/05-conversation.md`) is written only after the C3 live no-phone gate is
-observed; the real-phone M0 exit still waits on the Twilio account upgrade.
+C4's plan (`plans/05-conversation.md`) is approved and implemented; its no-phone live gate is
+the only remaining C4 exit evidence. The real-phone M0/M1 exits still wait on the Twilio
+account upgrade (and, for M1, controlled IVR/hold destinations).
 
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C4 implementation session (Europe/Vienna)
+
+- Implemented [plans/05-conversation.md](plans/05-conversation.md) end to end on
+  `feat/c4-conversation`, **without running any live test** (per explicit instruction) and
+  without reading any secret/`.env` value. PR #6 against `main`; not merged.
+- **Conversation engine (`internal/core/agent/`):** new `audio_features.go` (stdlib PCM16
+  decode, DC-removed RMS/ZCR, Hann+Goertzel 39-bin grid + 350/440/480/620 probes, spectral
+  flux/flatness, strong-tone/peak tests), `vad.go` (adaptive noise floor, 60 ms onset,
+  300 ms bounded pre-roll, 700 ms hangover, 15 s forced boundary, barge thresholds),
+  `listen.go` (continuous pump; one STT worker per utterance; bounded live feed; one
+  closing/pending final; malformed/overflow failures), `speak.go` (bounded text segments;
+  one TTS generation per segment; mark wait; ack timeout), `bargein.go` (bounded 2 s
+  `Abort`+`ClearAudio`, join ordering, confirmed-only rollback), `ivr.go` (German/English
+  menu parser, unique target only, one digit/menu, loop/ambiguity/step/timeout dead ends),
+  `hold.go` (3 s tone/cadence/music slate), `recovery.go` (fixed controls, two per call,
+  45 s stall, tool-consistency/empty/invalid repair), plus `control.go` (mark/DTMF router),
+  prompt greeting-disclosure variants, and a full agent/state-machine rewrite. The C3
+  `gate.go`/`transcribe.go` and their tests were replaced.
+- **Ports/domain/adapters:** added `EventPlaybackMark`+`PlaybackID`, required
+  `CallSession.ClearAudio`/`MarkPlayback`, `DialogueSession.Interrupt`/`SendControl`,
+  `SpeechStream.Abort`; updated stubs, all fakes, and live-tagged files. Twilio now sends
+  ordered `clear`/`mark` with a playback epoch, queue purge, residual-encoder reset, and
+  inbound-mark normalization. Mistral TTS realtime/offline gained non-flushing `Abort`;
+  Mistral dialogue gained history rollback/reopen and system-role control turns.
+- **Runner:** separate capacity-64 post-answer DTMF/mark relay with overflow-as-error; the
+  terminal channel stays capacity-one/independent. Pre-answer playback marks are contract
+  errors. Agent outcomes (incl. direct `ivr_dead_end`) still win; one `Finish`/`Hangup`.
+- **Tests:** new DSP/VAD/listen/speaker/barge/IVR/hold/recovery/control suites, Twilio
+  clear/mark/epoch/concurrency tests, Mistral interrupt/control/abort tests, stub lifecycle
+  tests, runner relay tests, a C3-compatible booked M0 chain adapted to streaming, and
+  `internal/app/m1_integration_test.go` covering streaming turns, barge confirmed history,
+  IVR digit→booked and ambiguity dead end, hold/no-STT/resume/timeout, invalid-outcome
+  repair, booked-without-confirmation repair, and recovery exhaustion. Live harnesses
+  `TestLiveM1NoPhone`/`TestLiveM1Phone` compile and SKIP without gates.
+- **Observed verification (this sandbox, `/tmp` GOCACHE/GOMODCACHE):**
+  - `/Library/Developer/CommandLineTools/usr/bin/make verify` → **PASS** (gofmt, `go vet`,
+    `go test -race -count=1 ./...` all green, `check-deps` OK: core imports no adapters,
+    `CGO_ENABLED=0 go build ./cmd/insteadly` OK). `make verify` reports golangci-lint as a
+    PATH skip; the `/tmp` v2.15.0 binary run separately reports **0 issues**.
+  - `make cover` → total **87.3 %** statements: agent **89.4 %**, runner **93.0 %**, Twilio
+    **83.9 %**, dialogue/mistral **89.2 %**, tts/mistral **87.9 %**, app **81.4 %**, stub
+    **87.7 %**, stt/mistral **84.5 %**, config 96.5 %, domain 93.8 %, httpapi 88.7 %,
+    storage 81.7 %.
+  - `go test -race -count=10 ./internal/core/agent ./internal/core/runner
+    ./internal/adapters/telephony/twilio ./internal/adapters/dialogue/mistral
+    ./internal/adapters/tts/mistral ./internal/app` → **PASS** (agent 104.6 s; others
+    3.0–15.7 s).
+  - `go test -tags live -run 'TestLiveM1(NoPhone|Phone)$' ./internal/app` → both **SKIP**
+    (no `LIVE_MISTRAL`/`LIVE_M1_PHONE` gates set). `go vet -tags live ./...` → clean.
+  - `go list -m all` → only the main module + `github.com/coder/websocket v1.8.15`;
+    `go mod tidy && git diff --exit-code -- go.mod go.sum` → unchanged.
+  - `git diff main -- internal/core/config internal/httpapi docs/api.md` → empty. No new
+    `INSTEADLY_*`/`Summary()` keys, no public call endpoint, no new module dependency.
+- **Deviations/decisions** are recorded in `plans/05-conversation.md` §13 (no replay pacer;
+  wall-clock IVR wait; hold classification in assistant mode; Twilio ordered item queue;
+  recovery always rolls back before control; music-hold synthetic fixture; unchanged
+  config/API/module surfaces). No live test was run and no secret was read.
+- **Status:** C4 → 🔵 code complete pending the conductor's `make live-test-m1` no-phone
+  gate. Real-phone M1 remains blocked by the Twilio trial/outbound-DTMF/controlled
+  IVR+hold prerequisites; C1 and the real-phone M0 exit remain blocked as before.
+
 
 ### 2026-11-17 — C3 conductor live-gate session (Europe/Vienna)
 
