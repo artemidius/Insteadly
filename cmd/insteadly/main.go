@@ -52,14 +52,26 @@ func run() error {
 
 	select {
 	case err := <-errCh:
+		// The listener failed or was closed unexpectedly; still drain active calls.
+		shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		runErr := a.Close(shCtx)
+		cancel()
 		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+			return runErr
 		}
-		return err
+		return errors.Join(err, runErr)
 	case <-ctx.Done():
 		a.Log.Info("shutting down")
-		shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return srv.Shutdown(shCtx)
+		return shutdown(a, srv)
 	}
+}
+
+// shutdown closes the runner before http.Server.Shutdown: active calls need the telephony
+// HTTP/WebSocket surface while they cancel and hang up.
+func shutdown(a *app.App, srv *http.Server) error {
+	shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	runErr := a.Close(shCtx)
+	srvErr := srv.Shutdown(shCtx)
+	return errors.Join(runErr, srvErr)
 }

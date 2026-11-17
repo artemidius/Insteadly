@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -31,6 +32,9 @@ func TestNewWiresDefaults(t *testing.T) {
 	}
 	if a.Storage == nil || a.Telephony == nil || a.STT == nil || a.TTS == nil || a.Dialogue == nil {
 		t.Fatalf("nil adapter in %+v", a)
+	}
+	if a.Agent == nil || a.Runner == nil {
+		t.Fatal("agent/runner not wired")
 	}
 	if a.Payments != nil || a.Notify != nil {
 		t.Error("payments/notify must stay nil until C6/C7")
@@ -154,6 +158,24 @@ func TestNewTwilioSIPTrunkNotImplemented(t *testing.T) {
 	}
 	if _, err := New(cfg); !errors.Is(err, ports.ErrNotImplemented) {
 		t.Fatalf("err = %v, want ErrNotImplemented", err)
+	}
+}
+
+func TestAppCloseWithoutActiveCalls(t *testing.T) {
+	a, err := New(testConfig(t))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var nilApp *App
+	if err := nilApp.Close(context.Background()); err != nil {
+		t.Fatalf("nil App.Close: %v", err)
+	}
+	if err := a.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Idempotent close is part of the process-shutdown contract.
+	if err := a.Close(context.Background()); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 }
 

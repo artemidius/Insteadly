@@ -3,12 +3,15 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
 
+	"github.com/artemidius/insteadly/internal/core/agent"
 	"github.com/artemidius/insteadly/internal/core/config"
 	"github.com/artemidius/insteadly/internal/core/ports"
+	"github.com/artemidius/insteadly/internal/core/runner"
 )
 
 // App is the fully wired object graph. It is the ONLY type that knows concrete
@@ -23,6 +26,12 @@ type App struct {
 	Payments  ports.Payments // nil until C6
 	Notify    ports.Notifier // nil until C7
 	Log       *slog.Logger
+
+	// Agent is the stateless answered-call loop; Runner owns one call attempt. There is
+	// deliberately no public HTTP call endpoint in C3 (see docs/agent.md): callers invoke
+	// Runner.Run directly until C5 owns authenticated scheduling.
+	Agent  *agent.Agent
+	Runner *runner.Runner
 
 	// Webhooks is the provider-facing HTTP surface (Twilio webhooks/Media Streams).
 	// Nil when the selected provider has none. internal/httpapi mounts it; the core
@@ -56,6 +65,26 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("dialogue: %w", err)
 	}
 
+	ag, err := agent.New(agent.Config{
+		STT:      stt,
+		TTS:      tts,
+		Dialogue: dialogue,
+		Orders:   storage.Orders(),
+		Logger:   log,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("agent: %w", err)
+	}
+	run, err := runner.New(runner.Config{
+		Telephony: telephony,
+		Orders:    storage.Orders(),
+		Agent:     ag,
+		Logger:    log,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("runner: %w", err)
+	}
+
 	return &App{
 		Config:    cfg,
 		Storage:   storage,
@@ -64,6 +93,17 @@ func New(cfg config.Config) (*App, error) {
 		TTS:       tts,
 		Dialogue:  dialogue,
 		Log:       log,
+		Agent:     ag,
+		Runner:    run,
 		Webhooks:  webhooks,
 	}, nil
+}
+
+// Close drains active calls before process shutdown. Storage and adapters need no close
+// API in C3.
+func (a *App) Close(ctx context.Context) error {
+	if a == nil || a.Runner == nil {
+		return nil
+	}
+	return a.Runner.Close(ctx)
 }
