@@ -44,7 +44,12 @@ const (
 	defaultMaxToolRounds      = 8
 	defaultMaxCallDuration    = 5 * time.Minute
 	defaultReplayPace         = 20 * time.Millisecond
-	defaultCleanupTimeout     = 5 * time.Second
+	// defaultCleanupTimeout must exceed the Mistral STT/TTS realtime finalDrainLimit
+	// (15 s): end-of-input final drain can legitimately take that long under provider
+	// latency, and a tighter agent deadline would preempt the adapter's drain and surface
+	// a bare context deadline error. The runner's own 5 s cleanup timeout is unrelated
+	// (it only bounds hangup/finalization).
+	defaultCleanupTimeout = 20 * time.Second
 )
 
 // Config configures one stateless agent service. Zero gate/limit values use the defaults
