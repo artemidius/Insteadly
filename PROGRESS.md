@@ -111,6 +111,10 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
     `go mod tidy && git diff --exit-code -- go.mod go.sum` → unchanged.
   - `git diff main -- internal/core/config internal/httpapi docs/api.md` → empty. No new
     `INSTEADLY_*`/`Summary()` keys, no public call endpoint, no new module dependency.
+  - GitHub Actions PR #6 CI (run 44147234745): **Lint & format pass**, **Test (race) pass**,
+    **Build & smoke test pass**. A first CI attempt exposed a platform-specific exact-frame
+    assumption in the M0 integration streaming assertion; commit `99d6200` now asserts the
+    actual contract (one contiguous ordered pre-roll+live STT window through the hangover).
 - **Deviations/decisions** are recorded in `plans/05-conversation.md` §13 (no replay pacer;
   wall-clock IVR wait; hold classification in assistant mode; Twilio ordered item queue;
   recovery always rolls back before control; music-hold synthetic fixture; unchanged
