@@ -41,8 +41,14 @@ func TestNewWiresDefaults(t *testing.T) {
 	if a.Scheduler == nil || a.Events == nil {
 		t.Fatal("scheduler/events not wired")
 	}
-	if a.Payments != nil || a.Notify != nil {
-		t.Error("payments/notify must stay nil until C6/C7")
+	if a.Payments == nil {
+		t.Error("payments must be wired (stub is the default)")
+	}
+	if a.Auth == nil {
+		t.Error("auth service must be wired")
+	}
+	if a.Notify != nil {
+		t.Error("notify must stay nil until C7")
 	}
 	if a.Log == nil {
 		t.Error("logger is nil")
@@ -319,5 +325,107 @@ func TestAppCloseDoesNotCloseStoragePool(t *testing.T) {
 	}
 	if len(calls) != 1 || calls[0] != "storage" {
 		t.Errorf("closer calls = %v", calls)
+	}
+}
+
+func TestBuildPasswordHasherValidatesCost(t *testing.T) {
+	hasher, err := buildPasswordHasher(config.Auth{BcryptCost: 4}, nil)
+	if err != nil || hasher == nil {
+		t.Fatalf("buildPasswordHasher(4) = %v, %v", hasher, err)
+	}
+	for _, cost := range []int{3, 32, 99} {
+		if _, err := buildPasswordHasher(config.Auth{BcryptCost: cost}, nil); err == nil {
+			t.Errorf("buildPasswordHasher(%d) succeeded, want rejection", cost)
+		}
+	}
+}
+
+func TestBuildPaymentsSelectsProvider(t *testing.T) {
+	stubAdapter, err := buildPayments(config.Payments{}, "", nil)
+	if err != nil || stubAdapter == nil {
+		t.Fatalf("default buildPayments = %v, %v", stubAdapter, err)
+	}
+
+	if _, err := buildPayments(config.Payments{Provider: "stripe"}, "", nil); err == nil {
+		t.Error("stripe without a public URL succeeded")
+	}
+	if _, err := buildPayments(config.Payments{Provider: "paypal"}, "", nil); err == nil {
+		t.Error("unknown provider succeeded")
+	}
+
+	stripeAdapter, err := buildPayments(config.Payments{
+		Provider: "stripe",
+		Stripe: config.Stripe{
+			SecretKey:     "sk_test_x",
+			WebhookSecret: "whsec_x",
+			PriceID:       "price_x",
+		},
+	}, "https://example.test", nil)
+	if err != nil || stripeAdapter == nil {
+		t.Fatalf("valid stripe buildPayments = %v, %v", stripeAdapter, err)
+	}
+}
+
+func TestNewAuthCookieModeWiresServiceAndAuthStore(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Auth = config.Auth{
+		Mode:       "cookie",
+		SessionTTL: 2 * time.Hour,
+		CookieName: "insteadly_session",
+		BcryptCost: 4,
+	}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = a.Close(ctx)
+		_ = a.CloseStorage()
+	})
+	if a.Auth == nil {
+		t.Fatal("Auth service is nil")
+	}
+	if got := a.Auth.SessionTTL(); got != 2*time.Hour {
+		t.Errorf("session ttl = %v, want 2h", got)
+	}
+	// The local store is also the auth store: register/login must work end to end.
+	user, token, err := a.Auth.Register(context.Background(), "wired@example.test", "password123")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	authenticated, err := a.Auth.Authenticate(context.Background(), token)
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if authenticated.ID != user.ID {
+		t.Errorf("authenticated user = %q, want %q", authenticated.ID, user.ID)
+	}
+}
+
+func TestNewWiresStripeAdapterWithoutNetwork(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.HTTP.PublicURL = "https://example.test"
+	cfg.Payments = config.Payments{
+		Provider: "stripe",
+		Stripe: config.Stripe{
+			SecretKey:     "sk_test_x",
+			WebhookSecret: "whsec_x",
+			PriceID:       "price_x",
+		},
+	}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = a.Close(ctx)
+		_ = a.CloseStorage()
+	})
+	if a.Payments == nil {
+		t.Fatal("stripe Payments not wired")
 	}
 }
