@@ -1,13 +1,18 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/artemidius/insteadly/internal/app"
 	"github.com/artemidius/insteadly/internal/core/config"
@@ -397,5 +402,86 @@ func TestStatusRecorderUnwrap(t *testing.T) {
 	}
 	if sr.Unwrap() != rec {
 		t.Error("Unwrap does not return the underlying writer")
+	}
+}
+
+func TestTelephonyWebhooksMountedOnlyForTwilio(t *testing.T) {
+	const callID = "0123456789abcdef0123456789abcdef"
+	post := func(t *testing.T, ts *httptest.Server) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/webhooks/telephony/twilio/status/"+callID, strings.NewReader("CallSid=CA123"))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatalf("post webhook: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	t.Run("stub", func(t *testing.T) {
+		if got := post(t, newTestServer(t)); got != http.StatusNotFound {
+			t.Fatalf("stub webhook status = %d, want 404", got)
+		}
+	})
+
+	t.Run("twilio", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.HTTP.PublicURL = "https://example.test"
+		cfg.Telephony.Provider = "twilio"
+		cfg.Telephony.Twilio = config.Twilio{
+			AccountSID:         "AC" + strings.Repeat("0", 32),
+			AuthToken:          "test-token",
+			PhoneNumber:        "+15551234567",
+			Mode:               "voice-api",
+			RingTimeoutSeconds: 30,
+		}
+		a, err := app.New(cfg)
+		if err != nil {
+			t.Fatalf("app.New: %v", err)
+		}
+		ts := httptest.NewServer(New(cfg, a, "test").Handler)
+		t.Cleanup(ts.Close)
+		if got := post(t, ts); got != http.StatusForbidden {
+			t.Fatalf("unsigned twilio status webhook = %d, want 403", got)
+		}
+	})
+}
+
+func TestWebSocketUpgradeThroughMiddleware(t *testing.T) {
+	cfg := testConfig(t)
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer c.CloseNow()
+		_ = c.Write(context.Background(), websocket.MessageText, []byte("upgraded"))
+	})
+	a := &app.App{
+		Config:   cfg,
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Webhooks: wrapped,
+	}
+	ts := httptest.NewServer(New(cfg, a, "test").Handler)
+	t.Cleanup(ts.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/webhooks/telephony/twilio/stream/abc", nil)
+	if err != nil {
+		t.Fatalf("dial through middleware: %v", err)
+	}
+	defer func() { _ = c.CloseNow() }()
+	_, msg, err := c.Read(ctx)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(msg) != "upgraded" {
+		t.Fatalf("message = %q", msg)
 	}
 }

@@ -9,9 +9,14 @@ medical appointments in Vienna, Austria. The backend is a Go service built as a
 interfaces; telephony, speech, dialogue, storage, payments, and notifications are
 swappable adapters.
 
-**Status:** C0 (foundation) implemented — see [PROGRESS.md](PROGRESS.md). The binary
-boots and serves a working API with **no credentials and no external network calls**:
-telephony, STT, TTS, and dialogue are deterministic stubs; storage is local disk.
+**Status:** C1 (Twilio telephony) is code-complete — see [PROGRESS.md](PROGRESS.md). The
+binary still boots and serves a working API with **no credentials and no external network
+calls** (all providers default to deterministic stubs); selecting
+`INSTEADLY_TELEPHONY_PROVIDER=twilio` activates the real Twilio Voice + Media Streams
+adapter. Live Media Streams audio is blocked on the current **trial** Twilio account
+(Twilio strips `<Stream>` during trial); the adapter is fully covered by fake-Twilio tests,
+and real dialing/status callbacks/TwiML fetch were verified live. STT, TTS, and dialogue
+are still stubs until C2.
 
 Design of record: [DESIGN.md](DESIGN.md). Chunk plans live in [`plans/`](plans/).
 
@@ -49,13 +54,15 @@ ignored.
 | Variable | Default | Values / notes |
 |---|---|---|
 | `INSTEADLY_HTTP_ADDR` | `127.0.0.1:8080` | `host:port` |
+| `INSTEADLY_HTTP_PUBLIC_URL` | — | public **https** origin Twilio reaches (tunnel URL); required when telephony is twilio in `voice-api` mode |
 | `INSTEADLY_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `INSTEADLY_LOG_FORMAT` | `text` | `text`, `json` |
-| `INSTEADLY_TELEPHONY_PROVIDER` | `stub` | `stub`, `twilio` (adapter lands in C1) |
+| `INSTEADLY_TELEPHONY_PROVIDER` | `stub` | `stub`, `twilio` |
 | `INSTEADLY_TWILIO_ACCOUNT_SID` | — | **secret** |
 | `INSTEADLY_TWILIO_AUTH_TOKEN` | — | **secret** |
-| `INSTEADLY_TWILIO_PHONE_NUMBER` | — | caller ID (C1) |
-| `INSTEADLY_TWILIO_MODE` | `voice-api` | `voice-api`, `sip-trunk` (C1) |
+| `INSTEADLY_TWILIO_PHONE_NUMBER` | — | caller ID, E.164 |
+| `INSTEADLY_TWILIO_MODE` | `voice-api` | `voice-api`, `sip-trunk` (SIP trunk lands in C7) |
+| `INSTEADLY_TWILIO_RING_TIMEOUT_SECONDS` | `0` | Twilio `Timeout` (0 = Twilio default ~60 s); trial accounts reject this parameter |
 | `INSTEADLY_STT_PROVIDER` | `stub` | `stub`, `mistral` (C2) |
 | `INSTEADLY_TTS_PROVIDER` | `stub` | `stub`, `mistral` (C2) |
 | `INSTEADLY_DIALOGUE_PROVIDER` | `stub` | `stub`, `mistral` (C2) |
@@ -67,7 +74,10 @@ ignored.
 | `INSTEADLY_MISTRAL_API_KEY` | — | **secret** (C2) |
 
 Secrets are never logged; startup logs and `/healthz` use a sanitized summary. `.env`
-is git-ignored and must never be committed.
+is git-ignored and must never be committed. Only `INSTEADLY_*` names are read: the
+unprefixed `TWILIO_*` variables in an existing `.env` must be mirrored (or exported) as
+`INSTEADLY_TWILIO_*`. Twilio setup, the public tunnel, and the live-call test are described
+in [docs/twilio.md](docs/twilio.md).
 
 Configuring a provider whose adapter does not exist yet fails fast with a clear
 `not implemented (lands in chunk Cx)` error instead of a half-wired process.
@@ -80,14 +90,16 @@ Configuring a provider whose adapter does not exist yet fails fast with a clear
 | `make run` | `go run ./cmd/insteadly` |
 | `make test` | `go test -race -count=1 ./...` |
 | `make cover` | tests with coverage + one-line total |
+| `make live-test` | **opt-in** real Twilio call (`-tags live`); needs a public tunnel, credentials and credit |
 | `make verify` | `lint` + `test` + `check-deps` + `build` (what CI enforces) |
 | `make lint` | gofmt check + `go vet` (+ `golangci-lint` when installed) |
 | `make check-deps` | fails if `internal/core` imports an adapter (hexagon guard) |
 | `make fmt` | `gofmt -w .` |
 | `make clean` / `make clean-data` | remove `bin/` / `data/` |
 
-Dependencies: standard library only (`go.mod` has no `require` block). Please keep it
-that way in the foundation; a new dependency needs a plan-level decision.
+Dependencies: exactly **one** third-party module — `github.com/coder/websocket` v1.8.15
+(pure Go, zero transitive dependencies) for Twilio Media Streams. A further dependency
+needs a plan-level decision.
 
 ### Layout
 
@@ -96,7 +108,7 @@ cmd/insteadly/            process entrypoint (config -> app -> http.Server)
 internal/core/domain/     pure types + order state machine (stdlib only)
 internal/core/ports/      the six+1 port contracts the core consumes
 internal/core/config/     env loader, validation, secret-safe summary
-internal/adapters/        implementations: storage/local, stub providers
+internal/adapters/        implementations: storage/local, stub, telephony/twilio
 internal/app/             composition root (the only core+adapters importer)
 internal/httpapi/         JSON API, middleware, error envelope
 ```
@@ -146,7 +158,7 @@ write` for releases).
 | Chunk | Delivers | Status |
 |---|---|---|
 | C0 | foundation: hexagon skeleton, config, local storage, stubs, HTTP API | ✅ |
-| C1 | Twilio telephony adapter (webhooks, Media Streams, µ-law→PCM16) | ⬜ |
+| C1 | Twilio telephony adapter (webhooks, Media Streams, µ-law→PCM16, DTMF) | 🔵 code complete; live audio blocked by Twilio trial |
 | C2 | Mistral STT / TTS / dialogue adapters | ⬜ |
 | C3 | call runner + agent engine, end-to-end M0 walk | ⬜ |
 | C4+ | conversation, orchestration, web app, swapability | ⬜ |

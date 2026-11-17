@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/artemidius/insteadly/internal/core/config"
@@ -43,23 +44,9 @@ func TestNewWiresDefaults(t *testing.T) {
 }
 
 func TestNewRejectsUnimplementedProviders(t *testing.T) {
-	cases := map[string]func(*config.Config){
-		"twilio":  func(c *config.Config) { c.Telephony.Provider = "twilio" },
-		"mistral": func(c *config.Config) { c.STT.Provider = "mistral" },
-	}
-	for name, mutate := range cases {
-		t.Run(name, func(t *testing.T) {
-			cfg := testConfig(t)
-			mutate(&cfg)
-			_, err := New(cfg)
-			if !errors.Is(err, ports.ErrNotImplemented) {
-				t.Fatalf("err = %v, want ErrNotImplemented", err)
-			}
-		})
-	}
-
-	// Every mistral-backed port must fail the same way.
+	// Every mistral-backed port must fail until C2.
 	for name, mutate := range map[string]func(*config.Config){
+		"stt":      func(c *config.Config) { c.STT.Provider = "mistral" },
 		"tts":      func(c *config.Config) { c.TTS.Provider = "mistral" },
 		"dialogue": func(c *config.Config) { c.Dialogue.Provider = "mistral" },
 	} {
@@ -70,6 +57,59 @@ func TestNewRejectsUnimplementedProviders(t *testing.T) {
 				t.Fatalf("err = %v, want ErrNotImplemented", err)
 			}
 		})
+	}
+}
+
+func TestNewBuildsTwilio(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.HTTP.PublicURL = "https://example.test"
+	cfg.Telephony = config.Telephony{
+		Provider: "twilio",
+		Twilio: config.Twilio{
+			AccountSID:         "AC" + strings.Repeat("0", 32),
+			AuthToken:          "test-token",
+			PhoneNumber:        "+15551234567",
+			Mode:               "voice-api",
+			RingTimeoutSeconds: 30,
+		},
+	}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.Telephony == nil {
+		t.Fatal("telephony adapter not wired")
+	}
+	if a.Webhooks == nil {
+		t.Fatal("twilio webhooks handler not wired")
+	}
+}
+
+func TestNewTwilioSIPTrunkNotImplemented(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.HTTP.PublicURL = "https://example.test"
+	cfg.Telephony = config.Telephony{
+		Provider: "twilio",
+		Twilio: config.Twilio{
+			AccountSID:         "AC" + strings.Repeat("0", 32),
+			AuthToken:          "test-token",
+			PhoneNumber:        "+15551234567",
+			Mode:               "sip-trunk",
+			RingTimeoutSeconds: 30,
+		},
+	}
+	if _, err := New(cfg); !errors.Is(err, ports.ErrNotImplemented) {
+		t.Fatalf("err = %v, want ErrNotImplemented", err)
+	}
+}
+
+func TestStubHasNoWebhooks(t *testing.T) {
+	a, err := New(testConfig(t))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.Webhooks != nil {
+		t.Fatal("stub provider must not mount webhooks")
 	}
 }
 

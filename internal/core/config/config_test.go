@@ -170,7 +170,8 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 
 	summary := cfg.Summary()
 	wantKeys := []string{
-		"http.addr", "telephony.provider", "stt.provider", "tts.provider",
+		"http.addr", "http.public_url", "telephony.provider", "telephony.twilio.mode",
+		"telephony.twilio.ring_timeout_seconds", "stt.provider", "tts.provider",
 		"dialogue.provider", "storage.provider", "storage.local.dir",
 		"recording.enabled", "transcript.enabled", "audio.enabled",
 		"log.level", "log.format",
@@ -207,6 +208,134 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 			t.Errorf("registry entry %q is marked secret but its name does not look secret", name)
 		}
 	}
+}
+
+func TestPublicURLValidation(t *testing.T) {
+	valid := []string{
+		"", "https://abc.trycloudflare.com", "https://example.test:8443",
+		"https://example.test/",
+	}
+	for _, raw := range valid {
+		t.Run("valid "+raw, func(t *testing.T) {
+			if _, err := load("", []string{"INSTEADLY_HTTP_PUBLIC_URL=" + raw}); err != nil {
+				t.Fatalf("load(%q): %v", raw, err)
+			}
+		})
+	}
+
+	invalid := []string{
+		"http://example.test", "https://", "https://example.test/webhooks",
+		"https://user:pass@example.test", "https://example.test?x=1",
+		"https://example.test#frag",
+	}
+	for _, raw := range invalid {
+		t.Run("invalid "+raw, func(t *testing.T) {
+			_, err := load("", []string{"INSTEADLY_HTTP_PUBLIC_URL=" + raw})
+			if err == nil || !strings.Contains(err.Error(), "http.public_url") {
+				t.Fatalf("load(%q) err = %v, want public_url error", raw, err)
+			}
+		})
+	}
+}
+
+func TestPublicURLTrailingSlashTrimmed(t *testing.T) {
+	cfg, err := load("", []string{"INSTEADLY_HTTP_PUBLIC_URL=https://example.test/"})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.HTTP.PublicURL != "https://example.test" {
+		t.Errorf("public_url = %q, want no trailing slash", cfg.HTTP.PublicURL)
+	}
+}
+
+func twilioEnv() []string {
+	return []string{
+		"INSTEADLY_TELEPHONY_PROVIDER=twilio",
+		"INSTEADLY_HTTP_PUBLIC_URL=https://example.test",
+		"INSTEADLY_TWILIO_ACCOUNT_SID=AC" + strings.Repeat("a", 32),
+		"INSTEADLY_TWILIO_AUTH_TOKEN=test-token",
+		"INSTEADLY_TWILIO_PHONE_NUMBER=+15551234567",
+	}
+}
+
+func TestTwilioValidation(t *testing.T) {
+	if _, err := load("", twilioEnv()); err != nil {
+		t.Fatalf("valid twilio config rejected: %v", err)
+	}
+
+	cases := map[string]struct {
+		mutate func([]string) []string
+		want   string
+	}{
+		"missing public url": {
+			mutate: func(env []string) []string {
+				return removeEnv(env, "INSTEADLY_HTTP_PUBLIC_URL")
+			},
+			want: "http.public_url is required",
+		},
+		"bad sid": {
+			mutate: func(env []string) []string {
+				return replaceEnv(env, "INSTEADLY_TWILIO_ACCOUNT_SID=AC123")
+			},
+			want: "account_sid",
+		},
+		"missing token": {
+			mutate: func(env []string) []string {
+				return replaceEnv(env, "INSTEADLY_TWILIO_AUTH_TOKEN=")
+			},
+			want: "auth_token",
+		},
+		"bad phone": {
+			mutate: func(env []string) []string {
+				return replaceEnv(env, "INSTEADLY_TWILIO_PHONE_NUMBER=555-1234")
+			},
+			want: "phone_number",
+		},
+		"bad ring timeout": {
+			mutate: func(env []string) []string {
+				return append(env, "INSTEADLY_TWILIO_RING_TIMEOUT_SECONDS=4")
+			},
+			want: "ring_timeout_seconds",
+		},
+		"bad mode": {
+			mutate: func(env []string) []string {
+				return append(env, "INSTEADLY_TWILIO_MODE=api")
+			},
+			want: "telephony.twilio.mode",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := load("", tc.mutate(twilioEnv()))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSIPTrunkDoesNotRequirePublicURL(t *testing.T) {
+	env := removeEnv(twilioEnv(), "INSTEADLY_HTTP_PUBLIC_URL")
+	env = append(env, "INSTEADLY_TWILIO_MODE=sip-trunk")
+	if _, err := load("", env); err != nil {
+		t.Fatalf("sip-trunk without public URL rejected: %v", err)
+	}
+}
+
+func removeEnv(env []string, name string) []string {
+	out := env[:0:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, name+"=") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+func replaceEnv(env []string, kv string) []string {
+	name, _, _ := strings.Cut(kv, "=")
+	out := removeEnv(env, name)
+	return append(out, kv)
 }
 
 func TestBoolValuesAccepted(t *testing.T) {

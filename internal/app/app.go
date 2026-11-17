@@ -5,6 +5,7 @@ package app
 import (
 	"fmt"
 	"log/slog"
+	"net/http"
 
 	"github.com/artemidius/insteadly/internal/core/config"
 	"github.com/artemidius/insteadly/internal/core/ports"
@@ -22,6 +23,11 @@ type App struct {
 	Payments  ports.Payments // nil until C6
 	Notify    ports.Notifier // nil until C7
 	Log       *slog.Logger
+
+	// Webhooks is the provider-facing HTTP surface (Twilio webhooks/Media Streams).
+	// Nil when the selected provider has none. internal/httpapi mounts it; the core
+	// never sees it.
+	Webhooks http.Handler
 }
 
 // New validates nothing itself (config.Load does that) but fails when a configured
@@ -33,7 +39,7 @@ func New(cfg config.Config) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("storage: %w", err)
 	}
-	telephony, err := buildTelephony(cfg.Telephony)
+	telephony, webhooks, err := buildTelephony(cfg.Telephony, cfg.HTTP.PublicURL, log)
 	if err != nil {
 		return nil, fmt.Errorf("telephony: %w", err)
 	}
@@ -58,5 +64,6 @@ func New(cfg config.Config) (*App, error) {
 		TTS:       tts,
 		Dialogue:  dialogue,
 		Log:       log,
+		Webhooks:  webhooks,
 	}, nil
 }

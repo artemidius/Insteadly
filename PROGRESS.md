@@ -10,15 +10,22 @@
 
 ## Status at a glance (update every session)
 
-- **Phase:** C0 complete — the binary boots, serves the API, and is fully tested with
-  zero credentials and zero external network calls.
-- **Current chunk:** C1 — Twilio telephony adapter. C0 plan
-  [plans/01-foundation.md](plans/01-foundation.md) is implemented (✅).
-- **First action of the next session:** write `plans/02-twilio-telephony.md` (one chunk
-  ahead, per the update protocol), then implement C1.
-- **Blockers:** none for C0. Operational notes: `golangci-lint` is not installed
-  (optional); `/usr/bin/make` is broken by the Xcode 16.2/macOS 26 issue — use
-  `/Library/Developer/CommandLineTools/usr/bin/make` (verified) or `brew install make`.
+- **Phase:** C0 complete; **C1 code complete** — real dialing, status callbacks, TwiML
+  fetching, and hangup were verified against Twilio. Live Media Streams audio is blocked by
+  the Twilio **trial** plan (Twilio strips `<Stream>`), so C1 is 🔵 until the account is
+  upgraded and the live test passes.
+- **Current chunk:** C1 — Twilio telephony adapter. Implementation and automated tests are
+  done; see [plans/02-twilio-telephony.md](plans/02-twilio-telephony.md) and the
+  amendments recorded there.
+- **First action of the next session:** with an **upgraded** Twilio account, start a
+  tunnel and run `LIVE_TWILIO=1 make live-test`; if it passes (media stream attached, tone
+  heard), mark C1 ✅ and then write `plans/03-mistral-ai.md` (C2).
+- **Blockers:** live Media Streams audio only — Twilio trial accounts strip `<Stream>`
+  from TwiML ([trial TwiML restrictions](https://www.twilio.com/docs/usage/trials/try-out-voice#custom-twiml-during-trial)).
+  No code blocker. Operational notes: `golangci-lint` is not installed (optional; a local
+  v2.15.0 copy under `/tmp` was used, 0 issues); `/usr/bin/make` is broken by the
+  Xcode 16.2/macOS 26 issue — use `/Library/Developer/CommandLineTools/usr/bin/make`
+  (verified) or `brew install make`.
 
 ---
 
@@ -27,7 +34,7 @@
 | Chunk | Milestone | What it delivers | Plan file | Status |
 |---|---|---|---|---|
 | **C0** | M0 | Foundation: Go module, hexagon skeleton (domain, all 6 port contracts, config loader, local storage adapter, stub providers, composition root, HTTP API). Zero external deps, zero credentials. | [plans/01-foundation.md](plans/01-foundation.md) | ✅ |
-| **C1** | M0 | Twilio telephony adapter (voice-api): webhooks, Media Streams WebSocket, µ-law→PCM16, DTMF. | `plans/02-twilio-telephony.md` (write before starting) | ⬜ |
+| **C1** | M0 | Twilio telephony adapter (voice-api): webhooks, Media Streams WebSocket, µ-law→PCM16, DTMF. | [plans/02-twilio-telephony.md](plans/02-twilio-telephony.md) | 🔵 code complete; live audio blocked by Twilio trial |
 | **C2** | M0 | Mistral adapters for STT / TTS / Dialogue (raw WS/JSON APIs, no Go SDK exists). | `plans/03-mistral-ai.md` (TBD) | ⬜ |
 | **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | `plans/04-m0-e2e.md` (TBD) | ⬜ |
 | **C4** | M1 | Conversation: VAD / turn-taking, barge-in, DTMF through IVRs, structured outcome extraction. | `plans/05-conversation.md` (TBD) | ⬜ |
@@ -35,13 +42,95 @@
 | **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | `plans/07-web-app.md` (TBD) | ⬜ |
 | **C7** | M4 | Swapability proof + hardening: second telephony adapter (Telnyx or Twilio SIP trunk), one alternative AI provider, recording/storage flags end-to-end, notifications. | `plans/08-swapability.md` (TBD) | ⬜ |
 
-Chunk plans are written **one chunk ahead**: before starting C1, write `plans/02-*.md` in the
-same style as the C0 plan (scope, preconditions, exact contracts, steps with verify commands,
-test plan, definition of done).
+Chunk plans are written **one chunk ahead** in the same style as the C0 plan (scope,
+preconditions, exact contracts, steps with verify commands, test plan, definition of done).
+C1's plan is ready; before starting C2, write `plans/03-mistral-ai.md`.
 
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C1 implementation session (Europe/Vienna)
+
+- Implemented [plans/02-twilio-telephony.md](plans/02-twilio-telephony.md); automated
+  checks are green. Committed on `feat/c1-twilio-telephony` (PR opened in this session).
+- **New package** `internal/adapters/telephony/twilio`: `adapter.go` (New/Dial/registry/
+  Handler), `client.go` (REST create/update/end, APIError), `session.go` (CallSession,
+  ordered events, queues, Hangup, reaper, `StreamReady`), `stream.go` (Media Streams
+  WebSocket, start validation, µ-law frames), `webhook.go` (voice/status/stream-status
+  routes, signature gate), `twiml.go`, `signature.go`, `audio.go`, plus unit + fake-Twilio
+  integration tests.
+- **Wiring/config:** `App.Webhooks` mounted by `httpapi` only for twilio;
+  `INSTEADLY_HTTP_PUBLIC_URL` and `INSTEADLY_TWILIO_RING_TIMEOUT_SECONDS` (default 0 =
+  Twilio's ~60 s, opt-in); strict validation; `Summary` keys. One dependency:
+  `github.com/coder/websocket v1.8.15`; `go.sum` added. CI cache path → `go.sum`.
+- **Automated verification (observed):**
+  - `make verify` → gofmt/vet clean, `go test -race` all packages `ok`,
+    `OK: core imports no adapters`, binary built.
+  - `golangci-lint v2.15.0` (copied to `/tmp`) → **0 issues**.
+  - `make cover` → **84.1 %** total statements; twilio package **83.8 %**.
+  - `go test -tags live -run TestLiveCall ./internal/app` without `LIVE_TWILIO` → skipped.
+- **Boot matrix (observed):** stub boots and serves orders (healthz `telephony=stub`);
+  twilio + public URL boots (healthz `telephony=twilio`, unsigned status webhook 403);
+  missing public URL and `sip-trunk` fail with the expected `config:`/`not implemented`
+  errors.
+- **Live retry (01:02, user available):** the call rang and was answered, then completed;
+  the live test failed at "Media Stream never attached" as designed. Twilio's trial
+  substitution of `<Stream>` is the only reason no audio plays — a real call path is
+  working.
+- **Live Twilio verification (real calls, trial account):** dialing → ringing → answered →
+  status callbacks → TwiML fetch → completed all worked; the TwiML fetch carries **no**
+  `X-Twilio-Signature` (status callbacks do), so the voice route accepts an unsigned fetch
+  only for a known call ID + matching `AccountSid`/`CallSid`. No Media Stream ever attached
+  and Twilio emitted no stream-status callback: a **trial account strips `<Stream>`**
+  (documented in the trial TwiML reference). The live test now fails explicitly when
+  `StreamReady()` never fires. **Live audio is blocked on an account upgrade**, not on
+  code.
+- **Trial Calls API finding:** trial accounts reject optional Calls parameters
+  (`Invalid or disallowed parameters ... trial accounts have limited parameter access`).
+  The adapter now sends only `To`, `From`, `Url`, `StatusCallback`, and repeated
+  `StatusCallbackEvent`; `Method`/`StatusCallbackMethod`/`Record` are omitted and
+  `Timeout` is opt-in.
+- **Deviations from the plan** (all recorded in the plan's Amendments):
+  ring-timeout default 0 instead of 30; unsigned TwiML fetch guard; `statusCallback`
+  diagnostic route accepts unsigned requests; µ-law 0x7f canonicalization in the test;
+  `LIVE_TWILIO`/`LIVE_DTMF` instead of `INSTEADLY_LIVE_*` (strict config rejects them);
+  `StreamReady()` test hook.
+- **Docs:** README status/config/dependency/roadmap, `docs/architecture.md`,
+  `docs/api.md`, new `docs/twilio.md`, Makefile `live-test`.
+- **Environment:** cloudflared **2026.11.0** was downloaded to `/tmp` (not installed);
+  its quick tunnel, including a WSS probe, worked. Twilio account is **Trial**; the shared
+  trial number works for outbound calls, but `<Stream>` is blocked.
+
+### 2026-11-17 — C1 planning session (Europe/Vienna)
+
+- Wrote [plans/02-twilio-telephony.md](plans/02-twilio-telephony.md): full C1 plan
+  (scope, preconditions, Twilio→port mapping, exact routes/events/audio pipeline,
+  implementation steps, test matrix, exit criteria, risks). No C1 code written.
+- Decisions recorded in the plan (rationale there):
+  - **Dependency:** `github.com/coder/websocket` **v1.8.15** (pure Go, zero transitive
+    deps, MIT) — Go has no stdlib WebSocket server. Pin it and switch CI caching to
+    `go.sum`.
+  - **No legacy-env fallback:** C1 keeps the C0 rule that only `INSTEADLY_*` variables are
+    read. The unprefixed Twilio names in `.env` must be mirrored/exported by the user
+    (`TEST_PHONE` stays test-only). This keeps `TestNonInsteadlyEnvIgnored` valid.
+  - **Outbound DTMF:** Twilio Media Streams has no outbound `dtmf` message; plan uses the
+    call-update/TwiML `<Play digits>` + stream-reconnect path, with an explicit live-test
+    decision gate (fallback: `ErrDTMFUnsupported`, move to C4). Inbound DTMF is direct.
+  - **Config:** add `INSTEADLY_HTTP_PUBLIC_URL` (public https origin for webhooks) and
+    `INSTEADLY_TWILIO_RING_TIMEOUT_SECONDS` (default 30). Webhook routes:
+    `/webhooks/telephony/twilio/{voice,status,stream,stream-status}/{callID}`.
+  - **Live verification** needs a public HTTPS/WSS tunnel and costs trial credit, so it
+    requires explicit user approval; if blocked, C1 must not be marked ✅.
+- Pre-plan verification (observed): `go test -count=1 ./...` → all packages `ok`; Go
+  **1.27.4 darwin/arm64**; `cloudflared`, `ngrok`, and the Twilio CLI are **absent**;
+  `go.sum` absent; `.env` has `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`,
+  `TWILIO_PHONE_NUMBER`, `TEST_PHONE` (names only, values never read); remote
+  `origin git@github.com:artemidius/Insteadly.git`, branch `main`.
+- Twilio docs re-checked 2026-11-17 (Media Streams message set, `<Connect>/<Stream>`,
+  `<Play digits>`, Call resource/status callbacks, webhook signatures); sources are listed
+  in the plan. No design conflict found.
+- Nothing committed; `.env`, `bin/`, `data/` untouched.
 
 ### 2026-11-17 — CI/CD session (Europe/Vienna)
 
@@ -140,7 +229,14 @@ test plan, definition of done).
   `artemidius/` + `insteadly`. A doubled `in` (`ininsteadly`) is the wrong spelling and must
   never be typed.
 - **Go toolchain:** go1.27.4 darwin/arm64 at `/opt/homebrew/bin/go`; module directive
-  `go 1.27.4`. Keep `go.mod` bare (zero external requires).
+  `go 1.27.4`. C1 adds exactly one module, **`github.com/coder/websocket` v1.8.15** (pure
+  Go, zero transitive deps); `go.sum` has two lines. Keep the dependency list this short;
+  any further dependency is a plan-level decision.
+- **Twilio account:** currently **Trial**. Status callbacks/TwiML fetch work; the trial
+  strips `<Stream>` (no live audio until upgrade) and rejects optional Calls parameters
+  (`Method`, `Timeout`, `Record`, `StatusCallbackMethod`, ...). The TwiML `Url` fetch is
+  **unsigned**; status callbacks are signed. Live-test flags are `LIVE_TWILIO=1` and
+  `LIVE_DTMF=1` (unprefixed so strict config ignores them).
 - **make:** use `/Library/Developer/CommandLineTools/usr/bin/make` (the `/usr/bin/make`
   shim is broken by the Xcode 16.2/macOS 26 issue); `golangci-lint` optional/absent
   (CI installs v2.15.0 itself).
@@ -155,9 +251,19 @@ test plan, definition of done).
   (strict mode). Secrets are never logged and never printed.
 - **Canonical audio:** PCM16 LE mono 16 kHz everywhere inside the core (`domain.FrameBytes`
   = 640 B = 20 ms). All codec conversion happens inside adapters.
-- **Credentials:** `.env` must never be committed (it is git-ignored). C0 does not read it.
-  `MISTRAL_API_KEY` still missing. A tunnel (cloudflared/ngrok) will be needed for real-call
-  testing in C1/C3.
+- **Credentials:** `.env` must never be committed (it is git-ignored). The app reads it only
+  through the registry of `INSTEADLY_*` names; the **unprefixed** Twilio names already in
+  `.env` are not read (C1 decision — mirror/export them as `INSTEADLY_TWILIO_*`). `TEST_PHONE`
+  is read only by the build-tagged live test. `MISTRAL_API_KEY` still missing (needed C2).
+- **Tunnel:** `cloudflared` 2026.11.0 works from `/tmp` (quick tunnel; HTTP + WSS verified);
+  it is **not installed** globally. The tunnel URL must equal `INSTEADLY_HTTP_PUBLIC_URL`
+  (scheme + host, no trailing slash) or Twilio webhook signatures fail with 403.
+- **C1 webhook surface:** `/webhooks/telephony/twilio/{voice,status,stream,stream-status}/{callID}`,
+  mounted only when `telephony.provider=twilio`. Status callbacks require a valid
+  `X-Twilio-Signature`; Twilio does **not** sign the TwiML `Url` fetch (verified live), so
+  the voice route requires a known call ID plus matching `AccountSid`/`CallSid`. The WSS
+  handshake is validated by AccountSID + call ID + media format. Trial accounts strip
+  `<Stream>`; live audio needs an upgraded account.
 
 ---
 

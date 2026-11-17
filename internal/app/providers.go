@@ -2,9 +2,13 @@ package app
 
 import (
 	"fmt"
+	"log/slog"
+	"net/http"
+	"time"
 
 	"github.com/artemidius/insteadly/internal/adapters/storage/local"
 	"github.com/artemidius/insteadly/internal/adapters/stub"
+	"github.com/artemidius/insteadly/internal/adapters/telephony/twilio"
 	"github.com/artemidius/insteadly/internal/core/config"
 	"github.com/artemidius/insteadly/internal/core/ports"
 )
@@ -21,14 +25,28 @@ func buildStorage(c config.Storage) (ports.Storage, error) {
 	}
 }
 
-func buildTelephony(c config.Telephony) (ports.Telephony, error) {
+func buildTelephony(c config.Telephony, publicURL string, log *slog.Logger) (ports.Telephony, http.Handler, error) {
 	switch c.Provider {
 	case "stub":
-		return stub.NewTelephony(nil), nil
+		return stub.NewTelephony(log), nil, nil
 	case "twilio":
-		return nil, fmt.Errorf("provider %q: %w (lands in chunk C1)", c.Provider, ports.ErrNotImplemented)
+		if c.Twilio.Mode != "voice-api" {
+			return nil, nil, fmt.Errorf("twilio mode %q: %w (lands in chunk C7)", c.Twilio.Mode, ports.ErrNotImplemented)
+		}
+		adapter, err := twilio.New(twilio.Config{
+			AccountSID:    c.Twilio.AccountSID,
+			AuthToken:     c.Twilio.AuthToken,
+			FromNumber:    c.Twilio.PhoneNumber,
+			PublicBaseURL: publicURL,
+			RingTimeout:   time.Duration(c.Twilio.RingTimeoutSeconds) * time.Second,
+			Logger:        log,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		return adapter, adapter.Handler(), nil
 	default:
-		return nil, fmt.Errorf("unknown provider %q", c.Provider)
+		return nil, nil, fmt.Errorf("unknown provider %q", c.Provider)
 	}
 }
 

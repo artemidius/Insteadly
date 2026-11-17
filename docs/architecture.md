@@ -25,7 +25,8 @@ project exists — see `make check-deps` and [../DESIGN.md](../DESIGN.md).
 
 - `internal/core/domain` imports **stdlib only** (plus nothing else).
 - `internal/core/ports` imports `domain` only.
-- Adapters import `ports` + `domain` only; they never import each other or `app`.
+- Adapters import `ports` + `domain` only (plus vetted third-party libraries used entirely
+  inside the adapter); they never import each other or `app`.
 - `internal/httpapi` talks to ports through `*app.App`; it contains no business rules.
 - Nothing outside `internal/core` implements core logic; nothing outside
   `internal/adapters` knows a provider SDK.
@@ -83,10 +84,13 @@ interface doc comments and must be honored by every adapter.
 
 `internal/app.New` turns a validated `config.Config` into the `App` object graph:
 
-- `Storage`: `local` (only provider in C0).
-- `Telephony`, `STT`, `TTS`, `Dialogue`: `stub` in C0; `twilio`/`mistral` return
-  `ports.ErrNotImplemented` until C1/C2.
+- `Storage`: `local`.
+- `Telephony`: `stub`, or `twilio` in `voice-api` mode (C1). `sip-trunk` still returns
+  `ports.ErrNotImplemented` (C7).
+- `STT`, `TTS`, `Dialogue`: `stub`; `mistral` returns `ports.ErrNotImplemented` until C2.
 - `Payments` and `Notify` remain `nil` until C6/C7.
+- `App.Webhooks` carries the telephony adapter's HTTP surface (nil for stub);
+  `internal/httpapi` mounts it, so the JSON API package never imports an adapter.
 
 Adding a provider = one adapter package + one `case` in `internal/app/providers.go`.
 No core changes, by design.
@@ -132,11 +136,71 @@ Middleware order is `recoverer → requestID → logger`. Every response carries
 adds request-shape validation (required clinic/patient fields, birth-date format,
 preferred-slot ordering) and reports all violations in one 400.
 
+## Twilio telephony adapter (C1)
+
+`internal/adapters/telephony/twilio` implements `ports.Telephony` + `ports.CallSession`
+using Twilio Programmable Voice and bidirectional Media Streams. Provider concepts
+(`CallSid`, µ-law, TwiML, signatures) never leave the package.
+
+### Outbound call flow
+
+1. `Dial` validates the clinic number (E.164), creates a `domain.CallID`, registers a
+   session, and `POST`s to the Twilio Calls resource with:
+   - `Url` → our voice webhook;
+   - `StatusCallback` → our status webhook (`initiated`, `ringing`, `answered`,
+     `completed`);
+   - `Timeout`, `From`, `To`.
+2. Twilio status callbacks are normalized to `dialing → ringing → answered`; callbacks may
+   arrive out of order, so progress is monotonic and gaps are synthesized.
+3. On answer, Twilio fetches `<Response><Connect><Stream url="wss://…">` and opens a
+   WebSocket. The adapter validates `start` (AccountSID, CallSid, the `call_id` custom
+   parameter, µ-law/8000/1) before accepting media.
+4. Inbound µ-law 20 ms frames are decoded, upsampled 8→16 kHz, and delivered as 640-byte
+   canonical chunks. Outbound canonical chunks are downsampled with an anti-alias filter,
+   µ-law encoded, and sent as 160-byte media frames.
+5. Terminal callbacks (`completed`, `busy`, `no-answer`, `canceled`, `failed`) produce
+   exactly one `EventEnded` with a normalized `domain.EndReason`; the event and audio
+   channels are then closed. Finished sessions stay addressable for 5 minutes so late
+   callbacks get a clean response, then are removed.
+
+### HTTP surface
+
+Mounted by `httpapi` only when `telephony.provider=twilio`:
+
+| Route | Purpose |
+|---|---|
+| `POST /webhooks/telephony/twilio/voice/{callID}` | TwiML: connect the call to a Media Stream (or hang up a finished one) |
+| `POST /webhooks/telephony/twilio/status/{callID}` | call progress callbacks |
+| `POST /webhooks/telephony/twilio/stream-status/{callID}` | stream started/stopped/error (diagnostics) |
+| `GET /webhooks/telephony/twilio/stream/{callID}` | bidirectional Media Streams WebSocket |
+
+Status callbacks require a valid `X-Twilio-Signature` (HMAC-SHA1 over the public URL and
+all form parameters). Twilio does **not** sign the TwiML `Url` fetch (verified live), so
+that route is guarded by the unguessable call ID plus matching `AccountSid`/`CallSid` form
+fields; if a signature is present it must still validate. Stream status callbacks are
+diagnostic and accept a signature when Twilio sends one. The WebSocket handshake is
+unsigned and is validated by the call ID plus the `start` payload. The public base URL
+(`INSTEADLY_HTTP_PUBLIC_URL`) must exactly match the URL configured at Twilio, otherwise
+status signatures fail with 403.
+
+### Trial accounts
+
+Twilio strips the `<Stream>` verb from custom TwiML on trial accounts and replaces it with
+a "not available on trial accounts" message. Dialing, status callbacks, and TwiML fetching
+work on trial; live Media Streams audio requires an upgraded account.
+
+### DTMF
+
+Inbound digits arrive as `dtmf` WebSocket messages and become `EventDTMF`. Twilio's
+Media Streams socket cannot send DTMF, so `SendDTMF` updates the call with TwiML that plays
+`<Play digits="…">` and reconnects the stream; the session is reconnect-safe across stream
+IDs. This is a C1 stopgap; C4 may replace it with a more robust IVR flow.
+
 ## Extension points
 
 | Chunk | Change |
 |---|---|
-| C1 | `internal/adapters/telephony/twilio` + one `buildTelephony` case |
+| C1 | ✅ (code) `internal/adapters/telephony/twilio` + `buildTelephony` case + `App.Webhooks`; live audio awaits a Twilio account upgrade |
 | C2 | `internal/adapters/{stt,tts,dialogue}/mistral` + three `build*` cases |
 | C3 | `internal/core/agent` (loop, VAD) + `internal/core/runner`; consumes existing ports |
 | C5 | Postgres storage adapter, scheduler, SSE endpoint in `httpapi` |
