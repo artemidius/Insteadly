@@ -18,20 +18,18 @@
   no-phone M1 live gate passed); **C5 ✅ code complete** — Postgres order/scheduler store
   (migrations, `FOR UPDATE`, `SKIP LOCKED`), in-process scheduler (windows, bounded
   concurrency, retry backoff, history-preserving callback requeue), order-status SSE hub +
-  endpoint, and the API-key-gated place-call eligibility endpoint; `make verify` +
-  `make test-postgres` (Docker/testcontainers) green. **C6 🔵 code complete pending the
-  conductor's final verification** — React+TS SPA (register/login, order form, dashboard
-  with SSE), cookie auth (opaque tokens, sha256-at-rest, bcrypt), owner-scoped orders,
-  Stripe Checkout + signed webhook + stub simulate, `webembed` SPA serving, and the
-  `0002_users` migration; `make verify`, `npm ci && npm run build && npm test`,
-  `-tags webembed` build, and `-tags postgres` tests are green (see the C6 session entry).
-  DESIGN's **real-phone M0 and M1 exits** remain blocked by the Twilio trial stripping
-  `<Stream>` (and, for M1, by the unproven outbound-DTMF path plus the need for controlled
-  IVR/hold destinations).
-- **Current chunk:** C6 code complete (M3 web app + payments + auth); pending the
-  conductor's final verification and merge of PR #13.
-- **First action of the next session (conductor):** re-run the C6 verification suite, review
-  PR #13, merge, then write the C7 plan.
+  endpoint, and the API-key-gated place-call eligibility endpoint. **C6 ✅ code complete** —
+  React+TS SPA (register/login, order form, dashboard with SSE), cookie auth (opaque tokens,
+  sha256-at-rest, bcrypt), owner-scoped orders, Stripe Checkout + signed webhook + stub
+  simulate, `webembed` SPA serving, and the `0002_users` migration; `make verify`,
+  `npm ci && npm run build && npm test`, `-tags webembed` build, and `-tags postgres` tests
+  are green (see the C6 session entry). DESIGN's **real-phone M0 and M1 exits** remain
+  blocked by the Twilio trial stripping `<Stream>` (and, for M1, by the unproven
+  outbound-DTMF path plus the need for controlled IVR/hold destinations).
+- **Current chunk:** C6 done (M3 web app + payments + auth). Next: write
+  `plans/08-swapability.md` and start C7 (swapability proof + hardening: second telephony
+  adapter, alternative AI provider, recording/storage flags, notifications).
+- **First action of the next session:** write the C7 plan (`plans/08-swapability.md`).
 - **Blockers:** DESIGN's real-phone M0/M1 exits remain blocked by the Twilio trial stripping
   `<Stream>` and the unproven outbound-DTMF path — need an upgraded account, a controlled
   IVR/hold destination, and explicit approval before the end-to-end phone walk. C6
@@ -61,7 +59,7 @@
 | **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | [plans/04-m0-e2e.md](plans/04-m0-e2e.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | **C4** | M1 | Conversation: streaming VAD/turn-taking, barge-in, playback clear/marks, deterministic IVR, hold detection, bounded structured-outcome repair. | [plans/05-conversation.md](plans/05-conversation.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE, place-call. | [plans/06-orchestration.md](plans/06-orchestration.md) | ✅ code complete; make verify + test-postgres green |
-| **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | [plans/07-web-app.md](plans/07-web-app.md) | 🔵 code complete pending conductor verification; no real Stripe charge; Twilio/live-phone + Q5 deployment blockers remain |
+| **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | [plans/07-web-app.md](plans/07-web-app.md) | ✅ code complete; make verify + npm build/test + webembed + test-postgres green; no real Stripe charge; Twilio/live-phone + Q5 deployment blockers remain |
 | **C7** | M4 | Swapability proof + hardening: second telephony adapter (Telnyx or Twilio SIP trunk), one alternative AI provider, recording/storage flags end-to-end, notifications. | `plans/08-swapability.md` (TBD) | ⬜ |
 
 Chunk plans are written **one chunk ahead** in the same style as the C0 plan (scope,
@@ -73,6 +71,34 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C6 conductor session (Europe/Vienna)
+
+- Ran the multi-agent flow for C6 (Kimi exhausted — no Kimi used): Architect
+  (`deepseek-official/deepseek-v4-pro`) → Coder (`deepseek-official/deepseek-flash`) →
+  Reviewer (`deepseek-official/deepseek-v4-pro`). Merged PR #13 (`feat/c6-web-app`) via
+  squash.
+- **C6 → ✅ code complete.** React+TS+Vite SPA (register/login, order form, dashboard with
+  SSE) served from the single Go binary behind `//go:build webembed`; opaque-session cookie
+  auth (sha256-at-rest, bcrypt behind `ports.PasswordHasher`); owner-scoped orders; Stripe
+  Checkout + signed webhook + `stub` simulate, both driving the idempotent `Order.MarkPaid`;
+  `0002_users` migration; `Runner.Run` remains the only dial path; the C5 `POST /call` +
+  `INSTEADLY_API_KEY` path is byte-for-byte unchanged.
+- **New dependencies (plan-justified):** `github.com/stripe/stripe-go/v87 v87.1.0` +
+  `golang.org/x/crypto` promoted to direct (+ `shopspring/decimal` indirect). Frontend npm
+  (react/vite/vitest/testing-library); no router/state lib/Playwright.
+- **Conductor verification (observed):** `make verify` → PASS (gofmt/vet/race/check-deps
+  "OK: core imports no adapters"/`build-go`); no-env boot `/healthz`
+  `{auth:"off",payments:"stub",storage:"local",…}`, unauth `POST /api/v1/orders` 201, SPA
+  placeholder at `/`, `POST /api/v1/auth/register` 501 (auth off) — all as designed.
+  Reviewer verdict: **APPROVE** (binding no-Twilio constraint verified — zero telephony/
+  twilio/runner/scheduler/agent changes; 13 §14 amendments judged correct; 4 non-blocking
+  nits). `npm ci && npm run build && npm test` (31 Vitest), `-tags webembed` build, and
+  `-tags postgres` tests (Docker) all green per the Coder + Reviewer.
+- **Status:** C6 → ✅. DESIGN's real-phone M0/M1 exits remain blocked by the Twilio trial +
+  unproven outbound DTMF + controlled IVR/hold destinations. C6 deployment blockers (no
+  real Stripe charge, CSRF/reset/email-verify/rate-limit are C7, in-memory local sessions,
+  Q5 deployment open) are documented, not code-complete blockers.
 
 ### 2026-11-17 — C6 implementation session (Europe/Vienna)
 
