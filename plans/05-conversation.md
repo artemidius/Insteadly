@@ -1209,3 +1209,32 @@ No live test was run in this fix session. Verification before re-running the gat
 verify`, `go test -race -count=10 ./internal/app -run 'TestM1Integration'`, live-tag
 compile/SKIP, lint, module and drift checks are recorded in `PROGRESS.md`. The gate remains
 pending a fresh conductor run.
+
+### 2026-11-17 — live no-phone barge target correction (test content only)
+
+The conductor's next gate run on merged `main` (`b114c4f`) reached the barge step but observed
+no clear. Instrumentation showed both STT finals were correct and the model processed the
+second utterance, but the assistant's real reply was short (~2.9 s) and quiet: the acoustic
+barge onset did not confirm before the reply ended, and STT even dropped the initial "Stopp".
+The failure is a live-harness robustness issue; production barge behavior is unchanged and is
+still covered by the synthetic `TestM1Integration` scenario.
+
+Correction (test content only; no production change):
+
+- `TestLiveM1NoPhone` now barges during the **fixed greeting**, a deterministic ~8.8 s
+  assistant-audio window, instead of a variable-length model reply.
+- After `session.sendProgress()`, it waits only for the first audible greeting frame (not the
+  two greeting marks) and then feeds one paced caller utterance:
+  `"Stopp, Stopp! Bitte beenden Sie den Anruf jetzt mit dem Ergebnis abgebrochen, denn das ist ein automatischer Test."`
+  The repeated cue strengthens the acoustic onset without changing production policy.
+- The test asserts a terminal `aborted` outcome, `attempts == 1`, `clears >= 1`, non-silent
+  640-byte outbound canonical audio, exactly one hangup, and no key leak. The
+  `awaitMarks`/`awaitAudioGrowth` gating on a model reply was removed; streaming VAD is still
+  exercised by the paced utterance's real STT final, while barge+clear is exercised by the
+  greeting barge.
+- A comment above the script records why the harness targets the greeting rather than a model
+  reply.
+
+No live test was run in this fix session. Verification before re-running the gate: `make
+verify`, `go test -race -count=10 ./internal/app -run 'TestM1Integration'`, live-tag
+compile/SKIP, lint, module and drift checks are recorded in `PROGRESS.md`.
