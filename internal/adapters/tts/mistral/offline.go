@@ -26,18 +26,29 @@ type offlineStream struct {
 
 	audio chan domain.AudioChunk
 
+	// state is 0 open, 1 finishing, 2 done. Close and Abort elect exactly one finisher;
+	// the loser waits on done (bounded by its own ctx) instead of double-closing Audio.
 	mu        sync.Mutex
-	closed    bool
+	state     int
 	totalText int
 	text      strings.Builder
-	closeOnce sync.Once
 	closeErr  error
+
+	abortCh   chan struct{}
+	abortOnce sync.Once
+	done      chan struct{}
 }
 
 var _ ports.SpeechStream = (*offlineStream)(nil)
 
 func newOfflineStream(a *Adapter, voice string) *offlineStream {
-	return &offlineStream{adapter: a, voice: voice, audio: make(chan domain.AudioChunk, audioBufferSize)}
+	return &offlineStream{
+		adapter: a,
+		voice:   voice,
+		audio:   make(chan domain.AudioChunk, audioBufferSize),
+		abortCh: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
 }
 
 // FeedText appends text locally; no request is made until Close.
@@ -53,7 +64,7 @@ func (s *offlineStream) FeedText(ctx context.Context, text string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.state != 0 {
 		if s.closeErr != nil {
 			return s.closeErr
 		}
@@ -71,24 +82,78 @@ func (s *offlineStream) FeedText(ctx context.Context, text string) error {
 func (s *offlineStream) Audio() <-chan domain.AudioChunk { return s.audio }
 
 // Close sends exactly one POST /v1/audio/speech (stream=true), feeds the SSE deltas through
-// the shared conversion pipeline, and closes Audio(). Idempotent.
+// the shared conversion pipeline, and closes Audio(). Idempotent. An Abort before the
+// request prevents it; an Abort during synthesis cancels it.
 func (s *offlineStream) Close(ctx context.Context) error {
-	s.closeOnce.Do(func() {
-		s.mu.Lock()
-		s.closed = true
-		text := s.text.String()
-		s.mu.Unlock()
-
-		if strings.TrimSpace(text) == "" {
-			s.closeErr = errors.New("mistral tts: empty synthesis input")
-			close(s.audio)
-			return
+	if !s.beginFinish() {
+		select {
+		case <-s.done:
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return s.closeErr
+		case <-ctx.Done():
+			return ctx.Err()
 		}
+	}
 
-		s.closeErr = s.synthesize(ctx, text)
-		close(s.audio)
-	})
-	return s.closeErr
+	s.mu.Lock()
+	text := s.text.String()
+	s.mu.Unlock()
+
+	if strings.TrimSpace(text) == "" {
+		s.finishFinish(errors.New("mistral tts: empty synthesis input"))
+		return errors.New("mistral tts: empty synthesis input")
+	}
+
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	watchDone := make(chan struct{})
+	go func() {
+		select {
+		case <-s.abortCh:
+			cancel()
+		case <-watchDone:
+		}
+	}()
+	err := s.synthesize(reqCtx, text)
+	close(watchDone)
+	s.finishFinish(err)
+	return err
+}
+
+// Abort discards buffered text without a request, or cancels an in-flight synthesis. It
+// closes Audio exactly once and is idempotent; safe before, during, or after Close.
+func (s *offlineStream) Abort(ctx context.Context) error {
+	s.abortOnce.Do(func() { close(s.abortCh) })
+	if s.beginFinish() {
+		s.finishFinish(nil)
+		return nil
+	}
+	select {
+	case <-s.done:
+	case <-ctx.Done():
+	}
+	return nil
+}
+
+// beginFinish elects this caller as the one that closes Audio.
+func (s *offlineStream) beginFinish() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != 0 {
+		return false
+	}
+	s.state = 1
+	return true
+}
+
+func (s *offlineStream) finishFinish(err error) {
+	s.mu.Lock()
+	s.closeErr = err
+	s.state = 2
+	s.mu.Unlock()
+	close(s.audio)
+	close(s.done)
 }
 
 func (s *offlineStream) synthesize(ctx context.Context, text string) error {

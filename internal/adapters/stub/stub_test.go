@@ -268,3 +268,121 @@ func TestDialogueEcho(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+func TestStubTelephonyClearMarkLifecycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tel := NewTelephony(nil)
+	sess, err := tel.Dial(ctx, domain.Order{
+		ID:     domain.NewOrderID(),
+		Clinic: domain.Clinic{Phone: "+431234567"},
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	s := sess.(*callSession)
+	for _, kind := range []domain.CallEventKind{domain.EventDialing, domain.EventRinging, domain.EventAnswered} {
+		select {
+		case ev := <-s.Events():
+			if ev.Kind != kind {
+				t.Fatalf("event = %q, want %q", ev.Kind, kind)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("progress event missing")
+		}
+	}
+	if err := s.ClearAudio(context.Background()); err != nil {
+		t.Fatalf("ClearAudio: %v", err)
+	}
+	if got := s.clearCountValue(); got != 1 {
+		t.Errorf("clear count = %d, want 1", got)
+	}
+	if err := s.MarkPlayback(context.Background(), "m1"); err != nil {
+		t.Fatalf("MarkPlayback: %v", err)
+	}
+	select {
+	case ev := <-s.Events():
+		if ev.Kind != domain.EventPlaybackMark || ev.PlaybackID != "m1" {
+			t.Fatalf("mark event = %+v", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fake mark event missing")
+	}
+	if err := s.Hangup(context.Background()); err != nil {
+		t.Fatalf("Hangup: %v", err)
+	}
+	if err := s.Hangup(context.Background()); err != nil {
+		t.Fatalf("second Hangup: %v", err)
+	}
+}
+
+func TestStubTTSAbortDiscards(t *testing.T) {
+	tts := NewTTS()
+	stream, err := tts.Speak(context.Background(), ports.SpeakOptions{})
+	if err != nil {
+		t.Fatalf("Speak: %v", err)
+	}
+	closed := make(chan int, 1)
+	go func() {
+		n := 0
+		for range stream.Audio() {
+			n++
+		}
+		closed <- n
+	}()
+	if err := stream.FeedText(context.Background(), "Hallo"); err != nil {
+		t.Fatalf("FeedText: %v", err)
+	}
+	if err := stream.Abort(context.Background()); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	select {
+	case n := <-closed:
+		if n != 1 {
+			t.Errorf("audio chunks before abort = %d, want 1", n)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Abort did not close Audio")
+	}
+	if err := stream.FeedText(context.Background(), "late"); err == nil {
+		t.Error("FeedText after Abort succeeded")
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Errorf("Close after Abort: %v", err)
+	}
+	if err := stream.Abort(context.Background()); err != nil {
+		t.Errorf("second Abort: %v", err)
+	}
+}
+
+func TestStubDialogueInterruptAndControlAreNotUserSpeech(t *testing.T) {
+	d := NewDialogue()
+	sess, err := d.NewSession(context.Background(), ports.SessionRequest{OrderID: "o1"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s := sess.(*dialogueSession)
+	if err := s.Interrupt(context.Background(), "bestätigter Text"); err != nil {
+		t.Fatalf("Interrupt: %v", err)
+	}
+	turn, err := s.SendControl(context.Background(), "repair")
+	if err != nil {
+		t.Fatalf("SendControl: %v", err)
+	}
+	for range turn.TextChunks() {
+	}
+	if _, err := turn.Wait(context.Background()); err != nil {
+		t.Fatalf("control Wait: %v", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.userTurns) != 0 {
+		t.Errorf("control/interrupt became user speech: %q", s.userTurns)
+	}
+	if len(s.interrupts) != 1 || s.interrupts[0] != "bestätigter Text" {
+		t.Errorf("interrupts = %q", s.interrupts)
+	}
+	if len(s.controls) != 1 || s.controls[0] != "repair" {
+		t.Errorf("controls = %q", s.controls)
+	}
+}

@@ -27,6 +27,10 @@ type streamConn struct {
 	mu        sync.Mutex
 	streamSID string
 	dec       frameDecoder
+
+	// sendMu serializes every outbound wire message (media, mark, clear) so their order
+	// on the stream is exactly the order the session writer submitted them.
+	sendMu sync.Mutex
 }
 
 func newStreamConn(s *session, c *websocket.Conn) *streamConn {
@@ -43,22 +47,51 @@ func (c *streamConn) close() {
 	_ = c.conn.CloseNow()
 }
 
-// writeMedia sends one µ-law frame to Twilio. coder/websocket allows concurrent writes;
-// only the stream SID is shared state.
+// writeMedia sends one µ-law frame to Twilio.
 func (c *streamConn) writeMedia(payload []byte) error {
+	var msg outboundMedia
+	msg.Event = "media"
+	msg.Media.Payload = base64.StdEncoding.EncodeToString(payload)
+	return c.write(&msg)
+}
+
+// writeMark sends one outbound playback mark.
+func (c *streamConn) writeMark(name string) error {
+	var msg outboundMark
+	msg.Event = "mark"
+	msg.Mark.Name = name
+	return c.write(&msg)
+}
+
+// writeClear sends the provider clear for this stream.
+func (c *streamConn) writeClear() error {
+	var msg outboundClear
+	msg.Event = "clear"
+	return c.write(&msg)
+}
+
+// write serializes one outbound JSON message and injects the current stream SID.
+func (c *streamConn) write(v any) error {
 	c.mu.Lock()
 	sid := c.streamSID
 	c.mu.Unlock()
 	if sid == "" {
 		return errors.New("stream has not started")
 	}
-	var msg outboundMedia
-	msg.Event = "media"
-	msg.StreamSID = sid
-	msg.Media.Payload = base64.StdEncoding.EncodeToString(payload)
+	switch msg := v.(type) {
+	case *outboundMedia:
+		msg.StreamSID = sid
+	case *outboundMark:
+		msg.StreamSID = sid
+	case *outboundClear:
+		msg.StreamSID = sid
+	}
+
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
 	defer cancel()
-	return wsjson.Write(ctx, c.conn, &msg)
+	return wsjson.Write(ctx, c.conn, v)
 }
 
 type outboundMedia struct {
@@ -67,6 +100,19 @@ type outboundMedia struct {
 	Media     struct {
 		Payload string `json:"payload"`
 	} `json:"media"`
+}
+
+type outboundMark struct {
+	Event     string `json:"event"`
+	StreamSID string `json:"streamSid"`
+	Mark      struct {
+		Name string `json:"name"`
+	} `json:"mark"`
+}
+
+type outboundClear struct {
+	Event     string `json:"event"`
+	StreamSID string `json:"streamSid"`
 }
 
 type inboundEnvelope struct {
@@ -206,7 +252,7 @@ func (a *Adapter) serveStream(w http.ResponseWriter, r *http.Request, s *session
 			}
 		case "mark":
 			if env.Mark != nil {
-				a.log.Debug("twilio: mark", "name", env.Mark.Name)
+				s.handleMark(env.Mark.Name)
 			}
 		case "stop":
 			return

@@ -53,7 +53,8 @@ concern (C5) and is deliberately absent from the state machine. Corrupt or illeg
 transitions return `domain.ErrInvalidTransition`; bad outcomes return
 `domain.ErrInvalidOutcome`.
 
-Other domain shapes: `CallEvent`/`EndReason` (normalized telephony), `Transcript`,
+Other domain shapes: `CallEvent`/`EndReason` (normalized telephony, including
+`EventPlaybackMark` with an opaque `PlaybackID`), `Transcript`,
 `AudioChunk` + canonical audio constants, `BlobKey`, `Tool`, `Notification`,
 `PaymentEvent`.
 
@@ -68,10 +69,10 @@ the port boundary.
 
 | Port | File | Consumer | Notes |
 |---|---|---|---|
-| `Telephony` / `CallSession` | `ports/telephony.go` | call runner (C3) | normalized events, duplex canonical audio, DTMF, idempotent hangup |
-| `SpeechToText` / `TranscriptionStream` | `ports/speech.go` | agent engine (C3) | one stream per utterance; final flush on `Close` |
-| `TextToSpeech` / `SpeechStream` | `ports/speech.go` | agent engine (C3) | feed text, canonical audio out; not 1:1 |
-| `Dialogue` / `DialogueSession` / `AssistantTurn` | `ports/dialogue.go` | agent engine (C3) | text + tools in, streamed text + tool calls + outcome out |
+| `Telephony` / `CallSession` | `ports/telephony.go` | call runner (C3/C4) | normalized events incl. playback marks, duplex canonical audio, DTMF, ordered `ClearAudio`/`MarkPlayback`, idempotent hangup |
+| `SpeechToText` / `TranscriptionStream` | `ports/speech.go` | conversation engine (C4) | one stream per VAD utterance; final flush on `Close` |
+| `TextToSpeech` / `SpeechStream` | `ports/speech.go` | conversation engine (C4) | feed text, canonical audio out, non-flushing `Abort` for barge-in; not 1:1 |
+| `Dialogue` / `DialogueSession` / `AssistantTurn` | `ports/dialogue.go` | conversation engine (C4) | text + tools in, streamed text + tool calls + outcome out; `Interrupt`/`SendControl` reconciliation |
 | `Storage` → `OrderStore`, `BlobStore` | `ports/storage.go` | API, runner, scheduler | orders + blobs; no provider types |
 | `Payments` | `ports/payments.go` | API/webhook (C6) | declared, no adapter yet |
 | `Notifier` | `ports/notify.go` | runner (C7) | declared, no adapter yet |
@@ -197,9 +198,21 @@ work on trial; live Media Streams audio requires an upgraded account.
 Inbound digits arrive as `dtmf` WebSocket messages and become `EventDTMF`. Twilio's
 Media Streams socket cannot send DTMF, so `SendDTMF` updates the call with TwiML that plays
 `<Play digits="…">` and reconnects the stream; the session is reconnect-safe across stream
-IDs. This is a C1 stopgap; C4 may replace it with a more robust IVR flow.
+IDs. This remains a C1 stopgap: C4's core IVR policy presses one evidence-backed digit at a
+time, but the real outbound-DTMF path is still unproven on the Twilio trial.
 
-## Call runner and agent engine (C3)
+### Playback clear and marks (C4)
+
+C4 adds the Media Streams outbound `{event:"clear",streamSid}` and
+`{event:"mark",streamSid,mark:{name}}` messages. One writer goroutine owns media/mark/clear
+order; `ClearAudio` advances a playback epoch, purges queued actions, resets residual encoder
+bytes, and sends `clear`, so old audio cannot race past it. Inbound `mark` becomes exactly
+one `EventPlaybackMark` with the opaque core ID; late marks from a cleared generation are
+valid races ignored by ID in the core. With no attached stream, clearing local playback
+succeeds; after call end the established safe-end semantics apply. µ-law conversion, inbound
+DTMF, `StreamReady`, reconnect, and `stop`-is-not-call-end are unchanged.
+
+## Call runner and conversation engine (C4)
 
 `internal/core/runner` owns one order attempt: atomic claim
 (`scheduled → dialing`, `Attempts++`), one `Dial` on a call-lifetime context, event-driven
@@ -207,20 +220,30 @@ status transitions, the optional C1 `StreamReady()` wait, agent handoff, exactly
 `Hangup`, and exactly one `Finish(outcome)`. A valid dialogue outcome always wins over the
 local Hangup reason (`EndAborted`); otherwise a fixed fallback maps the terminal
 `EndReason`/provider error to `aborted` or `failed/{busy,no_answer,rejected,ivr_dead_end,
-error,other}`. `Runner.Run` is synchronous; `Runner.Close` rejects new runs, cancels and
-waits for active calls, and `cmd/insteadly` drains it before `http.Server.Shutdown`.
+error,other}`. Post-answer `EventDTMF`/`EventPlaybackMark` are relayed on a separate
+capacity-64 control channel; overflow closes it and fails the attempt rather than silently
+losing a digit or mark — even if the agent raced to a valid outcome, the runner checks the
+relay error and refuses to persist it. The terminal `EventEnded` signal stays capacity-one and independent.
+`Runner.Run` is synchronous; `Runner.Close` rejects new runs, cancels and waits for active
+calls, and `cmd/insteadly` drains it before `http.Server.Shutdown`.
 
-`internal/core/agent` owns the answered-call loop: a fixed German AI disclosure greeting,
-a minimal energy/silence M0 utterance delimiter, one STT stream per utterance (20 ms/frame
-replay, exactly one final), dialogue turns with core-owned tool execution, lazy streaming
-TTS with a concurrent `SendAudio` drainer, and bounded turn/tool/call limits. The agent
-receives only `Inbound`/`SendAudio`; it cannot consume events, send DTMF, or hang up.
+`internal/core/agent` owns the streaming conversation engine (C4): continuous 20 ms framing
+and stdlib DSP, adaptive noise/VAD with 60 ms onset and 700 ms hangover, one STT stream per
+utterance with live pre-roll+frame feeding, full-duplex barge-in with bounded TTS
+`Abort`/`ClearAudio`, per-segment playback marks and conservative confirmed-text history,
+deterministic evidence-gated IVR navigation, conservative 3 s hold tone/music detection, and
+at most two structured-outcome recovery controls per call. C3's greeting, core-owned tools,
+`ValidateOutcome`, booking invariants, and exactly-once runner finalization are preserved.
+The agent's narrow `AudioSession` can read/send audio, send DTMF, clear queued audio, and
+place marks; it still cannot consume telephony events or hang up. The agent stops/joins its
+audio workers before closing the dialogue session; cleanup is 35 s to exceed C2's 30 s TTS
+final drain, while interruption is bounded separately at 2 s.
 
 Both packages import only `internal/core/{ports,domain}` (plus the agent from the runner);
 `internal/app` is the only composer. There is deliberately **no** public place-call
-endpoint in C3 — `Runner.Run` is the invocation surface until C5 owns authenticated,
-idempotent scheduling. Exact rules, tool schemas/results, outcome precedence, privacy
-constraints, and live-test recipes are in [agent.md](agent.md).
+endpoint in C4 — `Runner.Run` is the invocation surface until C5 owns authenticated,
+idempotent scheduling. Exact state machine, DSP constants, barge/hold/IVR/recovery rules,
+privacy constraints, and live-test recipes are in [agent.md](agent.md).
 
 ## Mistral adapters (C2)
 
@@ -234,10 +257,14 @@ never cross a port boundary.
   `TranscribeFile` (raw PCM → in-memory WAV → multipart POST → `domain.Transcript`).
 - **TTS** (`tts/mistral`): realtime `SpeechStream` (incremental text → float32 24 kHz audio
   → 15-tap anti-alias + 3:2 polyphase resampling → canonical PCM16 16 kHz, 640-byte frames)
-  and an `offline` mode that POSTs `/v1/audio/speech` (`stream=true`) on `Close`.
+  and an `offline` mode that POSTs `/v1/audio/speech` (`stream=true`) on `Close`. C4 adds a
+  non-flushing `Abort` for barge-in: realtime cancels the WebSocket generation, offline
+  cancels an in-flight request or prevents one before `Close`; normal `Close` still flushes.
 - **Dialogue** (`dialogue/mistral`): Chat Completions SSE with local history, fragmented
   tool-call assembly, exact tool-result continuation, and the reserved `finish_call` outcome
-  (strict `domain.Outcome` decode + validation).
+  (strict `domain.Outcome` decode + validation). C4 adds `Interrupt(confirmedText)` for
+  history rollback/reopen and `SendControl(instruction)` as a system-role control turn,
+  retaining the failed/stalled candidate without inventing user speech.
 
 See [mistral.md](mistral.md) for the exact protocols, config surface, tool/outcome contract,
 and live-test recipe.
@@ -248,6 +275,7 @@ and live-test recipe.
 |---|---|
 | C1 | ✅ (code) `internal/adapters/telephony/twilio` + `buildTelephony` case + `App.Webhooks`; live audio awaits a Twilio account upgrade |
 | C2 | ✅ (code) `internal/adapters/{stt,tts,dialogue}/mistral` + three `build*` cases; live Mistral smoke passed |
-| C3 | 🔵 code complete (pending the live no-phone gate) `internal/core/agent` + `internal/core/runner`; consumes existing ports; no new API route |
+| C3 | ✅ code complete (real-Mistral no-phone gate passed) `internal/core/agent` + `internal/core/runner`; no new API route |
+| C4 | 🔵 code complete pending the live no-phone gate: streaming VAD/turn-taking, barge-in, Twilio clear/mark, Mistral interrupt/control, TTS abort, IVR, hold, recovery; no new module/env/API surface |
 | C5 | Postgres storage adapter, scheduler, SSE endpoint in `httpapi` |
 | C6/C7 | Payments and Notifier adapters; fill the `nil` fields in `app.App` |

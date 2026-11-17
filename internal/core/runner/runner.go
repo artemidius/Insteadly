@@ -219,7 +219,7 @@ preAgent:
 	// call nor closes the event channel.
 	defer relay.shutdown()
 
-	agentOutcome, agentErr := r.cfg.Agent.Run(callCtx, state.order, session, relay.agentChannel())
+	agentOutcome, agentErr := r.cfg.Agent.Run(callCtx, state.order, session, relay.agentChannel(), relay.controlChannel())
 
 	// Always hang up once after a successful Dial, using a context independent of the
 	// canceled call, then give the provider a bounded chance to close the event stream.
@@ -228,6 +228,14 @@ preAgent:
 	relay.wait(waitCtx)
 	cancelWait()
 	relay.shutdown()
+
+	// A dropped DTMF/mark is never a silent success: even if the agent raced to a valid
+	// outcome, the runner refuses to persist a navigation/reconciliation result after a
+	// control relay overflow.
+	if cerr := relay.controlError(); cerr != nil {
+		final, finErr := r.persist(callerCtx, id, failedOutcome("error", detailControlLost), state.order)
+		return final, errors.Join(cerr, finErr)
+	}
 
 	terminal, haveTerminal := relay.terminal()
 	providerErr := relay.providerError()
@@ -307,6 +315,9 @@ func (r *Runner) handlePreAgentEvent(ctx context.Context, id domain.OrderID, st 
 		}
 	case domain.EventDTMF:
 		r.log.Debug("runner: dtmf ignored", "order_id", id, "dtmf_len", len(ev.DTMF))
+	case domain.EventPlaybackMark:
+		// Playback evidence before the agent starts cannot belong to any core segment.
+		return fmt.Errorf("runner: order %s: %w: playback mark before answer", id, errProviderContract)
 	case domain.EventError:
 		st.providerErr = true
 	case domain.EventEnded:

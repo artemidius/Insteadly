@@ -244,10 +244,186 @@ func TestSessionRollbackOnFailure(t *testing.T) {
 		t.Fatalf("second turn: text=%q err=%v", text, err)
 	}
 	s.mu.Lock()
-	if len(s.messages) != 3 { // system, user, assistant
+	// C4 keeps the failed turn's triggering user message until a retry succeeds, so the
+	// next ordinary user turn builds on it rather than silently losing it.
+	msgs := append([]chatMessage(nil), s.messages...)
+	s.mu.Unlock()
+	if len(msgs) != 4 { // system, user(first), user(second), assistant
+		t.Fatalf("history = %+v", msgs)
+	}
+	if msgs[1].Content != "first" || msgs[2].Content != "second" {
+		t.Errorf("failed user turn was not preserved: %+v", msgs)
+	}
+}
+
+func TestSessionInterruptAfterFailedTurn(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	a, capture := newChatServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		writeSSE(w, textSSE([]string{"ok"}, "stop"))
+	})
+	s := newSession(t, a, nil, outcomeSchema(), "")
+
+	turn, _ := s.SendUserTurn(context.Background(), "first")
+	if _, _, err := drainTurn(turn); err == nil {
+		t.Fatal("expected failed turn")
+	}
+	if err := s.Interrupt(context.Background(), "Teilweise gehört"); err != nil {
+		t.Fatalf("Interrupt: %v", err)
+	}
+	s.mu.Lock()
+	msgs := append([]chatMessage(nil), s.messages...)
+	s.mu.Unlock()
+	if len(msgs) != 3 {
+		t.Fatalf("history = %+v", msgs)
+	}
+	if msgs[1].Role != "user" || msgs[1].Content != "first" {
+		t.Errorf("triggering user history lost: %+v", msgs)
+	}
+	if msgs[2].Role != "assistant" || msgs[2].Content != "Teilweise gehört" {
+		t.Errorf("confirmed assistant text = %+v", msgs[2])
+	}
+
+	fail.Store(false)
+	control, err := s.SendControl(context.Background(), "repair instruction")
+	if err != nil {
+		t.Fatalf("SendControl: %v", err)
+	}
+	if _, _, err := drainTurn(control); err != nil {
+		t.Fatalf("control turn: %v", err)
+	}
+	_, body := capture.get()
+	last := body.Messages[len(body.Messages)-1]
+	if last.Role != "system" || last.Content != "repair instruction" {
+		t.Errorf("control message = %+v, want system role", last)
+	}
+	for _, m := range body.Messages {
+		if m.Role == "user" && strings.Contains(m.Content, "repair instruction") {
+			t.Fatalf("control instruction was represented as user speech")
+		}
+	}
+	if body.Messages[1].Content != "first" || body.Messages[2].Content != "Teilweise gehört" {
+		t.Errorf("control candidate lost history: %+v", body.Messages)
+	}
+}
+
+func TestSessionInterruptAfterCommittedTurn(t *testing.T) {
+	a, _ := newChatServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w, textSSE([]string{"very long unconfirmed answer"}, "stop"))
+	})
+	s := newSession(t, a, nil, outcomeSchema(), "")
+	turn, _ := s.SendUserTurn(context.Background(), "frage")
+	if _, _, err := drainTurn(turn); err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	if err := s.Interrupt(context.Background(), "nur dieser Satz"); err != nil {
+		t.Fatalf("Interrupt: %v", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.messages) != 3 {
 		t.Fatalf("history = %+v", s.messages)
 	}
+	if s.messages[1].Content != "frage" {
+		t.Errorf("user turn lost: %+v", s.messages)
+	}
+	if s.messages[2].Content != "nur dieser Satz" {
+		t.Errorf("unconfirmed full text retained: %+v", s.messages[2])
+	}
+}
+
+func TestSessionInterruptReopensFinished(t *testing.T) {
+	var calls atomic.Int32
+	a, _ := newChatServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			writeSSE(w, toolCallSSE("finish_call", "call_f", `{"kind":"aborted","detail":"done"}`, "tool_calls"))
+			return
+		}
+		writeSSE(w, textSSE([]string{"weiter"}, "stop"))
+	})
+	s := newSession(t, a, nil, outcomeSchema(), "")
+	turn, _ := s.SendUserTurn(context.Background(), "abbrechen")
+	res, _, err := drainTurn(turn)
+	if err != nil || res.Outcome == nil {
+		t.Fatalf("outcome turn: res=%+v err=%v", res, err)
+	}
+	if err := s.Interrupt(context.Background(), "kurz"); err != nil {
+		t.Fatalf("Interrupt on finished session: %v", err)
+	}
+	s.mu.Lock()
+	finished := s.finished
 	s.mu.Unlock()
+	if finished {
+		t.Fatal("Interrupt did not reopen the finished session")
+	}
+	turn2, err := s.SendUserTurn(context.Background(), "noch etwas")
+	if err != nil {
+		t.Fatalf("SendUserTurn after reopen: %v", err)
+	}
+	if _, _, err := drainTurn(turn2); err != nil {
+		t.Fatalf("post-reopen turn: %v", err)
+	}
+}
+
+func TestSessionInterruptWhilePending(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	a, _ := newChatServer(t, func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		writeSSE(w, textSSE([]string{"x"}, "stop"))
+	})
+	s := newSession(t, a, nil, outcomeSchema(), "")
+	if _, err := s.SendUserTurn(context.Background(), "eins"); err != nil {
+		t.Fatalf("SendUserTurn: %v", err)
+	}
+	<-started
+	if err := s.Interrupt(context.Background(), ""); !errors.Is(err, ErrTurnInProgress) {
+		t.Fatalf("Interrupt during turn = %v, want ErrTurnInProgress", err)
+	}
+	close(release)
+}
+
+func TestSessionSendControlReopensFinishedAndDiscardsOutcome(t *testing.T) {
+	var calls atomic.Int32
+	a, capture := newChatServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			writeSSE(w, toolCallSSE("finish_call", "call_f", `{"kind":"aborted","detail":"done"}`, "tool_calls"))
+			return
+		}
+		writeSSE(w, textSSE([]string{"repariert"}, "stop"))
+	})
+	s := newSession(t, a, nil, outcomeSchema(), "")
+	turn, _ := s.SendUserTurn(context.Background(), "abbrechen")
+	if _, _, err := drainTurn(turn); err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	control, err := s.SendControl(context.Background(), "outcome reparieren")
+	if err != nil {
+		t.Fatalf("SendControl on finished: %v", err)
+	}
+	if _, _, err := drainTurn(control); err != nil {
+		t.Fatalf("control turn: %v", err)
+	}
+	_, body := capture.get()
+	last := body.Messages[len(body.Messages)-1]
+	if last.Role != "system" {
+		t.Errorf("control role = %q, want system", last.Role)
+	}
+	for _, m := range body.Messages {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			t.Fatalf("rejected finish_call assistant message survived rollback: %+v", m)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finished {
+		t.Error("control turn left the session finished")
+	}
 }
 
 func TestSessionOneTurnAtATime(t *testing.T) {

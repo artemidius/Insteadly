@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -69,6 +70,9 @@ type realtimeStream struct {
 
 	closeOnce   sync.Once
 	closeResult error
+
+	aborted   atomic.Bool
+	abortOnce sync.Once
 }
 
 var _ ports.SpeechStream = (*realtimeStream)(nil)
@@ -173,6 +177,9 @@ func (s *realtimeStream) writer() {
 	for {
 		select {
 		case <-s.endCh:
+			if s.aborted.Load() {
+				return
+			}
 			s.drainAndEnd()
 			return
 		case text := <-s.textQ:
@@ -213,7 +220,9 @@ func (s *realtimeStream) sendText(text string) bool {
 // Audio().
 func (s *realtimeStream) reader() {
 	defer func() {
-		s.finalFlush()
+		if !s.aborted.Load() {
+			s.finalFlush()
+		}
 		close(s.audio)
 		close(s.readerDone)
 	}()
@@ -357,6 +366,25 @@ func (s *realtimeStream) FeedText(ctx context.Context, text string) error {
 
 // Audio returns the canonical PCM16 chunk channel, closed by the reader goroutine.
 func (s *realtimeStream) Audio() <-chan domain.AudioChunk { return s.audio }
+
+// Abort cancels the realtime generation without flushing queued text, closes the
+// WebSocket, and waits (bounded by ctx) for Audio to close. It is safe before, during,
+// or after Close and never blocks the caller past ctx.
+func (s *realtimeStream) Abort(ctx context.Context) error {
+	s.abortOnce.Do(func() {
+		s.aborted.Store(true)
+		s.mu.Lock()
+		s.feedClosed = true
+		s.mu.Unlock()
+		s.cancel()
+		_ = s.conn.CloseNow()
+	})
+	select {
+	case <-s.readerDone:
+	case <-ctx.Done():
+	}
+	return nil
+}
 
 // Close ends input and drains audio through the terminal speech.audio.done event.
 // Idempotent; concurrent callers share one close operation.

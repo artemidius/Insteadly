@@ -78,11 +78,27 @@ flushed on `speech.audio.done` and a residual frame is zero-padded to exactly 64
 
 Both modes share the same `ports.SpeechStream` and the same conversion pipeline.
 
+### Barge-in `Abort` (C4)
+
+`SpeechStream.Abort(ctx)` is the explicit non-flushing stop used by core barge-in and hold:
+
+- **realtime**: cancel the session context, close the WebSocket, discard unread synthesis, and
+  let the reader close `Audio` without the deferred resampler flush. It is idempotent and safe
+  before, during, or after `Close`.
+- **offline**: abort before `Close` emits **no** HTTP request; abort during synthesis cancels
+  the in-flight request/response body. The loser of the `Close`/`Abort` race waits on the
+  winner instead of double-closing `Audio`.
+
+`FeedText`, `Close`, and `Abort` are serialized so a queued-text send cannot panic against an
+aborted audio close. Normal `Close` semantics are unchanged and still flush. Abort's context
+bounds cleanup only; it never continues synthesis, and the core discards chunks already
+returned by an older playback generation.
+
 ## Dialogue: tools and the outcome
 
 The dialogue adapter is generic over `SessionRequest.Tools` and appends one reserved
 `finish_call` tool whose `parameters` is the caller's `OutcomeSchema`. The canonical tool surface
-is now **executed by the C3 agent** (`internal/core/agent`); the adapter still only parses and
+is now **executed by the C4 agent** (`internal/core/agent`); the adapter still only parses and
 returns tool calls, and never executes them. The wire contract below is unchanged:
 
 | Tool | Argument properties | Required | Handler-result contract |
@@ -132,6 +148,27 @@ others; `failed` requires non-blank `fail_reason`; `aborted` forbids the extras)
 exclusive and terminal: it is never returned as an ordinary `ports.ToolCall`, and after a valid
 outcome the session is finished.
 
+### Interruption and control (C4)
+
+`DialogueSession` adds two small operations; the assistant-turn/tool/outcome contract is
+otherwise unchanged.
+
+- `Interrupt(ctx, confirmedText)` reconciles the most recent assistant turn after its turn
+  context was canceled and `Wait` returned. The adapter keeps the triggering user/tool
+  messages, drops the interrupted turn's unexecuted calls/outcome, clears `pendingCalls`, and
+  records only `confirmedText` (the exact concatenation of complete, playback-marked assistant
+  segments) as assistant speech. Empty confirmed text records no assistant speech; executed
+  tool history is never erased. It reopens a `finish_call`-completed session when the core
+  interrupted before returning that outcome.
+- `SendControl(ctx, instruction)` starts one assistant turn from a fixed core-owned
+  instruction mapped to a **system-role** protocol message; it is never represented as a user
+  transcription. It preserves the failed/stalled turn's candidate user/tool messages (so a
+  retry does not lose them), rolls back a rejected `finish_call` assistant message, and keeps
+  the ordinary one-in-flight-turn rule. A successful turn commits normally; `Close` clears the
+  retained candidate.
+
+Both are local state operations and make no provider request by themselves.
+
 ## Terminal realtime events
 
 `transcription.done` and `speech.audio.done` are **terminal** for the realtime adapters: the
@@ -150,13 +187,15 @@ owns backoff via `Temporary`/`RetryDelay`. Context cancellation is wrapped so
 `errors.Is(err, context.Canceled/DeadlineExceeded)` works. Nothing logs API keys, auth headers,
 transcripts, prompts, tool arguments, outcome detail, patient data, or raw audio.
 
-## C3 agent execution
+## C4 conversation execution
 
-The C3 agent owns the tool definitions/validation/results, per-call proposal/confirmation
-state, the fixed German prompt, and the outcome/tool consistency check. See
-[agent.md](agent.md) for exact result JSON, the M0 gate, and the two live gates. The adapter
-contract here is unchanged: descriptions, schemas, the reserved `finish_call`, and the
-outcome schema are exactly what C3 passes in `SessionRequest`.
+The C4 conversation engine owns the tool definitions/validation/results, per-call
+proposal/confirmation state, the fixed German prompt with greeting-repair variants, streaming
+VAD/turn-taking, barge/hold/IVR policy, and bounded `Interrupt`/`SendControl` recovery. See
+[agent.md](agent.md) for the state machine, exact result JSON, and the live gates. The adapter
+contract is unchanged: descriptions, schemas, the reserved `finish_call`, and the outcome
+schema are exactly what the core passes in `SessionRequest`; only actual STT finals become
+user-role messages, while interruption metadata and control instructions use system roles.
 
 ## Live smoke test
 
@@ -179,5 +218,15 @@ LIVE_MISTRAL=1 MISTRAL_API_KEY=... make live-test-m0        # real Mistral, fake
 LIVE_M0_PHONE=1 LIVE_TWILIO=1 ... make live-test-m0-phone   # deferred real phone
 ```
 
-The no-phone target is the remaining C3 exit gate (it must run with explicit approval); the
-real-phone target stays blocked on the Twilio account upgrade.
+C4 adds the equivalent conversation gate pair (also excluded from `make verify`/CI):
+
+```bash
+LIVE_MISTRAL=1 MISTRAL_API_KEY=... make live-test-m1        # streaming VAD + barge + outcome
+LIVE_M1_PHONE=1 LIVE_TWILIO=1 LIVE_MISTRAL=1 ... make live-test-m1-phone
+```
+
+The C4 no-phone target exercises real streaming STT, a real barge with clear/confirmed
+history, and a valid structured outcome without a telephone. It is the remaining C4 exit gate
+and must run with explicit approval; it was **not** run by the C4 implementation session.
+Real-phone M1 remains blocked on the Twilio account upgrade and a controlled IVR/hold
+destination; a no-phone pass is not evidence of audible stream audio or human hearing.

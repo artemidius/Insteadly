@@ -33,6 +33,24 @@ type DialogueSession interface {
 	// the previous turn; the model continues from them and produces a new turn.
 	SubmitToolResults(ctx context.Context, results []ToolResult) (AssistantTurn, error)
 
+	// Interrupt reconciles the most recent assistant turn after its turn context was
+	// canceled and Wait returned. confirmedText is the exact concatenation of complete
+	// assistant segments whose playback marks were observed before ClearAudio; it is not
+	// the full generated response and never contains an estimated partial word. The
+	// adapter retains the triggering user/tool history, drops unexecuted calls/outcome
+	// from the interrupted assistant turn, and records only confirmedText as assistant
+	// speech. Empty confirmedText means no assistant text was confirmed. Already executed
+	// tool history is never erased. Interrupt reopens a finish_call-completed session
+	// when the core interrupted before returning that outcome.
+	Interrupt(ctx context.Context, confirmedText string) error
+
+	// SendControl starts one assistant turn from a fixed core-owned control instruction.
+	// It is not a transcription and must not be represented as something the far end
+	// said. The adapter preserves the candidate user/tool messages of a failed or
+	// stalled turn when retrying it. The same streaming AssistantTurn contract and
+	// ordinary tool/outcome limits apply. instruction must be non-empty.
+	SendControl(ctx context.Context, instruction string) (AssistantTurn, error)
+
 	// Close releases provider resources. Idempotent.
 	Close(ctx context.Context) error
 }

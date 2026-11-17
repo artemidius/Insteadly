@@ -39,6 +39,20 @@ type CallSession interface {
 	// SendDTMF sends a digit sequence through the live call (IVR menus).
 	SendDTMF(ctx context.Context, digits string) error
 
+	// ClearAudio discards outbound audio queued locally or by the provider but not yet
+	// played. It does not close the media stream or end the call. Audio already played
+	// cannot be recalled. It is idempotent and ordered against SendAudio/MarkPlayback:
+	// audio accepted after a successful clear belongs to the new playback generation.
+	// Late marks from an older generation may arrive.
+	ClearAudio(ctx context.Context) error
+
+	// MarkPlayback queues an opaque marker after all previously queued outbound audio.
+	// The adapter emits exactly one EventPlaybackMark with the same PlaybackID when the
+	// provider reports that point was reached. This is playback evidence, not proof that
+	// a person heard the audio. IDs are unique within a session. MarkPlayback is ordered
+	// with SendAudio and ClearAudio.
+	MarkPlayback(ctx context.Context, playbackID string) error
+
 	// Hangup terminates the call. Idempotent; safe after natural end.
 	Hangup(ctx context.Context) error
 }

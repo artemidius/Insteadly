@@ -142,6 +142,10 @@ func (s *fakeSession) SendAudio(context.Context, domain.AudioChunk) error {
 
 func (s *fakeSession) SendDTMF(context.Context, string) error { return nil }
 
+func (s *fakeSession) ClearAudio(context.Context) error { return nil }
+
+func (s *fakeSession) MarkPlayback(context.Context, string) error { return nil }
+
 func (s *fakeSession) Hangup(ctx context.Context) error {
 	s.mu.Lock()
 	s.hangupCount++
@@ -261,7 +265,7 @@ func newFakeAgent(outcome domain.Outcome, err error) *fakeAgent {
 	return &fakeAgent{outcome: outcome, err: err}
 }
 
-func (a *fakeAgent) Run(ctx context.Context, _ domain.Order, _ agent.AudioSession, _ <-chan domain.CallEvent) (domain.Outcome, error) {
+func (a *fakeAgent) Run(ctx context.Context, _ domain.Order, _ agent.AudioSession, _ <-chan domain.CallEvent, _ <-chan domain.CallEvent) (domain.Outcome, error) {
 	a.mu.Lock()
 	a.runs++
 	started := a.started

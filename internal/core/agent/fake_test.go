@@ -97,12 +97,13 @@ func (s *fakeStore) updateCount() int {
 // --- STT fake -------------------------------------------------------------------
 
 type fakeSTTScript struct {
-	partials   []string
-	finals     []string
-	openErr    error
-	feedErr    error
-	closeErr   error
-	resultsErr bool // close results without any final
+	partials      []string
+	finals        []string
+	openErr       error
+	feedErr       error
+	closeErr      error
+	resultsErr    bool   // close results without any final
+	partialOnFeed string // emitted once on the first Feed, before Close
 }
 
 type fakeSTT struct {
@@ -115,11 +116,24 @@ type fakeSTT struct {
 	opts     []ports.StreamOptions
 	streams  []*fakeTranscriptionStream
 	closeCtx []error
+
+	openGate  <-chan struct{}
+	feedDelay time.Duration
 }
 
 func (f *fakeSTT) TranscribeStream(ctx context.Context, opts ports.StreamOptions) (ports.TranscriptionStream, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	f.mu.Lock()
+	gate := f.openGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -154,11 +168,26 @@ func (s *fakeTranscriptionStream) Feed(ctx context.Context, chunk domain.AudioCh
 		return err
 	}
 	s.owner.mu.Lock()
+	delay := s.owner.feedDelay
+	feedErr := s.script.feedErr
+	s.owner.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	s.owner.mu.Lock()
 	defer s.owner.mu.Unlock()
-	if s.script.feedErr != nil {
-		return s.script.feedErr
+	if feedErr != nil {
+		return feedErr
 	}
 	s.owner.feeds = append(s.owner.feeds, append([]byte(nil), chunk.Data...))
+	if s.script.partialOnFeed != "" {
+		s.results <- ports.TranscriptionEvent{Text: s.script.partialOnFeed}
+		s.script.partialOnFeed = ""
+	}
 	return nil
 }
 
@@ -189,11 +218,12 @@ func (s *fakeTranscriptionStream) Close(ctx context.Context) error {
 // --- TTS fake -------------------------------------------------------------------
 
 type fakeTTSScript struct {
-	openErr   error
-	feedErr   error
-	closeErr  error
-	offline   bool
-	chunkSize int
+	openErr      error
+	feedErr      error
+	closeErr     error
+	offline      bool
+	chunkSize    int
+	suppressText string // emit no audio for exactly this text
 }
 
 type fakeTTS struct {
@@ -201,6 +231,7 @@ type fakeTTS struct {
 	script   fakeTTSScript
 	opens    int
 	closes   int
+	aborts   int
 	texts    []string
 	streams  []*fakeSpeechStream
 	feedHook func(text string)
@@ -226,6 +257,9 @@ type fakeSpeechStream struct {
 	audio  chan domain.AudioChunk
 	once   sync.Once
 	buffer []string
+
+	sendMu sync.Mutex
+	closed bool
 }
 
 func (s *fakeSpeechStream) FeedText(ctx context.Context, text string) error {
@@ -247,11 +281,34 @@ func (s *fakeSpeechStream) FeedText(ctx context.Context, text string) error {
 		s.buffer = append(s.buffer, text)
 		return nil
 	}
+	if script.suppressText != "" && text == script.suppressText {
+		return nil
+	}
 	s.emit()
 	return nil
 }
 
 func (s *fakeSpeechStream) Audio() <-chan domain.AudioChunk { return s.audio }
+
+// Abort discards without flushing.
+func (s *fakeSpeechStream) Abort(ctx context.Context) error {
+	s.once.Do(func() {
+		s.owner.mu.Lock()
+		s.owner.aborts++
+		s.owner.mu.Unlock()
+		s.closeAudio()
+	})
+	return nil
+}
+
+func (s *fakeSpeechStream) closeAudio() {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if !s.closed {
+		s.closed = true
+		close(s.audio)
+	}
+}
 
 func (s *fakeSpeechStream) Close(ctx context.Context) error {
 	s.once.Do(func() {
@@ -260,11 +317,14 @@ func (s *fakeSpeechStream) Close(ctx context.Context) error {
 		script := s.owner.script
 		s.owner.mu.Unlock()
 		if script.offline {
-			for range s.buffer {
+			for _, text := range s.buffer {
+				if script.suppressText != "" && text == script.suppressText {
+					continue
+				}
 				s.emit()
 			}
 		}
-		close(s.audio)
+		s.closeAudio()
 	})
 	if err := ctx.Err(); err != nil {
 		return err
@@ -283,6 +343,11 @@ func (s *fakeSpeechStream) emit() {
 	for i := range chunk {
 		chunk[i] = 1
 	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if s.closed {
+		return
+	}
 	select {
 	case s.audio <- domain.AudioChunk{Data: chunk}:
 	default:
@@ -293,19 +358,41 @@ func (s *fakeSpeechStream) emit() {
 // --- audio session fake ---------------------------------------------------------
 
 type fakeCall struct {
-	inbound chan domain.AudioChunk
+	inbound  chan domain.AudioChunk
+	controls chan domain.CallEvent
 
-	mu      sync.Mutex
-	sent    [][]byte
-	sendErr error
+	mu         sync.Mutex
+	sent       [][]byte
+	sendErr    error
+	clearErr   error
+	markErr    error
+	clears     int
+	marks      []string
+	dtmf       []string
+	dtmfErr    error
+	markSilent bool
+	markHook   func(id string)
 }
 
 func newFakeCall(inboundChunks ...[]byte) *fakeCall {
-	c := &fakeCall{inbound: make(chan domain.AudioChunk, 256)}
+	c := &fakeCall{
+		inbound:  make(chan domain.AudioChunk, 256),
+		controls: make(chan domain.CallEvent, 256),
+	}
 	for _, chunk := range inboundChunks {
 		c.inbound <- domain.AudioChunk{Data: chunk}
 	}
 	return c
+}
+
+func (c *fakeCall) Control() <-chan domain.CallEvent { return c.controls }
+
+// push enqueues canonical audio after the call started, for tests that must not interrupt
+// the greeting.
+func (c *fakeCall) push(chunks ...[]byte) {
+	for _, chunk := range chunks {
+		c.inbound <- domain.AudioChunk{Data: chunk}
+	}
 }
 
 func (c *fakeCall) Inbound() <-chan domain.AudioChunk { return c.inbound }
@@ -329,25 +416,94 @@ func (c *fakeCall) sentCount() int {
 	return len(c.sent)
 }
 
+func (c *fakeCall) SendDTMF(ctx context.Context, digits string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.dtmf = append(c.dtmf, digits)
+	err := c.dtmfErr
+	c.mu.Unlock()
+	return err
+}
+
+func (c *fakeCall) ClearAudio(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clears++
+	c.sent = nil
+	return c.clearErr
+}
+
+// MarkPlayback acknowledges immediately through the normalized control channel: the fake
+// has no provider queue, so the mark is reached after all previously accepted audio.
+func (c *fakeCall) MarkPlayback(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if c.markErr != nil {
+		err := c.markErr
+		c.mu.Unlock()
+		return err
+	}
+	c.marks = append(c.marks, id)
+	hook := c.markHook
+	silent := c.markSilent
+	c.mu.Unlock()
+	if hook != nil {
+		hook(id)
+	}
+	if silent {
+		return nil
+	}
+	select {
+	case c.controls <- domain.CallEvent{Kind: domain.EventPlaybackMark, PlaybackID: id}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *fakeCall) clearCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.clears
+}
+
+func (c *fakeCall) markIDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.marks...)
+}
+
 func (c *fakeCall) closeInbound() { close(c.inbound) }
 
 // --- dialogue fake --------------------------------------------------------------
 
 type turnScript struct {
-	chunks []string
-	result ports.TurnResult
-	err    error
+	chunks  []string
+	result  ports.TurnResult
+	err     error
+	waitCtx <-chan struct{}
+	waitErr error
 }
 
 type fakeDialogue struct {
-	mu       sync.Mutex
-	scripts  []turnScript
-	requests []ports.SessionRequest
-	opens    int
-	closed   int
-	texts    []string
-	results  [][]ports.ToolResult
-	failOpen error
+	mu          sync.Mutex
+	scripts     []turnScript
+	requests    []ports.SessionRequest
+	opens       int
+	closed      int
+	texts       []string
+	results     [][]ports.ToolResult
+	interrupts  []string
+	controls    []string
+	closeCtxErr error
+	failOpen    error
 }
 
 func (d *fakeDialogue) NewSession(ctx context.Context, req ports.SessionRequest) (ports.DialogueSession, error) {
@@ -399,19 +555,45 @@ func (s *fakeDialogueSession) next(string) (ports.AssistantTurn, error) {
 	if script.err != nil {
 		return nil, script.err
 	}
-	return newFakeTurn(script.chunks, script.result), nil
+	turn := newFakeTurn(script.chunks, script.result)
+	turn.waitCtx = script.waitCtx
+	turn.waitErr = script.waitErr
+	return turn, nil
 }
 
-func (s *fakeDialogueSession) Close(context.Context) error {
+func (s *fakeDialogueSession) Interrupt(ctx context.Context, confirmedText string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.owner.mu.Lock()
+	s.owner.interrupts = append(s.owner.interrupts, confirmedText)
+	s.owner.mu.Unlock()
+	return nil
+}
+
+func (s *fakeDialogueSession) SendControl(ctx context.Context, instruction string) (ports.AssistantTurn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.owner.mu.Lock()
+	s.owner.controls = append(s.owner.controls, instruction)
+	s.owner.mu.Unlock()
+	return s.next("control")
+}
+
+func (s *fakeDialogueSession) Close(ctx context.Context) error {
 	s.owner.mu.Lock()
 	defer s.owner.mu.Unlock()
 	s.owner.closed++
+	s.owner.closeCtxErr = ctx.Err()
 	return nil
 }
 
 type fakeTurn struct {
-	chunks chan string
-	result ports.TurnResult
+	chunks  chan string
+	result  ports.TurnResult
+	waitCtx <-chan struct{}
+	waitErr error
 }
 
 func newFakeTurn(chunks []string, result ports.TurnResult) *fakeTurn {
@@ -425,7 +607,20 @@ func newFakeTurn(chunks []string, result ports.TurnResult) *fakeTurn {
 
 func (t *fakeTurn) TextChunks() <-chan string { return t.chunks }
 
-func (t *fakeTurn) Wait(context.Context) (ports.TurnResult, error) { return t.result, nil }
+func (t *fakeTurn) Wait(ctx context.Context) (ports.TurnResult, error) {
+	if t.waitErr != nil && t.waitCtx == nil {
+		return t.result, t.waitErr
+	}
+	if t.waitCtx != nil {
+		select {
+		case <-t.waitCtx:
+			return ports.TurnResult{}, t.waitErr
+		case <-ctx.Done():
+			return ports.TurnResult{}, ctx.Err()
+		}
+	}
+	return t.result, nil
+}
 
 // --- tool executor fake ---------------------------------------------------------
 
@@ -444,26 +639,6 @@ func (f *fakeToolExecutor) Execute(_ context.Context, call ports.ToolCall) ([]by
 }
 
 func (f *fakeToolExecutor) ValidateOutcome(*domain.Outcome) error { return f.validateErr }
-
-// --- frame helpers --------------------------------------------------------------
-
-func silenceFrame() []byte { return make([]byte, domain.FrameBytes) }
-
-func frames(n int, frame []byte) [][]byte {
-	out := make([][]byte, n)
-	for i := range out {
-		out[i] = append([]byte(nil), frame...)
-	}
-	return out
-}
-
-func flatten(chunks ...[][]byte) [][]byte {
-	var out [][]byte
-	for _, c := range chunks {
-		out = append(out, c...)
-	}
-	return out
-}
 
 func testOrder() domain.Order {
 	return domain.Order{
@@ -495,7 +670,8 @@ func testConfig(store ports.OrderStore) Config {
 		Dialogue: &fakeDialogue{},
 		Orders:   store,
 		Now:      func() time.Time { return fixedNow },
-		Sleep:    func(context.Context, time.Duration) error { return nil },
+		VAD:      testVADConfig(),
+		Hold:     testHoldConfig(),
 	}
 }
 
