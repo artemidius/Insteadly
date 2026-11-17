@@ -27,6 +27,7 @@ type setter struct {
 // loader, the strict unknown-variable check, and (indirectly) the docs.
 var registry = map[string]setter{
 	"INSTEADLY_HTTP_ADDR":           {apply: strSetter(func(c *Config, v string) { c.HTTP.Addr = v })},
+	"INSTEADLY_HTTP_PUBLIC_URL":     {apply: strSetter(func(c *Config, v string) { c.HTTP.PublicURL = v })},
 	"INSTEADLY_LOG_LEVEL":           {apply: strSetter(func(c *Config, v string) { c.Log.Level = v })},
 	"INSTEADLY_LOG_FORMAT":          {apply: strSetter(func(c *Config, v string) { c.Log.Format = v })},
 	"INSTEADLY_TELEPHONY_PROVIDER":  {apply: strSetter(func(c *Config, v string) { c.Telephony.Provider = v })},
@@ -34,15 +35,18 @@ var registry = map[string]setter{
 	"INSTEADLY_TWILIO_AUTH_TOKEN":   {apply: strSetter(func(c *Config, v string) { c.Telephony.Twilio.AuthToken = v }), secret: true},
 	"INSTEADLY_TWILIO_PHONE_NUMBER": {apply: strSetter(func(c *Config, v string) { c.Telephony.Twilio.PhoneNumber = v })},
 	"INSTEADLY_TWILIO_MODE":         {apply: strSetter(func(c *Config, v string) { c.Telephony.Twilio.Mode = v })},
-	"INSTEADLY_STT_PROVIDER":        {apply: strSetter(func(c *Config, v string) { c.STT.Provider = v })},
-	"INSTEADLY_TTS_PROVIDER":        {apply: strSetter(func(c *Config, v string) { c.TTS.Provider = v })},
-	"INSTEADLY_DIALOGUE_PROVIDER":   {apply: strSetter(func(c *Config, v string) { c.Dialogue.Provider = v })},
-	"INSTEADLY_STORAGE_PROVIDER":    {apply: strSetter(func(c *Config, v string) { c.Storage.Provider = v })},
-	"INSTEADLY_STORAGE_LOCAL_DIR":   {apply: strSetter(func(c *Config, v string) { c.Storage.Local.Dir = v })},
-	"INSTEADLY_RECORDING_ENABLED":   {apply: boolSetter(func(c *Config, v bool) { c.Recording.RecordingEnabled = v })},
-	"INSTEADLY_TRANSCRIPT_ENABLED":  {apply: boolSetter(func(c *Config, v bool) { c.Recording.TranscriptEnabled = v })},
-	"INSTEADLY_AUDIO_ENABLED":       {apply: boolSetter(func(c *Config, v bool) { c.Recording.AudioEnabled = v })},
-	"INSTEADLY_MISTRAL_API_KEY":     {apply: strSetter(func(c *Config, v string) { c.Mistral.APIKey = v }), secret: true},
+	"INSTEADLY_TWILIO_RING_TIMEOUT_SECONDS": {
+		apply: intSetter(func(c *Config, v int) { c.Telephony.Twilio.RingTimeoutSeconds = v }),
+	},
+	"INSTEADLY_STT_PROVIDER":       {apply: strSetter(func(c *Config, v string) { c.STT.Provider = v })},
+	"INSTEADLY_TTS_PROVIDER":       {apply: strSetter(func(c *Config, v string) { c.TTS.Provider = v })},
+	"INSTEADLY_DIALOGUE_PROVIDER":  {apply: strSetter(func(c *Config, v string) { c.Dialogue.Provider = v })},
+	"INSTEADLY_STORAGE_PROVIDER":   {apply: strSetter(func(c *Config, v string) { c.Storage.Provider = v })},
+	"INSTEADLY_STORAGE_LOCAL_DIR":  {apply: strSetter(func(c *Config, v string) { c.Storage.Local.Dir = v })},
+	"INSTEADLY_RECORDING_ENABLED":  {apply: boolSetter(func(c *Config, v bool) { c.Recording.RecordingEnabled = v })},
+	"INSTEADLY_TRANSCRIPT_ENABLED": {apply: boolSetter(func(c *Config, v bool) { c.Recording.TranscriptEnabled = v })},
+	"INSTEADLY_AUDIO_ENABLED":      {apply: boolSetter(func(c *Config, v bool) { c.Recording.AudioEnabled = v })},
+	"INSTEADLY_MISTRAL_API_KEY":    {apply: strSetter(func(c *Config, v string) { c.Mistral.APIKey = v }), secret: true},
 }
 
 func strSetter(fn func(*Config, string)) func(*Config, string) error {
@@ -56,6 +60,17 @@ func boolSetter(fn func(*Config, bool)) func(*Config, string) error {
 			return fmt.Errorf("expected true/false, got %q", v)
 		}
 		fn(c, b)
+		return nil
+	}
+}
+
+func intSetter(fn func(*Config, int)) func(*Config, string) error {
+	return func(c *Config, v string) error {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("expected an integer, got %q", v)
+		}
+		fn(c, n)
 		return nil
 	}
 }
@@ -89,6 +104,9 @@ func load(path string, environ []string) (Config, error) {
 	if err := applyEnviron(&c, environ); err != nil {
 		return c, err
 	}
+	// A trailing slash is a common copy/paste artifact from tunnel tools and would turn
+	// webhook URLs into "https://host//webhooks/...". Normalize once, before validation.
+	c.HTTP.PublicURL = strings.TrimRight(c.HTTP.PublicURL, "/")
 	if err := c.Validate(); err != nil {
 		return c, err
 	}

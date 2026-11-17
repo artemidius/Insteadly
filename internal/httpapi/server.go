@@ -41,6 +41,12 @@ func New(cfg config.Config, a *app.App, version string) *http.Server {
 	mux.HandleFunc("POST /api/v1/orders", api.createOrder)
 	mux.HandleFunc("GET /api/v1/orders/{id}", api.getOrder)
 
+	// Provider webhooks are mounted only when the selected adapter has them. They are
+	// not part of the JSON API: Twilio posts form-encoded requests and expects TwiML.
+	if a.Webhooks != nil {
+		mux.Handle("/webhooks/telephony/twilio/", a.Webhooks)
+	}
+
 	// Outermost first: recoverer -> requestID -> logger. A panic is still logged with
 	// its request id, and the access log line records the final status.
 	var handler http.Handler = mux

@@ -104,3 +104,23 @@ generated at creation.
 curl -s http://127.0.0.1:8080/api/v1/orders/ad354a4459ffdff6870e77e85bd04ac0 | jq .status
 # "created"
 ```
+
+## Telephony webhooks (Twilio)
+
+These routes are **not** part of the JSON API. They exist only when
+`INSTEADLY_TELEPHONY_PROVIDER=twilio` and are called by Twilio with
+`application/x-www-form-urlencoded` bodies. Status callbacks carry and require
+`X-Twilio-Signature`; the TwiML fetch is not signed by Twilio and is instead guarded by
+the unguessable call ID plus matching `AccountSid`/`CallSid` form fields. Form bodies over
+64 KiB get `413`.
+
+| Method | Path | Response |
+|---|---|---|
+| `POST` | `/webhooks/telephony/twilio/voice/{callID}` | `200 text/xml` — `<Connect><Stream>` TwiML, or `<Hangup>` for a finished call |
+| `POST` | `/webhooks/telephony/twilio/status/{callID}` | `200` empty — call progress callback (`CallStatus`) |
+| `POST` | `/webhooks/telephony/twilio/stream-status/{callID}` | `200` empty — stream lifecycle diagnostics |
+| `GET` | `/webhooks/telephony/twilio/stream/{callID}` | `101` WebSocket — Media Streams audio |
+
+`{callID}` is the adapter's 32-hex call identifier, not an order ID. These endpoints are
+mounted by the same `http.Server` as the JSON API; see [twilio.md](twilio.md) for the
+public-URL/tunnel setup and signature troubleshooting.
