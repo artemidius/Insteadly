@@ -69,7 +69,7 @@ the port boundary.
 | Port | File | Consumer | Notes |
 |---|---|---|---|
 | `Telephony` / `CallSession` | `ports/telephony.go` | call runner (C3) | normalized events, duplex canonical audio, DTMF, idempotent hangup |
-| `SpeechToText` / `TranscriptionStream` | `ports/speech.go` | agent engine (C3) | streaming + batch; final flush on `Close` |
+| `SpeechToText` / `TranscriptionStream` | `ports/speech.go` | agent engine (C3) | one stream per utterance; final flush on `Close` |
 | `TextToSpeech` / `SpeechStream` | `ports/speech.go` | agent engine (C3) | feed text, canonical audio out; not 1:1 |
 | `Dialogue` / `DialogueSession` / `AssistantTurn` | `ports/dialogue.go` | agent engine (C3) | text + tools in, streamed text + tool calls + outcome out |
 | `Storage` → `OrderStore`, `BlobStore` | `ports/storage.go` | API, runner, scheduler | orders + blobs; no provider types |
@@ -89,6 +89,9 @@ interface doc comments and must be honored by every adapter.
   `ports.ErrNotImplemented` (C7).
 - `STT`, `TTS`, `Dialogue`: `stub`, or `mistral` (C2).
 - `Payments` and `Notify` remain `nil` until C6/C7.
+- `Agent` is one stateless `internal/core/agent.Agent` around the selected STT/TTS/
+  Dialogue/Orders ports; `Runner` is one `internal/core/runner.Runner` around telephony,
+  orders, and the agent. `App.Close` drains active calls through the runner.
 - `App.Webhooks` carries the telephony adapter's HTTP surface (nil for stub);
   `internal/httpapi` mounts it, so the JSON API package never imports an adapter.
 
@@ -196,6 +199,29 @@ Media Streams socket cannot send DTMF, so `SendDTMF` updates the call with TwiML
 `<Play digits="…">` and reconnects the stream; the session is reconnect-safe across stream
 IDs. This is a C1 stopgap; C4 may replace it with a more robust IVR flow.
 
+## Call runner and agent engine (C3)
+
+`internal/core/runner` owns one order attempt: atomic claim
+(`scheduled → dialing`, `Attempts++`), one `Dial` on a call-lifetime context, event-driven
+status transitions, the optional C1 `StreamReady()` wait, agent handoff, exactly one
+`Hangup`, and exactly one `Finish(outcome)`. A valid dialogue outcome always wins over the
+local Hangup reason (`EndAborted`); otherwise a fixed fallback maps the terminal
+`EndReason`/provider error to `aborted` or `failed/{busy,no_answer,rejected,ivr_dead_end,
+error,other}`. `Runner.Run` is synchronous; `Runner.Close` rejects new runs, cancels and
+waits for active calls, and `cmd/insteadly` drains it before `http.Server.Shutdown`.
+
+`internal/core/agent` owns the answered-call loop: a fixed German AI disclosure greeting,
+a minimal energy/silence M0 utterance delimiter, one STT stream per utterance (20 ms/frame
+replay, exactly one final), dialogue turns with core-owned tool execution, lazy streaming
+TTS with a concurrent `SendAudio` drainer, and bounded turn/tool/call limits. The agent
+receives only `Inbound`/`SendAudio`; it cannot consume events, send DTMF, or hang up.
+
+Both packages import only `internal/core/{ports,domain}` (plus the agent from the runner);
+`internal/app` is the only composer. There is deliberately **no** public place-call
+endpoint in C3 — `Runner.Run` is the invocation surface until C5 owns authenticated,
+idempotent scheduling. Exact rules, tool schemas/results, outcome precedence, privacy
+constraints, and live-test recipes are in [agent.md](agent.md).
+
 ## Mistral adapters (C2)
 
 `internal/adapters/{stt,tts,dialogue}/mistral` implement `ports.SpeechToText`,
@@ -222,6 +248,6 @@ and live-test recipe.
 |---|---|
 | C1 | ✅ (code) `internal/adapters/telephony/twilio` + `buildTelephony` case + `App.Webhooks`; live audio awaits a Twilio account upgrade |
 | C2 | ✅ (code) `internal/adapters/{stt,tts,dialogue}/mistral` + three `build*` cases; live Mistral smoke passed |
-| C3 | `internal/core/agent` (loop, VAD) + `internal/core/runner`; consumes existing ports |
+| C3 | 🔵 code complete (pending the live no-phone gate) `internal/core/agent` + `internal/core/runner`; consumes existing ports; no new API route |
 | C5 | Postgres storage adapter, scheduler, SSE endpoint in `httpapi` |
 | C6/C7 | Payments and Notifier adapters; fill the `nil` fields in `app.App` |

@@ -82,15 +82,16 @@ Both modes share the same `ports.SpeechStream` and the same conversion pipeline.
 
 The dialogue adapter is generic over `SessionRequest.Tools` and appends one reserved
 `finish_call` tool whose `parameters` is the caller's `OutcomeSchema`. The canonical tool surface
-for C3 (defined here as the contract, not implemented — C2 executes nothing):
+is now **executed by the C3 agent** (`internal/core/agent`); the adapter still only parses and
+returns tool calls, and never executes them. The wire contract below is unchanged:
 
 | Tool | Argument properties | Required | Handler-result contract |
 |---|---|---|---|
 | `propose_slot` | `start` (date-time), `end` (date-time), `doctor` (string), `practice` (string) | `start`, `end` | Propose, never book. C3 checks `start < end` and preference policy. Result: `{"ok":true,"start":"…","end":"…"}` or `{"ok":false,"error":"outside_preferences"}` |
 | `confirm_booking` | same four plus `confirmation_code` (string) | `start`, `end` | Record a slot only after explicit clinic acceptance. Result: `{"ok":true,"confirmation_code":"…"}` or `{"ok":false,"error":"not_confirmed"}`. Does not replace terminal `finish_call` |
 | `capture_info` | `field` (enum `full_name`, `phone`, `birth_date`, `insurance_number`, `reason`, `note`), `value` (string, 1..2048 chars) | `field`, `value` | Capture one user-authorized field; no arbitrary keys. Result: `{"ok":true,"field":"reason"}` or `{"ok":false,"error":"invalid_value"}` |
-| `escalate_to_human` | `reason` (non-empty string), `urgent` (boolean) | `reason` | Ask C3 to hand off; C2 never performs a transfer. Result: `{"ok":true,"action":"escalate_to_human"}` or `{"ok":false,"error":"unavailable"}` |
-| `finish_call` | the canonical outcome schema below | per schema | Reserved terminal outcome, intercepted by the dialogue adapter; no C3 tool result |
+| `escalate_to_human` | `reason` (non-empty string), `urgent` (boolean) | `reason` | Ask C3 to hand off; C2 never performs a transfer. C3 always returns `{"ok":false,"error":"unavailable"}` until a real handoff exists |
+| `finish_call` | the canonical outcome schema below | per schema | Reserved terminal outcome, intercepted by the dialogue adapter; never executed, never given a tool result |
 
 Descriptions must state the side-effect rules above, especially that `propose_slot` is not
 a booking and `confirm_booking` requires explicit acceptance. `capture_insurance` is
@@ -140,6 +141,14 @@ owns backoff via `Temporary`/`RetryDelay`. Context cancellation is wrapped so
 `errors.Is(err, context.Canceled/DeadlineExceeded)` works. Nothing logs API keys, auth headers,
 transcripts, prompts, tool arguments, outcome detail, patient data, or raw audio.
 
+## C3 agent execution
+
+The C3 agent owns the tool definitions/validation/results, per-call proposal/confirmation
+state, the fixed German prompt, and the outcome/tool consistency check. See
+[agent.md](agent.md) for exact result JSON, the M0 gate, and the two live gates. The adapter
+contract here is unchanged: descriptions, schemas, the reserved `finish_call`, and the
+outcome schema are exactly what C3 passes in `SessionRequest`.
+
 ## Live smoke test
 
 Optional, build-tagged, double-gated — excluded from CI and `make verify`:
@@ -153,3 +162,13 @@ It runs one short sequence: TTS `Guten Tag.` → canonical frames → realtime S
 containing `guten` → one dialogue `capture_info` call (not executed). Result 2026-11-17: **PASS**
 (40 canonical frames; float32 PCM encoding confirmed; two close-after-done robustness amendments
 recorded in `plans/03-mistral-ai.md` §13).
+
+C3 adds two more opt-in targets, both excluded from `make verify`/CI:
+
+```bash
+LIVE_MISTRAL=1 MISTRAL_API_KEY=... make live-test-m0        # real Mistral, fake telephony
+LIVE_M0_PHONE=1 LIVE_TWILIO=1 ... make live-test-m0-phone   # deferred real phone
+```
+
+The no-phone target is the remaining C3 exit gate (it must run with explicit approval); the
+real-phone target stays blocked on the Twilio account upgrade.
