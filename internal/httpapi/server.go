@@ -162,6 +162,10 @@ type healthResponse struct {
 // health reports liveness plus non-secret configuration, so ops can see which
 // providers the process actually wired.
 func (a *API) health(w http.ResponseWriter, _ *http.Request) {
+	notifyProvider := a.cfg.Notify.Provider
+	if notifyProvider == "" {
+		notifyProvider = "off" // zero Config == notifications disabled
+	}
 	writeJSON(w, http.StatusOK, healthResponse{
 		Status:        "ok",
 		Version:       a.version,
@@ -174,6 +178,7 @@ func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 			"storage":   a.cfg.Storage.Provider,
 			"auth":      a.cfg.Auth.Mode,
 			"payments":  a.cfg.Payments.Provider,
+			"notify":    notifyProvider,
 		},
 	})
 }
