@@ -13,20 +13,16 @@
 - **Phase:** C0 ✅; **C1 code complete** (live audio + outbound DTMF blocked by Twilio
   trial); **C2 ✅** (Mistral adapters, fake suites green, live smoke passed); **C3 ✅ code
   complete** (call runner + agent engine v0; real-Mistral no-phone live gate passed);
-  **C4 🔵 code complete pending the real-Mistral no-phone live gate** — the first gate
-  attempt exposed a live-harness burst-feed pacing bug (fixed; production unchanged); the
-  gate needs a re-run — streaming
-  VAD/turn-taking, barge-in with Twilio `clear`/`mark`, deterministic IVR, hold detection,
-  and bounded structured-outcome repair are implemented with credential-free fake-Mistral /
-  fake-telephony integration coverage. DESIGN's **real-phone M0 and M1 exits** remain
-  blocked by the Twilio trial stripping `<Stream>` (and, for M1, by the unproven outbound
-  DTMF path plus the need for controlled IVR/hold destinations).
-- **Current chunk:** C4 code complete (🔵). Next: conductor runs `make live-test-m1`
-  (`TestLiveM1NoPhone`) with explicit approval; only an observed pass marks C4 ✅. Then write
-  `plans/06-orchestration.md` and start C5.
-- **First action of the next session:** re-run the C4 no-phone live gate with the pacing and
-  script harness fixes; if it passes, mark C4 ✅ and proceed to C5 planning. Do not run the
-  real-phone M1 harness.
+  **C4 ✅ code complete** — streaming VAD/turn-taking, barge-in with Twilio `clear`/`mark`,
+  deterministic IVR, hold detection, and bounded structured-outcome repair are implemented
+  with credential-free fake-Mistral/fake-telephony integration coverage AND the
+  real-Mistral no-phone M1 live gate **passed** (`clears=2`, terminal `aborted`,
+  non-silent outbound). DESIGN's **real-phone M0 and M1 exits** remain blocked by the
+  Twilio trial stripping `<Stream>` (and, for M1, by the unproven outbound-DTMF path plus
+  the need for controlled IVR/hold destinations).
+- **Current chunk:** C4 done (code complete). Next: write `plans/06-orchestration.md` and
+  start C5 (Postgres order store, scheduler, status API + SSE).
+- **First action of the next session:** write the C5 plan (`plans/06-orchestration.md`).
 - **Blockers:** DESIGN's real-phone M0/M1 exits remain blocked by the Twilio trial stripping
   `<Stream>` and the unproven outbound-DTMF path — need an upgraded account, a controlled
   IVR/hold destination, and explicit approval before the end-to-end phone walk. Operational:
@@ -46,7 +42,7 @@
 | **C1** | M0 | Twilio telephony adapter (voice-api): webhooks, Media Streams WebSocket, µ-law→PCM16, DTMF. | [plans/02-twilio-telephony.md](plans/02-twilio-telephony.md) | 🔵 code complete; live audio blocked by Twilio trial |
 | **C2** | M0 | Mistral adapters for STT / TTS / Dialogue (raw WS/JSON APIs, no Go SDK exists). | [plans/03-mistral-ai.md](plans/03-mistral-ai.md) | ✅ code complete; live smoke passed |
 | **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | [plans/04-m0-e2e.md](plans/04-m0-e2e.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
-| **C4** | M1 | Conversation: streaming VAD/turn-taking, barge-in, playback clear/marks, deterministic IVR, hold detection, bounded structured-outcome repair. | [plans/05-conversation.md](plans/05-conversation.md) | 🔵 code complete pending the real-Mistral no-phone gate; real phone blocked by Twilio trial |
+| **C4** | M1 | Conversation: streaming VAD/turn-taking, barge-in, playback clear/marks, deterministic IVR, hold detection, bounded structured-outcome repair. | [plans/05-conversation.md](plans/05-conversation.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE. | `plans/06-orchestration.md` (TBD) | ⬜ |
 | **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | `plans/07-web-app.md` (TBD) | ⬜ |
 | **C7** | M4 | Swapability proof + hardening: second telephony adapter (Telnyx or Twilio SIP trunk), one alternative AI provider, recording/storage flags end-to-end, notifications. | `plans/08-swapability.md` (TBD) | ⬜ |
@@ -60,6 +56,33 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C4 conductor live-gate session (Europe/Vienna)
+
+- Ran the multi-agent flow for C4: Architect (`kimi-code/k3.1-pro`) → Coder
+  (`deepseek-official/deepseek-flash`) → Reviewer (`kimi-code/k3.1-pro`). Merged PR #6
+  (`feat/c4-conversation`) and follow-ups PR #7 (live pacing), PR #8 (live script), PR #9
+  (greeting barge), PR #10 (VAD barge tuning), PR #11 (outbound accounting) via squash.
+- **Real-Mistral no-phone M1 live gate PASS (observed):** `LIVE_MISTRAL=1 make live-test-m1`
+  → `TestLiveM1NoPhone` **PASS** (11.7 s): `outcome=aborted`, `attempts=1`, `clears=2`,
+  `outbound_frames=79` — proves streaming VAD, a real barge-in with `clear`/history
+  reconciliation during the greeting, a real STT final, and a terminal `finish_call` outcome.
+  Satisfies plan §8's C4 code-complete gate.
+- **Live-gate debugging (conductor-instrumented, multiple iterations):** the gate exposed a
+  live-harness burst-feed bug (instant frame delivery overflowed the 64-frame utterance
+  queue → paced to 20 ms/frame), a script bug (first utterance finished the call instead of
+  eliciting a reply), a greeting-barge restructure, and — measured via real TTS frame RMS —
+  a genuine VAD tuning bug: the barge onset required 5 consecutive frames each passing
+  `flux >= 0.04`, which real speech never produces (spectral flux only spikes at transitions,
+  and real speech has ~3–4-frame loud runs with consonant dips). Fixed by dropping the
+  per-frame flux requirement for the barge path and `BargeInFrames` 5→3, keeping the higher
+  0.024/4×-noise threshold for echo asymmetry. All recorded in `plans/05-conversation.md`
+  §3.7/§13.
+- **Status:** C4 → ✅ code complete. DESIGN's real-phone M1 exit remains blocked by the
+  Twilio trial + unproven outbound DTMF + controlled IVR/hold destinations; the
+  `live-test-m1-phone` harness compiles/skips and is ready for the upgraded-account run.
+- **Environment:** no new env keys/deps; the real `MISTRAL_API_KEY` was read only for the
+  no-phone live gate (value never printed). Builds used a `/tmp` GOCACHE/GOMODCACHE.
 
 ### 2026-11-17 — C4 implementation session (Europe/Vienna)
 

@@ -12,16 +12,17 @@ swappable adapters.
 **Status:** C2 (Mistral STT/TTS/dialogue adapters) is ✅. C3 (call runner + agent engine v0)
 is **✅ code complete** after its real-Mistral no-phone live gate. C4 (conversation:
 streaming VAD/turn-taking, barge-in, playback marks/clear, deterministic IVR, hold detection,
-bounded structured-outcome repair) is **🔵 code complete pending the real-Mistral no-phone
-live gate** — see [PROGRESS.md](PROGRESS.md). The binary still boots and serves a working API
+bounded structured-outcome repair) is **✅ code complete** after its real-Mistral no-phone
+M1 live gate — see [PROGRESS.md](PROGRESS.md). The binary still boots and serves a working API
 with **no credentials and no external network calls** (all providers default to deterministic
 stubs). Selecting `INSTEADLY_TELEPHONY_PROVIDER=twilio` activates the real Twilio Voice +
 Media Streams adapter; selecting `INSTEADLY_{STT,TTS,DIALOGUE}_PROVIDER=mistral` activates the
 real Mistral speech and dialogue adapters (see [docs/mistral.md](docs/mistral.md)).
 
 C4's conversation engine is proven credential-free against loopback fake Mistral servers and
-scripted fake telephony, and the full C4 unit/race suite is green. Twilio live audio and
-outbound DTMF remain blocked on the current **trial** account, so DESIGN's real-phone M1 exit
+scripted fake telephony, and the full C4 unit/race suite is green, plus a real-Mistral
+no-phone loopback (barge-in with clear, deterministic IVR, hold, outcome repair). Twilio live
+audio and outbound DTMF remain blocked on the current **trial** account, so DESIGN's real-phone M1 exit
 (and the earlier real-phone M0 exit) is still deferred. C4 deliberately does **not** implement
 acoustic echo cancellation, speaker diarization, recorded audio/transcripts, a free-form
 digits tool, a real human transfer (`escalate_to_human` stays honestly `unavailable`), retries,
@@ -193,6 +194,7 @@ write` for releases).
 | C1 | Twilio telephony adapter (webhooks, Media Streams, µ-law→PCM16, DTMF) | 🔵 code complete; live audio blocked by Twilio trial |
 | C2 | Mistral STT / TTS / dialogue adapters | ✅ code complete; live smoke passed |
 | C3 | call runner + agent engine, end-to-end M0 walk | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
-| C4+ | conversation, orchestration, web app, swapability | ⬜ |
+| C4 | conversation: VAD/turn-taking, barge-in, IVR, hold, outcome repair | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
+| C5+ | orchestration, web app, swapability | ⬜ |
 
 See [PROGRESS.md](PROGRESS.md) for the authoritative status and session log.
