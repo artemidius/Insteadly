@@ -10,15 +10,17 @@ interfaces; telephony, speech, dialogue, storage, payments, and notifications ar
 swappable adapters.
 
 **Status:** C2 (Mistral STT/TTS/dialogue adapters) is ✅. C3 (call runner + agent engine v0)
-is **code complete, pending the real-Mistral no-phone gate** — see
-[PROGRESS.md](PROGRESS.md). The binary still boots and serves a working API with **no
-credentials and no external network calls** (all providers default to deterministic stubs).
-Selecting `INSTEADLY_TELEPHONY_PROVIDER=twilio` activates the real Twilio Voice + Media Streams
-adapter; selecting `INSTEADLY_{STT,TTS,DIALOGUE}_PROVIDER=mistral` activates the real Mistral
-speech and dialogue adapters (see [docs/mistral.md](docs/mistral.md)). Twilio live audio is
-blocked on the current **trial** account, so DESIGN's real-phone M0 exit is still deferred; the
-Mistral chain was verified with a live smoke test, and C3's full runner/agent chain is proven
-credential-free against loopback fake Mistral servers (see [docs/agent.md](docs/agent.md)).
+is **✅ code complete** — the credential-free full fake-Mistral chain is green and the
+real-Mistral no-phone live gate **passed** — see [PROGRESS.md](PROGRESS.md). The binary still
+boots and serves a working API with **no credentials and no external network calls** (all
+providers default to deterministic stubs). Selecting `INSTEADLY_TELEPHONY_PROVIDER=twilio`
+activates the real Twilio Voice + Media Streams adapter; selecting
+`INSTEADLY_{STT,TTS,DIALOGUE}_PROVIDER=mistral` activates the real Mistral speech and dialogue
+adapters (see [docs/mistral.md](docs/mistral.md)). Twilio live audio is blocked on the current
+**trial** account, so DESIGN's real-phone M0 exit is still deferred; the Mistral chain was
+verified with a live smoke test, and C3's full runner/agent chain is proven credential-free
+against loopback fake Mistral servers plus a real-Mistral no-phone loopback (see
+[docs/agent.md](docs/agent.md)).
 
 Design of record: [DESIGN.md](DESIGN.md). Chunk plans live in [`plans/`](plans/).
 
@@ -185,7 +187,7 @@ write` for releases).
 | C0 | foundation: hexagon skeleton, config, local storage, stubs, HTTP API | ✅ |
 | C1 | Twilio telephony adapter (webhooks, Media Streams, µ-law→PCM16, DTMF) | 🔵 code complete; live audio blocked by Twilio trial |
 | C2 | Mistral STT / TTS / dialogue adapters | ✅ code complete; live smoke passed |
-| C3 | call runner + agent engine, end-to-end M0 walk | 🔵 code complete; real-Mistral no-phone gate pending; real phone blocked by Twilio trial |
+| C3 | call runner + agent engine, end-to-end M0 walk | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | C4+ | conversation, orchestration, web app, swapability | ⬜ |
 
 See [PROGRESS.md](PROGRESS.md) for the authoritative status and session log.

@@ -11,21 +11,21 @@
 ## Status at a glance (update every session)
 
 - **Phase:** C0 ✅; **C1 code complete** (live audio blocked by Twilio trial); **C2 ✅**
-  (Mistral adapters, fake suites green, live smoke passed); **C3 code complete** (call
-  runner + agent engine v0, credential-free full fake-Mistral chain green) but **🔵 pending
-  its real-Mistral no-phone live gate**, which this session was instructed not to run.
-- **Current chunk:** C3 — call runner + agent engine v0. Next: the conductor runs
-  `LIVE_MISTRAL=1 make live-test-m0`; only then may C3 move to ✅. C4 is planned after that.
-- **First action of the next session:** run the C3 no-phone live gate with explicit
-  approval and record the observed result; then write `plans/05-conversation.md`.
-- **Blockers:** the C3 live no-phone gate has not been run yet (requires explicit approval
-  and spends real Mistral credit); DESIGN's real-phone M0 exit remains blocked by the
-  Twilio trial stripping `<Stream>` — C1 🔵. Operational: `golangci-lint` absent locally
-  (optional; CI installs v2.15.0; the C3 session used the /tmp v2.15.0 binary);
-  `/usr/bin/make` broken by the Xcode 16.2/macOS 26 issue — use
-  `/Library/Developer/CommandLineTools/usr/bin/make`. Build/test commands may need
-  `GOCACHE=/tmp/insteadly-go-cache` in this sandbox because `~/Library/Caches/go-build` is
-  not writable here.
+  (Mistral adapters, fake suites green, live smoke passed); **C3 ✅ code complete** — call
+  runner + agent engine v0 with the credential-free full fake-Mistral chain green AND the
+  real-Mistral no-phone live gate **passed** (`capture_info` persisted, terminal `aborted`,
+  non-silent outbound). DESIGN's **real-phone M0 exit** is still blocked by the Twilio
+  trial stripping `<Stream>` (C1 🔵).
+- **Current chunk:** C3 done (code complete). Next: write `plans/05-conversation.md` and
+  start C4 (real VAD / turn-taking, barge-in, DTMF through IVRs, structured-outcome repair).
+- **First action of the next session:** write the C4 plan (`plans/05-conversation.md`).
+- **Blockers:** DESIGN's real-phone M0 exit remains blocked by the Twilio trial stripping
+  `<Stream>` — needs an upgraded account before the end-to-end phone walk. Operational:
+  `golangci-lint` absent locally (optional; CI installs v2.15.0; the C3 session used the
+  /tmp v2.15.0 binary); `/usr/bin/make` broken by the Xcode 16.2/macOS 26 issue — use
+  `/Library/Developer/CommandLineTools/usr/bin/make`. Build/test commands may need a
+  `/tmp` GOCACHE/GOMODCACHE in this sandbox (`~/Library/Caches/go-build` and
+  `~/go/pkg/mod` are not writable here).
 
 ---
 
@@ -36,7 +36,7 @@
 | **C0** | M0 | Foundation: Go module, hexagon skeleton (domain, all 6 port contracts, config loader, local storage adapter, stub providers, composition root, HTTP API). Zero external deps, zero credentials. | [plans/01-foundation.md](plans/01-foundation.md) | ✅ |
 | **C1** | M0 | Twilio telephony adapter (voice-api): webhooks, Media Streams WebSocket, µ-law→PCM16, DTMF. | [plans/02-twilio-telephony.md](plans/02-twilio-telephony.md) | 🔵 code complete; live audio blocked by Twilio trial |
 | **C2** | M0 | Mistral adapters for STT / TTS / Dialogue (raw WS/JSON APIs, no Go SDK exists). | [plans/03-mistral-ai.md](plans/03-mistral-ai.md) | ✅ code complete; live smoke passed |
-| **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | [plans/04-m0-e2e.md](plans/04-m0-e2e.md) | 🔵 code complete; real-Mistral no-phone gate not yet run; real phone blocked by Twilio trial |
+| **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | [plans/04-m0-e2e.md](plans/04-m0-e2e.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | **C4** | M1 | Conversation: VAD / turn-taking, barge-in, DTMF through IVRs, structured outcome extraction. | `plans/05-conversation.md` (TBD) | ⬜ |
 | **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE. | `plans/06-orchestration.md` (TBD) | ⬜ |
 | **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | `plans/07-web-app.md` (TBD) | ⬜ |
@@ -50,6 +50,30 @@ observed; the real-phone M0 exit still waits on the Twilio account upgrade.
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C3 conductor live-gate session (Europe/Vienna)
+
+- Ran the multi-agent flow for C3: Architect (`kimi-code/k3.1-pro`) → Coder
+  (`deepseek-official/deepseek-flash`) → Reviewer (`kimi-code/k3.1-pro`). Merged PR #3
+  (`feat/c3-call-runner-agent`), PR #4 (`fix/c3-live-gate`), and PR #5
+  (`fix/c3-cleanup-timeout`) via squash.
+- **Real-Mistral no-phone live gate PASS (observed):** `LIVE_MISTRAL=1 make live-test-m0`
+  → `TestLiveM0NoPhone` **PASS** (32.3 s): 591 scripted canonical frames → real STT final →
+  dialogue `capture_info` → `finish_call` → real TTS; `patient.reason == "Kontrolle"`
+  persisted, terminal `aborted`, `attempts=1`, 756 non-silent 640-byte outbound frames, one
+  hangup. Satisfies plan §8 exit criterion 5.
+- **Live-gate debugging (conductor-instrumented):** the first live runs exposed three real
+  bugs, each fixed by the Coder and merged: (1) STT/TTS realtime readers waited for a
+  provider close frame after `transcription.done`/`speech.audio.done`; (2) the scripted
+  utterance + missing German→field mapping made the model skip `capture_info`; (3) the agent
+  `CleanupTimeout` (5 s) was tighter than the adapters' 15 s `finalDrainLimit`. All recorded
+  in `plans/04-m0-e2e.md` §13.
+- **Status:** C3 → ✅ code complete. DESIGN's real-phone M0 exit remains blocked by the
+  Twilio trial (`<Stream>` stripped); `live-test-m0-phone` compiles/skips and is ready for
+  the upgraded-account run.
+- **Environment:** no new env keys/deps; the real `MISTRAL_API_KEY` was read only for the
+  no-phone live gate (value never printed). Builds used a `/tmp` GOCACHE/GOMODCACHE in this
+  sandbox.
 
 ### 2026-11-17 — C3 implementation session (Europe/Vienna)
 
