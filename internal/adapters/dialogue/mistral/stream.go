@@ -216,8 +216,8 @@ func (a *Adapter) readChatStream(ctx context.Context, br *bufio.Reader, tools []
 			if tc.Function.Name != "" {
 				c.name = tc.Function.Name
 			}
-			c.args.WriteString(tc.Function.Arguments)
-			if c.args.Len() > maxToolArgs {
+			c.args = append(c.args, tc.Function.Arguments...)
+			if len(c.args) > maxToolArgs {
 				return chatMessage{}, ports.TurnResult{}, errors.New("mistral dialogue: tool arguments exceed 64 KiB")
 			}
 		}
@@ -269,13 +269,14 @@ func decodeContent(raw json.RawMessage) (string, error) {
 	return b.String(), nil
 }
 
-// assembledCall accumulates one fragmented tool call.
+// assembledCall accumulates one fragmented tool call. args is a []byte (not a
+// strings.Builder) so the struct stays safe to copy when the calls slice reallocates.
 type assembledCall struct {
 	index int
 	id    string
 	name  string
 	typ   string
-	args  strings.Builder
+	args  []byte
 }
 
 // finalizeCalls validates and converts assembled calls, building the assistant message's
@@ -302,7 +303,7 @@ func finalizeCalls(assistant chatMessage, text string, calls []assembledCall, al
 		if !allowed[c.name] {
 			return chatMessage{}, ports.TurnResult{}, fmt.Errorf("mistral dialogue: unknown tool %q", c.name)
 		}
-		args := c.args.String()
+		args := string(c.args)
 		if !isJSONObject(args) {
 			return chatMessage{}, ports.TurnResult{}, errors.New("mistral dialogue: tool arguments must be one JSON object")
 		}

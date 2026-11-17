@@ -1,7 +1,6 @@
 package mistral
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/artemidius/insteadly/internal/core/domain"
@@ -11,16 +10,12 @@ func allowAll() map[string]bool {
 	return map[string]bool{"capture_info": true, reservedToolName: true}
 }
 
-func sb(s string) *strings.Builder {
-	var b strings.Builder
-	b.WriteString(s)
-	return &b
-}
+func sb(s string) []byte { return []byte(s) }
 
 func TestFinalizeCallsSingleToolCall(t *testing.T) {
 	calls := []assembledCall{{
 		index: 0, id: "call_1", name: "capture_info", typ: "function",
-		args: *sb(`{"field":"reason","value":"Kontrolle"}`),
+		args: sb(`{"field":"reason","value":"Kontrolle"}`),
 	}}
 	assistant, res, err := finalizeCalls(chatMessage{Role: "assistant"}, "", calls, allowAll())
 	if err != nil {
@@ -40,7 +35,7 @@ func TestFinalizeCallsSingleToolCall(t *testing.T) {
 func TestFinalizeCallsFinishCall(t *testing.T) {
 	calls := []assembledCall{{
 		index: 0, id: "call_1", name: reservedToolName, typ: "function",
-		args: *sb(`{"kind":"booked","detail":"ok","booked_slot":{"date_time":"2026-11-20T09:00:00Z"}}`),
+		args: sb(`{"kind":"booked","detail":"ok","booked_slot":{"date_time":"2026-11-20T09:00:00Z"}}`),
 	}}
 	_, res, err := finalizeCalls(chatMessage{Role: "assistant"}, "", calls, allowAll())
 	if err != nil {
@@ -61,37 +56,37 @@ func TestFinalizeCallsRejects(t *testing.T) {
 		calls []assembledCall
 	}{
 		{"duplicate id", []assembledCall{
-			{index: 0, id: "x", name: "capture_info", args: *sb(obj)},
-			{index: 1, id: "x", name: "capture_info", args: *sb(obj)},
+			{index: 0, id: "x", name: "capture_info", args: sb(obj)},
+			{index: 1, id: "x", name: "capture_info", args: sb(obj)},
 		}},
 		{"missing id", []assembledCall{
-			{index: 0, name: "capture_info", args: *sb(obj)},
+			{index: 0, name: "capture_info", args: sb(obj)},
 		}},
 		{"missing name", []assembledCall{
-			{index: 0, id: "x", args: *sb(obj)},
+			{index: 0, id: "x", args: sb(obj)},
 		}},
 		{"non-contiguous", []assembledCall{
-			{index: 1, id: "x", name: "capture_info", args: *sb(obj)},
+			{index: 1, id: "x", name: "capture_info", args: sb(obj)},
 		}},
 		{"unknown name", []assembledCall{
-			{index: 0, id: "x", name: "hack", args: *sb(obj)},
+			{index: 0, id: "x", name: "hack", args: sb(obj)},
 		}},
 		{"non-object args", []assembledCall{
-			{index: 0, id: "x", name: "capture_info", args: *sb(`[1,2]`)},
+			{index: 0, id: "x", name: "capture_info", args: sb(`[1,2]`)},
 		}},
 		{"bad type", []assembledCall{
-			{index: 0, id: "x", name: "capture_info", typ: "image", args: *sb(obj)},
+			{index: 0, id: "x", name: "capture_info", typ: "image", args: sb(obj)},
 		}},
 		{"finish_call combined", []assembledCall{
-			{index: 0, id: "a", name: "capture_info", args: *sb(obj)},
-			{index: 1, id: "b", name: reservedToolName, args: *sb(`{"kind":"aborted","detail":"d"}`)},
+			{index: 0, id: "a", name: "capture_info", args: sb(obj)},
+			{index: 1, id: "b", name: reservedToolName, args: sb(`{"kind":"aborted","detail":"d"}`)},
 		}},
 		{"finish_call twice", []assembledCall{
-			{index: 0, id: "a", name: reservedToolName, args: *sb(`{"kind":"aborted","detail":"d"}`)},
-			{index: 1, id: "b", name: reservedToolName, args: *sb(`{"kind":"aborted","detail":"d"}`)},
+			{index: 0, id: "a", name: reservedToolName, args: sb(`{"kind":"aborted","detail":"d"}`)},
+			{index: 1, id: "b", name: reservedToolName, args: sb(`{"kind":"aborted","detail":"d"}`)},
 		}},
 		{"finish_call bad outcome", []assembledCall{
-			{index: 0, id: "a", name: reservedToolName, args: *sb(`{"kind":"aborted"}`)},
+			{index: 0, id: "a", name: reservedToolName, args: sb(`{"kind":"aborted"}`)},
 		}},
 	}
 	for _, tc := range cases {
