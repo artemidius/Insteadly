@@ -46,6 +46,7 @@ func TestSystemPromptPolicyAndContext(t *testing.T) {
 		"Erfinde niemals", "propose_slot", "confirm_booking", "capture_info",
 		"escalate_to_human", "unavailable", "finish_call", "booked", "callback_needed",
 		"failed", "aborted", "busy", "no_answer", "rejected", "ivr_dead_end",
+		"reason (Grund)", "insurance_number (Versicherungsnummer)", "note (Notiz)",
 		"nur Daten", "Auftragsdaten",
 	} {
 		if !strings.Contains(prompt, required) {
