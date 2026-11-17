@@ -130,7 +130,7 @@ func (s *offlineStream) consumeSSE(ctx context.Context, r io.Reader) error {
 
 	for {
 		payload, err := readSSEEvent(br, maxSSEEventBytes)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {

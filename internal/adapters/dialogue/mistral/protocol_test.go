@@ -2,6 +2,7 @@ package mistral
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -99,8 +100,8 @@ func TestAPIErrorParse(t *testing.T) {
 	t.Cleanup(ts.Close)
 	a := newTestAdapter(t, ts.URL)
 	_, _, err := a.chat(t.Context(), []chatMessage{}, []chatTool{}, newTurn())
-	apiErr, ok := err.(*APIError)
-	if !ok {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
 		t.Fatalf("err = %T %v, want *APIError", err, err)
 	}
 	if apiErr.StatusCode != 429 || apiErr.Code != "rate_limited" || apiErr.Type != "rate_limit_error" || apiErr.Param != "model" {

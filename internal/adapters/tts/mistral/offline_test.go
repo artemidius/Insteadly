@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,13 +16,6 @@ import (
 
 	"github.com/artemidius/insteadly/internal/core/ports"
 )
-
-func offlineServer(t *testing.T, handler func(w http.ResponseWriter, r *http.Request)) (*Adapter, *httptest.Server) {
-	t.Helper()
-	ts := httptest.NewServer(http.HandlerFunc(handler))
-	t.Cleanup(ts.Close)
-	return newTestAdapter(t, ts.URL), ts
-}
 
 func newOfflineAdapter(t *testing.T, baseURL string) *Adapter {
 	t.Helper()
@@ -179,8 +173,8 @@ func TestOfflineNon2xx(t *testing.T) {
 	stream, _ := a.Speak(context.Background(), ports.SpeakOptions{})
 	_ = stream.FeedText(context.Background(), "Hallo")
 	err := stream.Close(context.Background())
-	apiErr, ok := err.(*APIError)
-	if !ok || apiErr.StatusCode != 429 || apiErr.Code != "rate_limited" || !apiErr.Temporary() {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 429 || apiErr.Code != "rate_limited" || !apiErr.Temporary() {
 		t.Errorf("err = %v, want 429 rate_limited APIError", err)
 	}
 	for range stream.Audio() {

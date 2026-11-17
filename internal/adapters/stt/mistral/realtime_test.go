@@ -3,6 +3,7 @@ package mistral
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -275,7 +276,7 @@ func TestRealtimeFeedAfterClose(t *testing.T) {
 	if err := stream.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := stream.Feed(context.Background(), domain.AudioChunk{Data: make([]byte, 640)}); err != ErrStreamClosed {
+	if err := stream.Feed(context.Background(), domain.AudioChunk{Data: make([]byte, 640)}); !errors.Is(err, ErrStreamClosed) {
 		t.Errorf("Feed after close = %v, want ErrStreamClosed", err)
 	}
 	if err := stream.Close(context.Background()); err != nil {
@@ -305,8 +306,8 @@ func TestRealtimeProviderError(t *testing.T) {
 		}
 	}()
 	err = stream.Close(context.Background())
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != "model_overloaded" {
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Code != "model_overloaded" {
 		t.Errorf("Close = %v, want ProtocolError model_overloaded", err)
 	}
 }
@@ -333,8 +334,8 @@ func TestRealtimeCleanCloseBeforeDone(t *testing.T) {
 		}
 	}()
 	err = stream.Close(context.Background())
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != "final transcript missing" {
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Code != "final transcript missing" {
 		t.Errorf("Close = %v, want final-transcript-missing protocol error", err)
 	}
 }
@@ -372,8 +373,8 @@ func TestRealtimeNon101Handshake(t *testing.T) {
 	t.Cleanup(ts.Close)
 	a := newTestAdapter(t, ts.URL)
 	_, err := a.TranscribeStream(context.Background(), ports.StreamOptions{})
-	apiErr, ok := err.(*APIError)
-	if !ok {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
 		t.Fatalf("err = %T %v, want *APIError", err, err)
 	}
 	if apiErr.StatusCode != http.StatusUnauthorized || apiErr.Code != "invalid_api_key" {

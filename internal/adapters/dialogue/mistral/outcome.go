@@ -16,7 +16,7 @@ import (
 func decodeFinishCall(args []byte) (domain.Outcome, error) {
 	var out domain.Outcome
 	if err := decodeStrictJSON(args, &out); err != nil {
-		return domain.Outcome{}, fmt.Errorf("%w: %v", domain.ErrInvalidOutcome, err)
+		return domain.Outcome{}, fmt.Errorf("%w: %w", domain.ErrInvalidOutcome, err)
 	}
 	if err := validateOutcome(out); err != nil {
 		return domain.Outcome{}, err

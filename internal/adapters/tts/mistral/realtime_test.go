@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/coder/websocket"
@@ -216,7 +217,7 @@ func TestRealtimeFeedTextAfterClose(t *testing.T) {
 	if err := stream.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := stream.FeedText(context.Background(), "late"); err != ErrStreamClosed {
+	if err := stream.FeedText(context.Background(), "late"); !errors.Is(err, ErrStreamClosed) {
 		t.Errorf("FeedText after close = %v, want ErrStreamClosed", err)
 	}
 	if err := stream.Close(context.Background()); err != nil {
@@ -244,8 +245,8 @@ func TestRealtimeProviderError(t *testing.T) {
 		}
 	}()
 	err = stream.Close(context.Background())
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != "model_overloaded" {
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Code != "model_overloaded" {
 		t.Errorf("Close = %v, want ProtocolError model_overloaded", err)
 	}
 }
@@ -271,7 +272,8 @@ func TestRealtimeMalformedAudioDelta(t *testing.T) {
 		}
 	}()
 	err = stream.Close(context.Background())
-	if _, ok := err.(*ProtocolError); !ok {
+	var pe *ProtocolError
+	if !errors.As(err, &pe) {
 		t.Errorf("Close = %v, want ProtocolError", err)
 	}
 }
@@ -309,7 +311,8 @@ func TestRealtimeAudioDoneMissing(t *testing.T) {
 		}
 	}()
 	err = stream.Close(context.Background())
-	if _, ok := err.(*ProtocolError); !ok {
+	var pe *ProtocolError
+	if !errors.As(err, &pe) {
 		t.Errorf("Close = %v, want ProtocolError (audio.done missing)", err)
 	}
 }

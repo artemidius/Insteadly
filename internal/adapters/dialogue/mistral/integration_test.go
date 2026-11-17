@@ -62,8 +62,8 @@ func TestDialogueHTTPErrors(t *testing.T) {
 			s := newSession(t, a, nil, outcomeSchema(), "")
 			turn, _ := s.SendUserTurn(context.Background(), "hi")
 			_, _, err := drainTurn(turn)
-			apiErr, ok := err.(*APIError)
-			if !ok {
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
 				t.Fatalf("err = %T %v, want *APIError", err, err)
 			}
 			if apiErr.StatusCode != tc.status || apiErr.Temporary() != tc.temp {

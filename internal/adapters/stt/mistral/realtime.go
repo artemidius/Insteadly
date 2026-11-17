@@ -171,7 +171,10 @@ func verifyUpdatedSession(raw json.RawMessage) error {
 			SampleRate int    `json:"sample_rate"`
 		} `json:"audio_format"`
 	}
-	if err := json.Unmarshal(raw, &s); err != nil || s.AudioFormat == nil {
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return err
+	}
+	if s.AudioFormat == nil {
 		return nil
 	}
 	if s.AudioFormat.Encoding != "" && s.AudioFormat.Encoding != "pcm_s16le" {

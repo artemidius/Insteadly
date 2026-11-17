@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -267,8 +268,8 @@ func TestTranscribeFileAPIErrors(t *testing.T) {
 				_, _ = io.WriteString(w, tc.body)
 			})
 			_, err := a.TranscribeFile(context.Background(), strings.NewReader(string(make([]byte, 640))), ports.BatchOptions{})
-			apiErr, ok := err.(*APIError)
-			if !ok {
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
 				t.Fatalf("err = %T %v, want *APIError", err, err)
 			}
 			if apiErr.StatusCode != tc.wantStatus {

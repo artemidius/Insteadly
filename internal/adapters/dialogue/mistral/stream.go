@@ -145,7 +145,7 @@ func (a *Adapter) readChatStream(br *bufio.Reader, tools []chatTool, t *turn) (c
 
 	for {
 		payload, err := readSSEEvent(br, maxSSEEventBytes)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return chatMessage{}, ports.TurnResult{}, ErrTurnTruncated // EOF before [DONE]/terminal
 		}
 		if err != nil {

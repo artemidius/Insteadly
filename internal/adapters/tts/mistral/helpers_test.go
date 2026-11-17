@@ -14,8 +14,6 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
-
-	"github.com/artemidius/insteadly/internal/core/domain"
 )
 
 const testAPIKey = "test-mistral-api-key"
@@ -145,17 +143,6 @@ func float32Bytes(samples []float32) []byte {
 		out[4*i+1] = byte(bits >> 8)
 		out[4*i+2] = byte(bits >> 16)
 		out[4*i+3] = byte(bits >> 24)
-	}
-	return out
-}
-
-func drainAudio(t *testing.T, s interface {
-	Audio() <-chan domain.AudioChunk
-}) [][]byte {
-	t.Helper()
-	var out [][]byte
-	for c := range s.Audio() {
-		out = append(out, c.Data)
 	}
 	return out
 }

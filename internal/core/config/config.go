@@ -191,7 +191,7 @@ func (c Config) validateMistral() error {
 		return err
 	}
 	d := c.Mistral.STT.StreamingDelayMS
-	if !(d >= 80 && d <= 1200) && d != 2400 {
+	if (d < 80 || d > 1200) && d != 2400 {
 		return fmt.Errorf("config: mistral.stt.streaming_delay_ms: must be between 80 and 1200, or exactly 2400")
 	}
 	if err := checkNonEmptyTrim("mistral.tts.model", c.Mistral.TTS.Model); err != nil {

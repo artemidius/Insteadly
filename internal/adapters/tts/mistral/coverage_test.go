@@ -107,8 +107,8 @@ func TestOfflineSSEErrorEvent(t *testing.T) {
 	stream, _ := a.Speak(context.Background(), ports.SpeakOptions{})
 	_ = stream.FeedText(context.Background(), "hi")
 	err := stream.Close(context.Background())
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != "model_overloaded" {
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Code != "model_overloaded" {
 		t.Errorf("err = %v, want ProtocolError model_overloaded", err)
 	}
 	for range stream.Audio() {
