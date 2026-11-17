@@ -39,6 +39,11 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 		a.cfg.MaxCallDuration != defaultMaxCallDuration {
 		t.Errorf("defaults not applied: %+v", a.cfg)
 	}
+	// Must exceed the STT/TTS adapters' 15 s realtime final-drain limit, otherwise the
+	// agent preempts a legitimate end-of-input drain under provider latency.
+	if a.cfg.CleanupTimeout < 15*time.Second {
+		t.Errorf("default cleanup timeout = %v, want >= 15s (adapter final-drain limit)", a.cfg.CleanupTimeout)
+	}
 
 	missing := root
 	missing.Dialogue = nil

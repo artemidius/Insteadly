@@ -150,6 +150,20 @@ observed; the real-phone M0 exit still waits on the Twilio account upgrade.
   ./internal/core/runner ./internal/app` green; both live tests **SKIP**;
   `golangci-lint v2.15.0` → **0 issues**; `go mod tidy` no drift; contract drift empty;
   `make cover` → **87.4 %** total.
+- **Residual live-gate fix (diagnostic run on `main` = `d6d7425` passed the chain but
+  exposed a timeout ordering bug):** the agent's default `CleanupTimeout` was 5 s, shorter
+  than the STT/TTS adapters' 15 s `finalDrainLimit`, so provider-latent end-of-input drain
+  could be preempted with a bare `context deadline exceeded` → `failed/error`. The agent
+  default is now **20 s** with a comment requiring it to exceed the adapter's 15 s bound;
+  the runner's 5 s cleanup timeout (hangup/finalization only) is unchanged.
+  `TestConfigDefaultsAndValidation` asserts the resolved zero-config timeout is ≥ 15 s.
+  Recorded in `plans/04-m0-e2e.md` §13; no live test was run; C3 remains 🔵 pending the
+  conductor's re-run.
+- **Cleanup-timeout fix verification (observed):** `make verify` green (gofmt/vet, all race
+  tests `ok`, `OK: core imports no adapters`, binary built); `go test -race -count=10
+  ./internal/core/agent ./internal/core/runner ./internal/app` green; both live tests
+  **SKIP**; `golangci-lint v2.15.0` → **0 issues**; `go mod tidy` no drift; contract drift
+  empty; `git diff --check main...HEAD` clean.
 
 ### 2026-11-17 — C2 implementation session (Europe/Vienna)
 
