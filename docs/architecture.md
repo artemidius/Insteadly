@@ -26,7 +26,9 @@ project exists — see `make check-deps` and [../DESIGN.md](../DESIGN.md).
 - `internal/core/domain` imports **stdlib only** (plus nothing else).
 - `internal/core/ports` imports `domain` only.
 - `internal/core/{events,scheduler}` import `domain`/`ports` and stdlib only;
-  `internal/core/config` stays stdlib-only (it never imports pgx).
+  `internal/core/auth` imports only `core/{ports,domain}` + stdlib (crypto/rand,
+  crypto/sha256, encoding/base64); bcrypt lives in `internal/adapters/password/bcrypt`.
+- `internal/core/config` stays stdlib-only (it never imports pgx, stripe-go, or bcrypt).
 - Adapters import `ports` + `domain` only (plus vetted third-party libraries used entirely
   inside the adapter); they never import each other or `app`.
 - `internal/httpapi` talks to ports through `*app.App`; it contains no business rules.
@@ -65,6 +67,20 @@ C5 adds two **additive** order fields and two methods:
   history. `booked`/`aborted`/`rejected`/`other` are never requeued. The spine transition
   table is unchanged. `callback_needed` remains a terminal outcome, not a status.
 
+C6 adds an ownership/payment dimension to the same spine, additively:
+
+- `Order.UserID` (`domain.UserID`, empty when auth is off or a machine created the order),
+  `Order.PaidAt`, and `Order.PaymentReference` (the provider's opaque payment id, unique per
+  paid order).
+- `Order.MarkPaid(reference, at)` is the **only** C6 `created → paid` writer. It is
+  idempotent: an order already past `created` is returned unchanged, so a redelivered
+  webhook is a no-op. It uses `Transition(OrderPaid)`, so the spine table is unchanged.
+- `domain.User`/`domain.UserID`/`domain.Session`. `User.PasswordHash` and
+  `Session.TokenHash` are `json:"-"`: neither a password hash nor a raw session token is
+  ever serialized. `NewUserID` is 32 lowercase hex.
+- `domain.PaymentEvent` gains the additive `Reference` field (the Stripe checkout session
+  id) so the webhook bridge can persist `payment_reference`.
+
 Other domain shapes: `CallEvent`/`EndReason` (normalized telephony, including
 `EventPlaybackMark` with an opaque `PlaybackID`), `Transcript`,
 `AudioChunk` + canonical audio constants, `BlobKey`, `Tool`, `Notification`,
@@ -87,7 +103,8 @@ the port boundary.
 | `Dialogue` / `DialogueSession` / `AssistantTurn` | `ports/dialogue.go` | conversation engine (C4) | text + tools in, streamed text + tool calls + outcome out; `Interrupt`/`SendControl` reconciliation |
 | `Storage` → `OrderStore`, `BlobStore` | `ports/storage.go` | API, runner, scheduler | orders + blobs; no provider types |
 | `SchedulerStore` | `ports/storage.go` | scheduler | list due orders, lease-claim (`ports.ErrNotEligible`), release; a claim never changes status |
-| `Payments` | `ports/payments.go` | API/webhook (C6) | declared, no adapter yet |
+| `Payments` | `ports/payments.go` | API/webhook (C6) | Checkout redirect + signed webhook; `stub` (dev) or `stripe` adapter |
+| `AuthStore` / `PasswordHasher` | `ports/auth.go` | core auth service (C6) | users/sessions persistence + password hashing; local/Postgres + bcrypt adapters |
 | `Notifier` | `ports/notify.go` | runner (C7) | declared, no adapter yet |
 
 Sentinel errors shared by adapters: `ports.ErrNotFound`, `ports.ErrConflict`,
@@ -103,7 +120,8 @@ are written in the interface doc comments and must be honored by every adapter.
 - `Telephony`: `stub`, or `twilio` in `voice-api` mode (C1). `sip-trunk` still returns
   `ports.ErrNotImplemented` (C7).
 - `STT`, `TTS`, `Dialogue`: `stub`, or `mistral` (C2).
-- `Payments` and `Notify` remain `nil` until C6/C7.
+- `Payments` is `stub` (default) or `stripe`; `Auth` is one `core/auth.Service` built from
+  the storage `AuthStore` + the bcrypt `PasswordHasher`. `Notify` remains `nil` until C7.
 - `Agent` is one stateless `internal/core/agent.Agent` around the selected STT/TTS/
   Dialogue/Orders ports; `Runner` is one `internal/core/runner.Runner` around telephony,
   orders, and the agent.
@@ -124,7 +142,8 @@ No core changes, by design.
 ```
 <dir>/
 ├── orders/<32-hex-id>.json          # 0600, JSON indent 2
-└── blobs/<32-hex-id|_system>/<kind>/<name>
+├── blobs/<32-hex-id|_system>/<kind>/<name>
+└── auth/users.json                  # 0600, email → {id, email, password_hash, created_at}
 ```
 
 - `_system` holds blobs without an order ID; it cannot collide with a 32-hex ID.
@@ -142,6 +161,10 @@ No core changes, by design.
   due scheduled orders, `Claim` records an **in-memory** lease (single-process only), and
   `Release` clears it. `next_attempt_at`/`attempt_history` persist through the normal JSON
   file.
+- It also implements `ports.AuthStore` (C6). Users persist in `auth/users.json` (written
+  atomically, 0600); the file uses an adapter-local record because
+  `domain.User.PasswordHash` is intentionally not a JSON field. Sessions are **in memory**,
+  keyed by `sha256(raw token)`; a restart logs everyone out (fine for dev).
 
 ## HTTP layer
 
@@ -155,8 +178,19 @@ No core changes, by design.
 | `GET /api/v1/orders/{id}` | fetch one |
 | `POST /api/v1/orders/{id}/call` | make an order eligible to dial now (`202`); API-key-gated when configured |
 | `GET /api/v1/orders/{id}/events` | SSE: one order snapshot, then live status events |
+| `POST /api/v1/auth/register` | create account + session cookie (`auth.mode=cookie`; `501` when off) |
+| `POST /api/v1/auth/login` | verify credentials + session cookie |
+| `POST /api/v1/auth/logout` | revoke session + clear cookie (`204`) |
+| `GET /api/v1/auth/me` | bootstrap the SPA session |
+| `POST /api/v1/orders/{id}/checkout` | payment redirect URL (owner-scoped) |
+| `GET /api/v1/orders/{id}/checkout/simulate` | stub payments: mark paid + `303` dashboard |
+| `POST /webhooks/payments/stripe` | signed Stripe webhook (mounted only in stripe mode) |
+| `GET /` | embedded SPA + client-side fallback (GET-only; `/api` and `/webhooks` misses are 404) |
 
-Middleware order is `recoverer → requestID → logger`. Every response carries
+Middleware order is `recoverer → requestID → logger`; user routes additionally pass through
+`sessionAuth` when `auth.mode=cookie`. `sessionAuth` stores the resolved user in the request
+context; handlers enforce ownership and answer `404` for non-owned orders. In
+`auth.mode=off` it is a passthrough, preserving the C5 API. Every response carries
 `X-Request-Id` (inbound value honored). Errors use one envelope:
 `{"error":{"code":"<snake_case>","message":"<human>"}}`, mapping
 `ErrNotFound → 404`, `ErrConflict → 409`, oversized body → 413, decode/validation →
@@ -330,6 +364,70 @@ last so a persisting runner/scheduler never touches a closed pool; HTTP drains a
 runner because an active call needs the telephony HTTP/WebSocket surface while it cancels
 and hangs up.
 
+## Web app, auth, and payments (C6)
+
+### Auth
+
+`internal/core/auth.Service` is provider-neutral: register/login/logout and cookie-session
+validation, with an injectable clock and TTL. It stores only `sha256(hex)` of a 256-bit
+random token and relies on `ports.AuthStore` for persistence and `ports.PasswordHasher` for
+hashing; bcrypt is the C6 adapter (`internal/adapters/password/bcrypt`, cost 12 by default,
+validated 4..31). Login returns the same `ErrBadCredentials` for an unknown email and a
+wrong password (no existence oracle), and a malformed hash verifies as `false`.
+
+Cookies are `HttpOnly`, `SameSite=Lax`, `Path=/`, with `Max-Age` equal to the session TTL;
+`Secure` is derived from an `https://` `INSTEADLY_HTTP_PUBLIC_URL`. A dedicated CSRF token,
+password reset, email verification, and rate limiting are documented C7 hardening; JSON
+bodies and SameSite raise the CSRF bar for C6.
+
+`auth.mode=off` (the default) keeps the C5 no-env behavior: unauthenticated orders with
+`user_id` empty, and auth/checkout routes answering `501 not_implemented`.
+`auth.mode=cookie` enables the full web flow and scopes order list/get/events/checkout to
+the session user. The C5 `POST /orders/{id}/call` route and `INSTEADLY_API_KEY` are
+unchanged (dev/ops only).
+
+### Payments
+
+Two adapters implement `ports.Payments`:
+
+- `internal/adapters/payments/stub` (default): `CreateCheckout` returns the authenticated
+  simulate URL. The simulate endpoint performs the same `Order.MarkPaid` update the Stripe
+  webhook does, so the scheduler path is identical without Stripe credentials.
+- `internal/adapters/payments/stripe`: Checkout Sessions via
+  `stripe-go/v87` (`stripe.Client`), and `checkout.session.completed` verification through
+  `webhook.ConstructEventWithOptions` (HMAC-SHA256, API-version mismatch tolerated). The
+  session is correlated by `metadata.order_id` / `client_reference_id`; the webhook bridge
+  marks the order paid with the session id as `payment_reference`.
+
+Durable replay safety comes from the domain (`MarkPaid` is a no-op outside `created`) plus a
+partial unique index on `orders.payment_reference`. The webhook route exists only in stripe
+mode; a bad signature is a `400` (not retryable), and an unknown order is acknowledged with
+`200`. Stripe keys/secret are trimmed and non-empty-checked by config, parsed only inside
+the adapter, redacted in `Summary`, and never logged.
+
+### SPA serving and build tags
+
+`web/` is a React 19 + TypeScript + Vite app. It consumes the snake_case JSON API verbatim
+(no DTO layer), bootstraps the session with `/auth/me`, and subscribes to
+`/orders/{id}/events` with `EventSource`. There is no client router or state library; one
+`AuthProvider` context and a small `useState` view switch are enough.
+
+`web/embed.go` (`//go:build webembed`) embeds `all:dist`; `web/noembed.go` (`!webembed`)
+returns a placeholder, and `web/serve.go` always compiles and serves either the embedded SPA
+with an `index.html` fallback or the placeholder. This keeps `go build ./...` and
+`make verify` green without Node. `make build` runs the npm build first and compiles with
+`-tags webembed`; `make build-go` is the Node-free backend build. Release artifacts are
+built with `webembed`.
+
+### Postgres schema
+
+Migration `0002_users.sql` adds `users` (unique normalized email, bcrypt hash),
+`sessions` (token hash primary key, `ON DELETE CASCADE` to users, expiry index), and the
+`orders.user_id`/`paid_at`/`payment_reference` columns with an owner index and the partial
+unique payment-reference index. `orders.user_id` references `users(id)`; pre-C6 rows keep
+`NULL`. The migration runner applies `0001` then `0002` idempotently under the same advisory
+lock.
+
 ## Mistral adapters (C2)
 
 `internal/adapters/{stt,tts,dialogue}/mistral` implement `ports.SpeechToText`,
@@ -363,4 +461,5 @@ and live-test recipe.
 | C3 | ✅ code complete (real-Mistral no-phone gate passed) `internal/core/agent` + `internal/core/runner`; no new API route |
 | C4 | 🔵 code complete pending the live no-phone gate: streaming VAD/turn-taking, barge-in, Twilio clear/mark, Mistral interrupt/control, TTS abort, IVR, hold, recovery; no new module/env/API surface |
 | C5 | 🔵 code complete pending conductor verification: `internal/adapters/storage/postgres`, `internal/core/{scheduler,events}`, place-call + SSE in `httpapi`, Postgres-gated testcontainers suites |
-| C6/C7 | Payments and Notifier adapters; fill the `nil` fields in `app.App` |
+| C6 | 🔵 code complete pending conductor verification: users/sessions + cookie auth, Stripe Checkout + signed webhook + stub, ownership scoping, React+TS SPA embedded behind `webembed` |
+| C7 | Notifier adapter; recording persistence; CSRF/reset/rate limiting; second provider swap |

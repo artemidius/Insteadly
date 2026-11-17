@@ -19,24 +19,35 @@
   (migrations, `FOR UPDATE`, `SKIP LOCKED`), in-process scheduler (windows, bounded
   concurrency, retry backoff, history-preserving callback requeue), order-status SSE hub +
   endpoint, and the API-key-gated place-call eligibility endpoint; `make verify` +
-  `make test-postgres` (Docker/testcontainers) green. DESIGN's **real-phone M0 and M1
-  exits** remain blocked by the Twilio trial stripping `<Stream>` (and, for M1, by the
-  unproven outbound-DTMF path plus the need for controlled IVR/hold destinations).
-- **Current chunk:** C5 done (code complete). Next: write `plans/07-web-app.md` and start
-  C6 (React+TS web app, registration, Stripe payments, order form, dashboard).
-- **First action of the next session:** write the C6 plan (`plans/07-web-app.md`).
+  `make test-postgres` (Docker/testcontainers) green. **C6 🔵 code complete pending the
+  conductor's final verification** — React+TS SPA (register/login, order form, dashboard
+  with SSE), cookie auth (opaque tokens, sha256-at-rest, bcrypt), owner-scoped orders,
+  Stripe Checkout + signed webhook + stub simulate, `webembed` SPA serving, and the
+  `0002_users` migration; `make verify`, `npm ci && npm run build && npm test`,
+  `-tags webembed` build, and `-tags postgres` tests are green (see the C6 session entry).
+  DESIGN's **real-phone M0 and M1 exits** remain blocked by the Twilio trial stripping
+  `<Stream>` (and, for M1, by the unproven outbound-DTMF path plus the need for controlled
+  IVR/hold destinations).
+- **Current chunk:** C6 code complete (M3 web app + payments + auth); pending the
+  conductor's final verification and merge of PR #13.
+- **First action of the next session (conductor):** re-run the C6 verification suite, review
+  PR #13, merge, then write the C7 plan.
 - **Blockers:** DESIGN's real-phone M0/M1 exits remain blocked by the Twilio trial stripping
   `<Stream>` and the unproven outbound-DTMF path — need an upgraded account, a controlled
-  IVR/hold destination, and explicit approval before the end-to-end phone walk. C5
-  deployment blockers (not code-complete blockers): no real-phone/Mistral evidence was
-  produced or re-run, the API key is a prototype gate (C6 owns real auth), the scheduler is
-  single-process with no River yet, and multi-instance runner draining is untested.
+  IVR/hold destination, and explicit approval before the end-to-end phone walk. C6
+  deployment blockers (not code-complete blockers): no real Stripe charge/test-mode run
+  (the stub provider and a fake httptest Stripe server are the C6 evidence); CSRF tokens,
+  password reset, email verification, and rate limiting are C7 hardening; local-storage
+  sessions are in memory; Q5 (deployment target) is still open. C5 blockers carry over: no
+  real-phone/Mistral evidence was produced or re-run by C6, the scheduler is still
+  single-process with no River, and multi-instance runner draining is untested.
   Operational: `golangci-lint` absent locally (optional; CI installs v2.15.0; the /tmp
-  v2.15.0 binary was run); `/usr/bin/make` broken by the Xcode 16.2/macOS 26 issue — use
-  `/Library/Developer/CommandLineTools/usr/bin/make`. Build/test commands may need a
-  `/tmp` GOCACHE/GOMODCACHE/GOPATH in this sandbox (`~/Library/Caches/go-build`,
+  v2.15.0 binary was run with 0 issues); `/usr/bin/make` broken by the Xcode 16.2/macOS 26
+  issue — use `/Library/Developer/CommandLineTools/usr/bin/make`. Build/test commands may
+  need a `/tmp` GOCACHE/GOMODCACHE/GOPATH in this sandbox (`~/Library/Caches/go-build`,
   `~/go/pkg/mod`, and `~/go/pkg/sumdb` are not writable here). Postgres-tagged tests need
-  `CGO_ENABLED=0` while Xcode clang is broken.
+  `CGO_ENABLED=0` while Xcode clang is broken. `make build` now needs Node/npm (the SPA is
+  embedded); `make verify` uses the Node-free `make build-go`.
 
 ---
 
@@ -50,7 +61,7 @@
 | **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | [plans/04-m0-e2e.md](plans/04-m0-e2e.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | **C4** | M1 | Conversation: streaming VAD/turn-taking, barge-in, playback clear/marks, deterministic IVR, hold detection, bounded structured-outcome repair. | [plans/05-conversation.md](plans/05-conversation.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE, place-call. | [plans/06-orchestration.md](plans/06-orchestration.md) | ✅ code complete; make verify + test-postgres green |
-| **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | `plans/07-web-app.md` (TBD) | ⬜ |
+| **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | [plans/07-web-app.md](plans/07-web-app.md) | 🔵 code complete pending conductor verification; no real Stripe charge; Twilio/live-phone + Q5 deployment blockers remain |
 | **C7** | M4 | Swapability proof + hardening: second telephony adapter (Telnyx or Twilio SIP trunk), one alternative AI provider, recording/storage flags end-to-end, notifications. | `plans/08-swapability.md` (TBD) | ⬜ |
 
 Chunk plans are written **one chunk ahead** in the same style as the C0 plan (scope,
@@ -62,6 +73,98 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C6 implementation session (Europe/Vienna)
+
+- Implemented [plans/07-web-app.md](plans/07-web-app.md) end to end on `feat/c6-web-app`
+  in the §9 order 1–14, **without running any live-phone/Twilio test and without reading
+  any secret/`.env` value or Stripe key**. PR **#13** against `main`
+  (<https://github.com/artemidius/Insteadly/pull/13>); not merged. §14 of the plan records
+  the dated implementation amendments (additive `PaymentEvent.Reference`, bcrypt
+  constructor error, adapter-local local-user record, health provider names, Stripe
+  success/cancel URL derivation, Node-requiring `make build` + `build-go`, GET-only SPA
+  fallback, v87 `stripe.Client` backends, TS7 worked, Playwright skipped, auth-off checkout
+  501, Postgres test-helper truncation).
+- **Domain/ports (additive only):** `domain.UserID`/`NewUserID`/`User`/`Session` (password
+  hash and token hash never serialized); `Order.UserID`/`PaidAt`/`PaymentReference` +
+  idempotent `Order.MarkPaid` (spine transitions unchanged); `domain.PaymentEvent.Reference`
+  (additive, carries the Stripe session id); new `ports.AuthStore` + `ports.PasswordHasher`.
+- **New core package:** `internal/core/auth` — register/login/logout/authenticate, 256-bit
+  opaque tokens, `sha256`-at-rest, injectable clock/TTL, one validation error listing every
+  register problem, identical `ErrBadCredentials` for unknown email/wrong password.
+- **Adapters:** `password/bcrypt` (cost validated 4–31, default 12; malformed hash verifies
+  false, not error); local `AuthStore` (`auth/users.json` 0600 atomic, in-memory sessions);
+  Postgres `AuthStore` + `migrations/0002_users.sql` (users/sessions, `ON DELETE CASCADE`,
+  `orders.user_id/paid_at/payment_reference`, owner index, partial unique payment-reference
+  index) and `row.go`/`orders.go` column round-trips; `payments/stripe` (v87
+  `stripe.Client`, Checkout Session with `metadata.order_id`/`client_reference_id`, signed
+  `checkout.session.completed` with API-version tolerance, test-only BaseURL backends) and
+  `payments/stub` (simulate URL + trivial webhook).
+- **Config:** `auth.{mode,session_ttl,cookie_name,bcrypt_cost}` and
+  `payments.{provider,stripe.{secret_key,webhook_secret,price_id}}`, strict enums/validation
+  (stripe mode requires keys, price, and an https public URL), secret-safe `Summary`
+  (`stripe.secret_key`/`webhook_secret` redacted, never values), no-env defaults
+  `auth.mode=off`/`payments.provider=stub`.
+- **HTTP:** `register/login/logout/me`; `sessionAuth` passthrough when off; owner-scoped
+  create/list/get/events/checkout/simulate with non-owner `404`; `POST /{id}/checkout`
+  (`{"redirect_url"}`); stub simulate `303` → `/dashboard?order=<id>` driving `MarkPaid`;
+  signed `POST /webhooks/payments/stripe` (bad signature `400`, unknown order `200`,
+  duplicate no-op); SPA mounted last as **GET-only** with `/api`/`/webhooks` misses 404;
+  C5 `POST /{id}/call` + `INSTEADLY_API_KEY` unchanged; health now names `auth`/`payments`.
+- **Composition/lifecycle:** `App.Payments` (stub|stripe) and `App.Auth` wired;
+  `buildStorage` additionally returns the `AuthStore`; `buildPasswordHasher`/
+  `buildPayments` builders; shutdown order unchanged.
+- **Web app (`web/`):** React 19 + TypeScript 7 + Vite 8 + Vitest 5 SPA with `api.ts`/
+  `types.ts` (snake_case API verbatim), one `AuthProvider`, Register/Login, OrderForm,
+  OrderList, OrderDetail with `EventSource` live status, CheckoutButton, Dashboard; no
+  router/state library. `web/embed.go` (`//go:build webembed`) embeds `all:dist`;
+  `web/noembed.go` placeholder; `web/serve.go` SPA file/fallback handler; Vite dev proxy
+  `/api`, `/webhooks`, `/healthz` → `127.0.0.1:8080`. `.gitignore` now excludes
+  `web/node_modules/` and `web/dist/`.
+- **Make/CI:** `make web`, `make web-build`, `make build` (npm + `-tags webembed`),
+  `make build-go` (Node-free, used by `verify`); CI build job and release workflow use
+  `actions/setup-node@v7.1.0`, release cross-compiles with `webembed`.
+- **Tests added:** domain `MarkPaid` idempotency/spine; user/session JSON redaction; auth
+  service register/login/logout/expiry/validation/token hashing; bcrypt; local auth
+  persistence/reopen/expiry; Postgres-gated users/sessions/cascade/migration/ownership/
+  payment-reference/`MarkPaid`; Stripe fake-server checkout + signed/ tampered webhooks +
+  validation; stub payments; config auth/payments env/validation/redaction; HTTP cookie
+  attributes/401/409/501/ownership/checkout/simulate/Stripe webhook replay; app wiring +
+  `m3_integration_test.go` (cookie register → create → stub checkout → `MarkPaid` →
+  scheduler → booked, SSE sequence; auth-off C5 flow); web serve placeholder/fallback; 31
+  Vitest tests across api/auth/order components.
+- **Observed verification (this sandbox, `/tmp` caches, `CGO_ENABLED=0` for tagged builds):**
+  - `/Library/Developer/CommandLineTools/usr/bin/make verify` → **PASS** (gofmt clean,
+    `go vet`, `go test -race -count=1 ./...` all green incl. `web`, `check-deps`
+    `OK: core imports no adapters`, Node-free `build-go`).
+  - `cd web && npm ci && npm run build && npm test` → **PASS** (tsc 7.0.2 + Vite 8.3.8
+    build: `dist/index.html` 0.50 kB, CSS 3.55 kB, JS 233.71 kB; Vitest **7 files / 31
+    tests passed**).
+  - `CGO_ENABLED=0 go build -tags webembed ./cmd/insteadly` → **PASS** (20 MB binary
+    embedding the real `dist/`).
+  - `go test -race -count=10 ./internal/core/auth ./internal/httpapi ./internal/app` →
+    **PASS** (1.3 s / 17.2 s / 20.9 s).
+  - `CGO_ENABLED=0 go test -tags postgres -count=1 ./...` → **PASS** with Docker Engine
+    29.7.2 (testcontainers `postgres:16-alpine`; postgres adapter 13.6 s, app 8.7 s).
+  - `go mod tidy` stable; `go.mod` adds `github.com/stripe/stripe-go/v87 v87.1.0` and
+    promotes `golang.org/x/crypto v0.58.0` to direct; only new indirect
+    `github.com/shopspring/decimal v1.4.0`; `go.sum` +4 lines.
+  - `/tmp/golangci-lint-2.15.0-darwin-arm64/golangci-lint run --timeout=5m` → **0 issues**
+    (cache-write warnings only, sandbox).
+  - No-env untagged boot: `/healthz` 200 `{auth:off,payments:stub,...}`, unauthenticated
+    `POST /api/v1/orders` **201**, `GET /` 200 placeholder ("web app not built"),
+    `POST /auth/register` **501**.
+  - Webembed boot: `GET /` 200 real `index.html`, asset 200, `/dashboard?order=…` 200
+    (SPA fallback), `/api/v1/nope` 404. Cookie mode: register 201 + session cookie, `me`
+    200, create 201 with `user_id`, checkout 200 `{"redirect_url":…/simulate}`, simulate
+    **303** → `/dashboard?order=<id>`, order `paid` with `paid_at` and
+    `payment_reference=stub/<id>`, logout 204, `me` after logout 401.
+  - No live phone/Twilio test was run; no `.env` or secret value was read, printed, or
+    committed. The only Stripe HTTP traffic used an in-repo fake `httptest` server.
+- **Status:** C6 is **🔵 code complete pending the conductor's final verification/merge**.
+  DESIGN's real-phone exits, real Stripe charges (test mode not required), notifications,
+  per-clinic hours (Q3), River, refunds/subscriptions, recording persistence, CSRF/password
+  reset/rate limiting, and Q5 deployment remain out of scope/blocked.
 
 ### 2026-11-17 — C5 conductor session (Europe/Vienna)
 
@@ -739,6 +842,16 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
   (strict mode). Secrets are never logged and never printed.
 - **Canonical audio:** PCM16 LE mono 16 kHz everywhere inside the core (`domain.FrameBytes`
   = 640 B = 20 ms). All codec conversion happens inside adapters.
+- **C6 web toolchain:** Node v26.4.0 + npm 11.17.0 (no pnpm). `web/` pins React 19.3.1,
+  Vite 8.3.8, TypeScript 7.0.2 (native compiler works with `@vitejs/plugin-react` 6.3.0 —
+  no TS5 fallback needed), Vitest 5.1.0, Testing Library, jsdom. `package-lock.json` is
+  committed; `web/node_modules/`/`web/dist/` are gitignored. `make build` embeds the SPA
+  (`-tags webembed`) and needs Node; `make verify` uses `make build-go` and does not.
+- **C6 auth/payments defaults:** `auth.mode=off` and `payments.provider=stub`; cookie mode
+  is `INSTEADLY_AUTH_MODE=cookie`, Stripe is `INSTEADLY_PAYMENTS_PROVIDER=stripe` plus the
+  three `INSTEADLY_STRIPE_*` settings and an https `INSTEADLY_HTTP_PUBLIC_URL`. Local
+  sessions are in-memory; Postgres persists users/sessions. No real Stripe charge or
+  Twilio/live-phone run has been performed.
 - **Credentials:** `.env` must never be committed (it is git-ignored). The app reads it only
   through the registry of `INSTEADLY_*` names; the **unprefixed** Twilio names already in
   `.env` are not read (C1 decision — mirror/export them as `INSTEADLY_TWILIO_*`). `TEST_PHONE`
