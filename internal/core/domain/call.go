@@ -7,12 +7,13 @@ import "time"
 type CallEventKind string
 
 const (
-	EventDialing  CallEventKind = "dialing"
-	EventRinging  CallEventKind = "ringing"
-	EventAnswered CallEventKind = "answered"
-	EventDTMF     CallEventKind = "dtmf"
-	EventEnded    CallEventKind = "ended"
-	EventError    CallEventKind = "error"
+	EventDialing      CallEventKind = "dialing"
+	EventRinging      CallEventKind = "ringing"
+	EventAnswered     CallEventKind = "answered"
+	EventDTMF         CallEventKind = "dtmf"
+	EventPlaybackMark CallEventKind = "playback_mark"
+	EventEnded        CallEventKind = "ended"
+	EventError        CallEventKind = "error"
 )
 
 // EndReason normalizes provider hangup causes so the core never sees provider codes.
@@ -35,6 +36,12 @@ type CallEvent struct {
 	DTMF      string        `json:"dtmf,omitempty"`
 	EndReason EndReason     `json:"end_reason,omitempty"`
 	At        time.Time     `json:"at"`
+
+	// PlaybackID is set only for EventPlaybackMark. It echoes the opaque ID supplied to
+	// CallSession.MarkPlayback after all outbound audio queued before that mark has been
+	// played. It is a bounded opaque core-generated string, never text, patient data, a
+	// provider SID, or a secret.
+	PlaybackID string `json:"playback_id,omitempty"`
 }
 
 // Transcript is the product of batch (post-call) transcription.

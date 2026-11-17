@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -83,5 +85,147 @@ func TestEventRelayCloseWithoutTerminal(t *testing.T) {
 	}
 	if _, have := relay.terminal(); have {
 		t.Error("closed channel without EventEnded recorded a terminal event")
+	}
+}
+
+func TestEventRelayForwardsDTMFAndMarksInOrder(t *testing.T) {
+	relay := newEventRelay(relayTestLogger())
+	events := make(chan domain.CallEvent, 4)
+	events <- domain.CallEvent{Kind: domain.EventDTMF, DTMF: "1"}
+	events <- domain.CallEvent{Kind: domain.EventPlaybackMark, PlaybackID: "m1"}
+	events <- domain.CallEvent{Kind: domain.EventDTMF, DTMF: "2"}
+	go relay.run(events)
+
+	want := []struct {
+		kind domain.CallEventKind
+		id   string
+	}{{domain.EventDTMF, "1"}, {domain.EventPlaybackMark, "m1"}, {domain.EventDTMF, "2"}}
+	for i, w := range want {
+		select {
+		case ev := <-relay.controlChannel():
+			if ev.Kind != w.kind {
+				t.Fatalf("event %d kind = %q, want %q", i, ev.Kind, w.kind)
+			}
+			id := ev.DTMF
+			if ev.Kind == domain.EventPlaybackMark {
+				id = ev.PlaybackID
+			}
+			if id != w.id {
+				t.Fatalf("event %d id = %q, want %q", i, id, w.id)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("control event not forwarded")
+		}
+	}
+	close(events)
+	select {
+	case <-relay.done:
+	case <-time.After(time.Second):
+		t.Fatal("relay did not stop")
+	}
+}
+
+func TestEventRelayControlOverflowClosesAndErrors(t *testing.T) {
+	relay := newEventRelay(relayTestLogger())
+	events := make(chan domain.CallEvent, controlBuffer+1)
+	for i := 0; i < controlBuffer+1; i++ {
+		events <- domain.CallEvent{Kind: domain.EventDTMF, DTMF: "1"}
+	}
+	close(events)
+	go relay.run(events)
+	select {
+	case <-relay.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not drain")
+	}
+	if !errors.Is(relay.controlError(), errControlOverflow) {
+		t.Fatalf("control overflow not recorded: %v", relay.controlError())
+	}
+	// The bounded control channel was closed rather than silently dropping a digit.
+	drained := 0
+	for range relay.controlChannel() {
+		drained++
+	}
+	if drained != controlBuffer {
+		t.Errorf("forwarded before overflow = %d, want %d", drained, controlBuffer)
+	}
+}
+
+func TestEventRelayTerminalIndependentOfFullControlQueue(t *testing.T) {
+	relay := newEventRelay(relayTestLogger())
+	events := make(chan domain.CallEvent, controlBuffer+1)
+	for i := 0; i < controlBuffer; i++ {
+		events <- domain.CallEvent{Kind: domain.EventDTMF, DTMF: "1"}
+	}
+	events <- domain.CallEvent{Kind: domain.EventEnded, EndReason: domain.EndBusy}
+	go relay.run(events)
+
+	select {
+	case ev := <-relay.agentChannel():
+		if ev.Kind != domain.EventEnded || ev.EndReason != domain.EndBusy {
+			t.Fatalf("terminal = %+v", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal event was blocked behind the control queue")
+	}
+	close(events)
+	<-relay.done
+}
+
+func TestPreAnswerPlaybackMarkIsAProviderContractError(t *testing.T) {
+	store := newFakeStore(testOrder())
+	store.orders = map[domain.OrderID]domain.Order{}
+	order := testOrder()
+	store = newFakeStore(order)
+	telephony := &fakeTelephony{session: newFakeSession()}
+	r := testRunner(t, store, telephony, newFakeAgent(domain.Outcome{}, nil))
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Run(context.Background(), order.ID)
+		done <- err
+	}()
+	telephony.session.send(domain.CallEvent{Kind: domain.EventDialing})
+	telephony.session.send(domain.CallEvent{Kind: domain.EventRinging})
+	telephony.session.send(domain.CallEvent{Kind: domain.EventPlaybackMark, PlaybackID: "early"})
+	select {
+	case err := <-done:
+		if !errors.Is(err, errProviderContract) {
+			t.Fatalf("err = %v, want errProviderContract", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not reject a pre-answer playback mark")
+	}
+}
+
+func TestRunnerUsesAgentIVRDeadEndOutcome(t *testing.T) {
+	order := testOrder()
+	store := newFakeStore(order)
+	telephony := &fakeTelephony{session: newFakeSession()}
+	agentOutcome := domain.Outcome{Kind: domain.OutcomeFailed, FailReason: "ivr_dead_end", Detail: "fixed"}
+	ag := newFakeAgent(agentOutcome, nil)
+	r := testRunner(t, store, telephony, ag)
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Run(context.Background(), order.ID)
+		done <- err
+	}()
+	telephony.session.send(domain.CallEvent{Kind: domain.EventDialing})
+	telephony.session.send(domain.CallEvent{Kind: domain.EventRinging})
+	telephony.session.send(domain.CallEvent{Kind: domain.EventAnswered})
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	final, err := store.Get(context.Background(), order.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if final.Outcome == nil || final.Outcome.FailReason != "ivr_dead_end" {
+		t.Fatalf("outcome = %+v", final.Outcome)
+	}
+	if store.finishCount != 1 {
+		t.Errorf("finish count = %d, want 1", store.finishCount)
+	}
+	if telephony.session.hangups() != 1 {
+		t.Errorf("hangup count = %d, want 1", telephony.session.hangups())
 	}
 }

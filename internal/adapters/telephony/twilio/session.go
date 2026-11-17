@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/artemidius/insteadly/internal/core/domain"
@@ -72,8 +73,18 @@ type session struct {
 
 	events chan domain.CallEvent
 	evq    chan domain.CallEvent
-	outQ   chan domain.AudioChunk
 	done   chan struct{}
+
+	// Outbound playback ordering. enqMu serializes SendAudio/MarkPlayback/ClearAudio so
+	// a clear either drops an earlier audio item or is enqueued before later audio. A
+	// single writer goroutine owns media/mark/clear wire writes, so their order is the
+	// queue order. playEpoch invalidates audio accepted before the last clear.
+	enqMu     sync.Mutex
+	outQ      chan outboundItem
+	playEpoch atomic.Uint64
+
+	epochMu sync.Mutex
+	epochCh chan struct{}
 
 	streamReady     chan struct{}
 	streamReadyOnce sync.Once
@@ -82,6 +93,38 @@ type session struct {
 	endReason  domain.EndReason
 	reaper     *time.Timer
 	enc        frameEncoder
+}
+
+// outboundItem is one ordered outbound playback action: media, mark, or clear.
+type outboundItem struct {
+	kind  outboundKind
+	data  []byte
+	name  string
+	epoch uint64
+	done  chan error // buffered one; completed by the writer
+}
+
+type outboundKind int
+
+const (
+	itemMedia outboundKind = iota
+	itemMark
+	itemClear
+)
+
+// outQLimit bounds queued outbound playback actions. It matches the M0 queue depth of
+// about two seconds of 20 ms frames.
+const outQLimit = 100
+
+func newOutboundItem(kind outboundKind) outboundItem {
+	return outboundItem{kind: kind, done: make(chan error, 1)}
+}
+
+func (s *session) completeItem(item outboundItem, err error) {
+	select {
+	case item.done <- err:
+	default:
+	}
 }
 
 var _ ports.CallSession = (*session)(nil)
@@ -95,8 +138,9 @@ func newSession(a *Adapter, id domain.CallID) *session {
 		events:        make(chan domain.CallEvent, 64),
 		evq:           make(chan domain.CallEvent, 64),
 		inbound:       make(chan domain.AudioChunk, 100),
-		outQ:          make(chan domain.AudioChunk, 100),
+		outQ:          make(chan outboundItem, outQLimit),
 		done:          make(chan struct{}),
+		epochCh:       make(chan struct{}),
 		streamReady:   make(chan struct{}),
 	}
 	s.reaper = time.AfterFunc(sessionMaxDuration, func() {
@@ -329,20 +373,6 @@ func (s *session) currentStream() (*streamConn, <-chan struct{}) {
 	return s.stream, s.streamChanged
 }
 
-func (s *session) waitStream() *streamConn {
-	for {
-		sc, changed := s.currentStream()
-		if sc != nil {
-			return sc
-		}
-		select {
-		case <-s.done:
-			return nil
-		case <-changed:
-		}
-	}
-}
-
 func (s *session) pushInbound(chunk domain.AudioChunk) {
 	s.inMu.Lock()
 	defer s.inMu.Unlock()
@@ -378,25 +408,67 @@ func (s *session) closeInbound() {
 func (s *session) writeLoop() {
 	for {
 		select {
+		case item := <-s.outQ:
+			s.processOutbound(item)
 		case <-s.done:
-			return
-		case chunk := <-s.outQ:
-			if err := s.play(chunk.Data); err != nil {
-				if errors.Is(err, ErrSessionEnded) {
+			// Drop whatever is still queued; the call can no longer play it.
+			for {
+				select {
+				case item := <-s.outQ:
+					s.completeItem(item, ErrSessionEnded)
+				default:
 					return
 				}
-				s.log.Warn("twilio: playback failed", "error", err)
 			}
 		}
 	}
 }
 
-func (s *session) play(pcm []byte) error {
+// processOutbound performs one ordered playback action and reports its result to the
+// enqueuer. Media is dropped when a clear has already advanced the playback epoch.
+func (s *session) processOutbound(item outboundItem) {
+	var err error
+	switch item.kind {
+	case itemMedia:
+		err = s.play(item.data, item.epoch)
+	case itemMark:
+		err = s.playMark(item.name)
+	case itemClear:
+		// The writer is the encoder's single owner: drop residual bytes from the cleared
+		// generation before any post-clear media is encoded.
+		s.enc = frameEncoder{}
+		err = s.playClear(item.epoch)
+	}
+	if err != nil && !errors.Is(err, ErrSessionEnded) {
+		s.log.Warn("twilio: outbound playback action failed", "kind", item.kind, "error", err)
+	}
+	s.completeItem(item, err)
+}
+
+// play sends every encoded frame for one accepted chunk unless the playback epoch has
+// moved on. Only the writeLoop calls play, so the encoder has a single owner.
+func (s *session) play(pcm []byte, epoch uint64) error {
+	if epoch != s.playEpoch.Load() {
+		return nil
+	}
 	for _, frame := range s.enc.encode(pcm) {
 		for {
-			sc := s.waitStream()
+			sc, changed := s.currentStream()
 			if sc == nil {
-				return ErrSessionEnded
+				// Wait for a reconnect, call end, or a clear that invalidates this audio.
+				select {
+				case <-s.done:
+					return ErrSessionEnded
+				case <-changed:
+				case <-s.epochNotification():
+				}
+				if epoch != s.playEpoch.Load() {
+					return nil
+				}
+				continue
+			}
+			if epoch != s.playEpoch.Load() {
+				return nil
 			}
 			if err := sc.writeMedia(frame); err == nil {
 				break
@@ -410,23 +482,165 @@ func (s *session) play(pcm []byte) error {
 	return nil
 }
 
+// epochNotification returns the channel closed when the playback epoch advances.
+func (s *session) epochNotification() <-chan struct{} {
+	s.epochMu.Lock()
+	defer s.epochMu.Unlock()
+	return s.epochCh
+}
+
+// bumpEpoch invalidates all audio accepted before the next clear and wakes a writer that
+// is waiting for a media stream.
+func (s *session) bumpEpoch() uint64 {
+	s.epochMu.Lock()
+	defer s.epochMu.Unlock()
+	epoch := s.playEpoch.Add(1)
+	close(s.epochCh)
+	s.epochCh = make(chan struct{})
+	return epoch
+}
+
+// playMark sends one mark after all previously queued media. With no attached stream the
+// audio was never provider-played, so the mark cannot be acknowledged.
+func (s *session) playMark(name string) error {
+	sc := s.currentStreamOnly()
+	if sc == nil {
+		if s.isEnded() {
+			return ErrSessionEnded
+		}
+		return ErrSessionNotReady
+	}
+	return sc.writeMark(name)
+}
+
+// playClear sends the wire clear. With no attached stream the local queue/encoder purge
+// already satisfies the contract: an old disconnected Twilio buffer cannot outlive its
+// old stream.
+func (s *session) playClear(epoch uint64) error {
+	sc := s.currentStreamOnly()
+	if sc == nil {
+		return nil
+	}
+	if err := sc.writeClear(); err != nil {
+		if errors.Is(err, ErrSessionEnded) {
+			return err
+		}
+		return fmt.Errorf("twilio: clear playback: %w", err)
+	}
+	return nil
+}
+
+// currentStreamOnly returns the attached stream without waiting for a reconnect.
+func (s *session) currentStreamOnly() *streamConn {
+	sc, _ := s.currentStream()
+	return sc
+}
+
+// enqueue submits one outbound item under the ordering lock, honoring an already-ended
+// call and the caller's deadline.
+func (s *session) enqueue(ctx context.Context, item outboundItem) error {
+	s.enqMu.Lock()
+	defer s.enqMu.Unlock()
+	select {
+	case <-s.done:
+		return ErrSessionEnded
+	default:
+	}
+	select {
+	case s.outQ <- item:
+		return nil
+	case <-s.done:
+		return ErrSessionEnded
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // SendAudio queues canonical PCM16 audio. It blocks while the queue is full (100 frames
 // = 2 s) and fails once the call has ended.
 func (s *session) SendAudio(ctx context.Context, chunk domain.AudioChunk) error {
 	if len(chunk.Data) == 0 {
 		return nil
 	}
+	item := newOutboundItem(itemMedia)
+	item.data = append([]byte(nil), chunk.Data...)
+	item.epoch = s.playEpoch.Load()
+	return s.enqueue(ctx, item)
+}
+
+// ClearAudio increments the playback epoch, purges queued audio, resets residual encoder
+// bytes, and sends the provider clear. Audio accepted afterwards is ordered after it.
+func (s *session) ClearAudio(ctx context.Context) error {
 	if s.isEnded() {
 		return ErrSessionEnded
 	}
+	item := newOutboundItem(itemClear)
+	s.enqMu.Lock()
+	item.epoch = s.bumpEpoch()
+	// Drop every queued action from the old generation; a mark from that generation is
+	// no longer meaningful once the audio has been cleared.
+	for {
+		select {
+		case dropped := <-s.outQ:
+			s.completeItem(dropped, nil)
+		default:
+			goto purged
+		}
+	}
+purged:
 	select {
+	case s.outQ <- item:
+		s.enqMu.Unlock()
+	case <-s.done:
+		s.enqMu.Unlock()
+		return ErrSessionEnded
+	case <-ctx.Done():
+		s.enqMu.Unlock()
+		return ctx.Err()
+	}
+	// The bounded clear write is ordered behind in-flight media by the writer.
+	select {
+	case err := <-item.done:
+		return err
 	case <-s.done:
 		return ErrSessionEnded
-	case s.outQ <- chunk:
-		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// MarkPlayback queues an opaque marker after all previously queued audio. It does not
+// emit a local event: only a provider mark is playback evidence.
+func (s *session) MarkPlayback(ctx context.Context, playbackID string) error {
+	if playbackID == "" || len(playbackID) > 64 {
+		return fmt.Errorf("twilio: invalid playback mark id")
+	}
+	if s.isEnded() {
+		return ErrSessionEnded
+	}
+	item := newOutboundItem(itemMark)
+	item.name = playbackID
+	item.epoch = s.playEpoch.Load()
+	if err := s.enqueue(ctx, item); err != nil {
+		return err
+	}
+	select {
+	case err := <-item.done:
+		return err
+	case <-s.done:
+		return ErrSessionEnded
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// handleMark normalizes one inbound provider mark.
+func (s *session) handleMark(name string) {
+	if name == "" || len(name) > 64 {
+		s.log.Debug("twilio: ignoring malformed playback mark")
+		return
+	}
+	s.postEvent(domain.CallEvent{Kind: domain.EventPlaybackMark, PlaybackID: name})
 }
 
 // SendDTMF sends digits through an answered call. Twilio's Media Streams socket has no

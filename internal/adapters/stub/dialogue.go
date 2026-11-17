@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/artemidius/insteadly/internal/core/ports"
 )
@@ -25,7 +26,12 @@ func (d *Dialogue) NewSession(ctx context.Context, req ports.SessionRequest) (po
 	return &dialogueSession{}, nil
 }
 
-type dialogueSession struct{}
+type dialogueSession struct {
+	mu         sync.Mutex
+	userTurns  []string
+	interrupts []string
+	controls   []string
+}
 
 var _ ports.DialogueSession = (*dialogueSession)(nil)
 
@@ -34,6 +40,9 @@ func (s *dialogueSession) SendUserTurn(ctx context.Context, text string) (ports.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
+	s.userTurns = append(s.userTurns, text)
+	s.mu.Unlock()
 	return newTurn("stub: " + text), nil
 }
 
@@ -43,6 +52,32 @@ func (s *dialogueSession) SubmitToolResults(ctx context.Context, results []ports
 		return nil, err
 	}
 	return newTurn(fmt.Sprintf("stub: %d tool result(s)", len(results))), nil
+}
+
+// Interrupt records confirmed speech for observability. It never becomes a fake user
+// turn, tool call, or booking.
+func (s *dialogueSession) Interrupt(ctx context.Context, confirmedText string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.interrupts = append(s.interrupts, confirmedText)
+	s.mu.Unlock()
+	return nil
+}
+
+// SendControl returns a deterministic non-user turn for a core-owned control instruction.
+func (s *dialogueSession) SendControl(ctx context.Context, instruction string) (ports.AssistantTurn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(instruction) == "" {
+		return nil, fmt.Errorf("stub dialogue: empty control instruction")
+	}
+	s.mu.Lock()
+	s.controls = append(s.controls, instruction)
+	s.mu.Unlock()
+	return newTurn("stub: control acknowledged"), nil
 }
 
 // Close is a no-op.

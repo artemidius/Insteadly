@@ -78,11 +78,16 @@ type fakeMistral struct {
 	toolResults   []string
 	toolNames     []string
 	chatResponses func(n int, req chatRequest) chatScript
+
+	sttFinals   []string
+	sttStreams  int
+	ttsDelay    map[string]time.Duration
+	chatHistory []chatRequest
 }
 
 func newFakeMistral(t *testing.T, responses func(n int, req chatRequest) chatScript) (*fakeMistral, *httptest.Server) {
 	t.Helper()
-	f := &fakeMistral{t: t, chatResponses: responses}
+	f := &fakeMistral{t: t, chatResponses: responses, ttsDelay: map[string]time.Duration{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/audio/transcriptions/realtime", f.serveSTT)
 	mux.HandleFunc("/v1/audio/speech/realtime", f.serveTTS)
@@ -99,6 +104,10 @@ func (f *fakeMistral) serveSTT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = conn.CloseNow() }()
+	f.mu.Lock()
+	f.sttStreams++
+	streamIndex := f.sttStreams - 1
+	f.mu.Unlock()
 	wsWriteJSON(f.t, conn, map[string]any{"type": "session.created", "session": map[string]any{"model": "fake"}})
 	update := wsReadJSON(f.t, conn)
 	if session, ok := update["session"].(map[string]any); ok {
@@ -136,11 +145,19 @@ func (f *fakeMistral) serveSTT(w http.ResponseWriter, r *http.Request) {
 		case "input_audio.end":
 			f.mu.Lock()
 			f.sttEnds++
+			final := "Ja, wir haben am 15. Jänner um neun Uhr einen Termin, der passt, ich bestätige das."
+			if streamIndex < len(f.sttFinals) {
+				final = f.sttFinals[streamIndex]
+			}
 			f.mu.Unlock()
-			wsWriteJSON(f.t, conn, map[string]any{"type": "transcription.text.delta", "text": "Ja, wir haben"})
+			partial := final
+			if len(partial) > 12 {
+				partial = partial[:12]
+			}
+			wsWriteJSON(f.t, conn, map[string]any{"type": "transcription.text.delta", "text": partial})
 			wsWriteJSON(f.t, conn, map[string]any{
 				"type":     "transcription.done",
-				"text":     "Ja, wir haben am 15. Jänner um neun Uhr einen Termin, der passt, ich bestätige das.",
+				"text":     final,
 				"segments": []any{}, "language": "de",
 			})
 			_ = conn.Close(websocket.StatusNormalClosure, "")
@@ -170,11 +187,23 @@ func (f *fakeMistral) serveTTS(w http.ResponseWriter, r *http.Request) {
 			f.ttsTexts = append(f.ttsTexts, message["text"].(string))
 			f.mu.Unlock()
 		case "input_text.end":
+			f.mu.Lock()
+			texts := append([]string(nil), f.ttsTexts...)
+			f.mu.Unlock()
+			delay := time.Duration(0)
+			if len(texts) > 0 {
+				delay = f.ttsDelay[texts[len(texts)-1]]
+			}
+			if delay > 0 {
+				time.Sleep(delay)
+			}
 			audio := sineFloat32(480, 440)
 			half := len(audio) / 2
-			wsWriteJSON(f.t, conn, map[string]any{"type": "speech.audio.delta", "audio_data": base64.StdEncoding.EncodeToString(float32LE(audio[:half]))})
-			wsWriteJSON(f.t, conn, map[string]any{"type": "speech.audio.delta", "audio_data": base64.StdEncoding.EncodeToString(float32LE(audio[half:]))})
-			wsWriteJSON(f.t, conn, map[string]any{"type": "speech.audio.done"})
+			// The core may abort this generation at any point; a write failure is expected
+			// and must not be reported as a test error.
+			_ = writeWSBestEffort(conn, map[string]any{"type": "speech.audio.delta", "audio_data": base64.StdEncoding.EncodeToString(float32LE(audio[:half]))})
+			_ = writeWSBestEffort(conn, map[string]any{"type": "speech.audio.delta", "audio_data": base64.StdEncoding.EncodeToString(float32LE(audio[half:]))})
+			_ = writeWSBestEffort(conn, map[string]any{"type": "speech.audio.done"})
 			_ = conn.Close(websocket.StatusNormalClosure, "")
 			return
 		}
@@ -192,6 +221,7 @@ func (f *fakeMistral) serveChat(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.chatCount++
 	n := f.chatCount
+	f.chatHistory = append(f.chatHistory, req)
 	for _, message := range req.Messages {
 		if message.Role == "tool" {
 			f.toolResults = append(f.toolResults, message.Content)
@@ -237,9 +267,15 @@ func sseLine(v any) string {
 	return "data: " + string(raw) + "\n\n"
 }
 
+func writeWSBestEffort(conn *websocket.Conn, v any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return wsjson.Write(ctx, conn, v)
+}
+
 func wsWriteJSON(t *testing.T, conn *websocket.Conn, v any) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := wsjson.Write(ctx, conn, v); err != nil {
 		t.Errorf("ws write: %v", err)
@@ -248,7 +284,7 @@ func wsWriteJSON(t *testing.T, conn *websocket.Conn, v any) {
 
 func wsReadJSON(t *testing.T, conn *websocket.Conn) map[string]any {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var v map[string]any
 	if err := wsjson.Read(ctx, conn, &v); err != nil {
@@ -288,10 +324,14 @@ type integrationSession struct {
 	events  chan domain.CallEvent
 	inbound chan domain.AudioChunk
 
+	sendMu        sync.Mutex
 	mu            sync.Mutex
 	hangupCount   int
 	audioAtHangup int
 	sentAudio     [][]byte
+	marksAcked    int
+	clearCount    int
+	dtmf          []string
 	ended         bool
 }
 
@@ -319,7 +359,32 @@ func (r readyIntegrationSession) SendAudio(ctx context.Context, chunk domain.Aud
 	return nil
 }
 
-func (r readyIntegrationSession) SendDTMF(context.Context, string) error { return nil }
+func (r readyIntegrationSession) SendDTMF(_ context.Context, digits string) error {
+	r.session.mu.Lock()
+	r.session.dtmf = append(r.session.dtmf, digits)
+	r.session.mu.Unlock()
+	return nil
+}
+
+func (r readyIntegrationSession) ClearAudio(context.Context) error {
+	r.session.mu.Lock()
+	r.session.clearCount++
+	r.session.sentAudio = nil
+	r.session.mu.Unlock()
+	return nil
+}
+
+func (r readyIntegrationSession) MarkPlayback(_ context.Context, id string) error {
+	r.session.mu.Lock()
+	if r.session.ended {
+		r.session.mu.Unlock()
+		return nil
+	}
+	r.session.marksAcked++
+	r.session.mu.Unlock()
+	r.session.events <- domain.CallEvent{CallID: "call-integration", Kind: domain.EventPlaybackMark, PlaybackID: id, At: time.Now()}
+	return nil
+}
 
 func (r readyIntegrationSession) Hangup(context.Context) error {
 	r.session.mu.Lock()
@@ -341,6 +406,8 @@ func (s *integrationSession) end(reason domain.EndReason) {
 	}
 	s.ended = true
 	s.mu.Unlock()
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	s.events <- domain.CallEvent{CallID: "call-integration", Kind: domain.EventEnded, EndReason: reason, At: time.Now()}
 	close(s.events)
 	close(s.inbound)
@@ -354,28 +421,56 @@ func newIntegrationSession() *integrationSession {
 }
 
 func (s *integrationSession) sendProgress() {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	s.events <- domain.CallEvent{CallID: "call-integration", Kind: domain.EventDialing, At: time.Now()}
 	s.events <- domain.CallEvent{CallID: "call-integration", Kind: domain.EventRinging, At: time.Now()}
 	s.events <- domain.CallEvent{CallID: "call-integration", Kind: domain.EventAnswered, At: time.Now()}
 }
 
-// sendUtterance emits a non-silent canonical utterance followed by 700 ms of silence, so
-// the M0 gate has a deterministic boundary.
-func (s *integrationSession) sendUtterance() {
-	for i := 0; i < 10; i++ {
-		s.inbound <- domain.AudioChunk{Data: pcmFrame(3000)}
+// utteranceFrames is the canonical deterministic speech fixture: 20 non-stationary voiced
+// frames followed by the 700 ms hangover.
+func utteranceFrames() [][]byte {
+	out := make([][]byte, 0, 55)
+	for i := 0; i < 20; i++ {
+		out = append(out, speechPCMFrame(i))
 	}
 	for i := 0; i < 35; i++ {
-		s.inbound <- domain.AudioChunk{Data: make([]byte, domain.FrameBytes)}
+		out = append(out, make([]byte, domain.FrameBytes))
 	}
+	return out
 }
 
-func pcmFrame(amplitude int16) []byte {
+// speechPCMFrame generates a non-stationary multi-component frame that passes the core VAD
+// without any human recording.
+func speechPCMFrame(seed int) []byte {
+	freqs := [6]float64{220, 730, 1150, 1750, 2650, 3300}
 	frame := make([]byte, domain.FrameBytes)
 	for i := 0; i < domain.FrameBytes/2; i++ {
-		binary.LittleEndian.PutUint16(frame[2*i:], uint16(amplitude))
+		var v float64
+		for k := 0; k < len(freqs); k++ {
+			amp := 0.10 + 0.08*math.Sin(float64(seed*7+k*3))
+			phase := float64(seed*11+k*5) * 0.37
+			v += amp * math.Sin(2*math.Pi*freqs[k]*float64(i)/16000+phase)
+		}
+		binary.LittleEndian.PutUint16(frame[2*i:], uint16(int16(v*18000)))
 	}
 	return frame
+}
+
+// sendFrames emits canonical 20 ms chunks.
+func (s *integrationSession) sendFrames(frames [][]byte) {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	s.mu.Lock()
+	ended := s.ended
+	s.mu.Unlock()
+	if ended {
+		return
+	}
+	for _, frame := range frames {
+		s.inbound <- domain.AudioChunk{Data: frame}
+	}
 }
 
 // --- wiring ---------------------------------------------------------------------
@@ -393,6 +488,11 @@ type integrationHarness struct {
 }
 
 func newHarness(t *testing.T, responses func(n int, req chatRequest) chatScript) *integrationHarness {
+	t.Helper()
+	return newHarnessWith(t, responses, nil)
+}
+
+func newHarnessWith(t *testing.T, responses func(n int, req chatRequest) chatScript, mutate func(*agent.Config)) *integrationHarness {
 	t.Helper()
 	mistral, srv := newFakeMistral(t, responses)
 	logs := &bytes.Buffer{}
@@ -440,10 +540,13 @@ func newHarness(t *testing.T, responses func(n int, req chatRequest) chatScript)
 		t.Fatalf("seed scheduled: %v", err)
 	}
 
-	ag, err := agent.New(agent.Config{
+	agentCfg := agent.Config{
 		STT: stt, TTS: tts, Dialogue: dialogue, Orders: storage.Orders(), Logger: logger,
-		Sleep: func(context.Context, time.Duration) error { return nil },
-	})
+	}
+	if mutate != nil {
+		mutate(&agentCfg)
+	}
+	ag, err := agent.New(agentCfg)
 	if err != nil {
 		t.Fatalf("agent New: %v", err)
 	}
@@ -464,10 +567,69 @@ func newHarness(t *testing.T, responses func(n int, req chatRequest) chatScript)
 	}
 }
 
+type harnessRun struct {
+	final domain.Order
+	err   error
+}
+
+// start launches one runner attempt and returns its result channel.
+func (h *integrationHarness) start(t *testing.T) <-chan harnessRun {
+	t.Helper()
+	done := make(chan harnessRun, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		final, err := h.runner.Run(ctx, h.order.ID)
+		done <- harnessRun{final: final, err: err}
+	}()
+	return done
+}
+
+func (h *integrationHarness) waitRun(t *testing.T, done <-chan harnessRun) harnessRun {
+	t.Helper()
+	select {
+	case r := <-done:
+		return r
+	case <-time.After(30 * time.Second):
+		t.Fatal("runner did not return")
+		return harnessRun{}
+	}
+}
+
+func (h *integrationHarness) awaitGreeting(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		h.session.mu.Lock()
+		n, ended := h.session.marksAcked, h.session.ended
+		h.session.mu.Unlock()
+		if n >= 2 || ended {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("greeting never confirmed")
+}
+
 func (h *integrationHarness) run(t *testing.T) (domain.Order, error) {
 	t.Helper()
 	h.session.sendProgress()
-	h.session.sendUtterance()
+	go func() {
+		// Wait until both fixed greeting segments were confirmed before speaking, so the
+		// scripted utterance is an ordinary turn instead of a greeting barge.
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			h.session.mu.Lock()
+			n := h.session.marksAcked
+			ended := h.session.ended
+			h.session.mu.Unlock()
+			if n >= 2 || ended {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		h.session.sendFrames(utteranceFrames())
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	return h.runner.Run(ctx, h.order.ID)
@@ -533,28 +695,23 @@ func TestM0IntegrationBookedFullChain(t *testing.T) {
 	if sttEnds != 1 {
 		t.Errorf("STT input_audio.end count = %d, want 1", sttEnds)
 	}
-	// The gate must replay exactly the delimited utterance: 10 active frames followed by
-	// the 30 frames of end-silence. No pre-roll silence exists here, so the byte sequence
-	// is deterministic and asserted exactly (never printed).
-	expected := make([]byte, 0, 40*domain.FrameBytes)
-	for i := 0; i < 10; i++ {
-		expected = append(expected, pcmFrame(3000)...)
+	// Streaming VAD opens STT at onset with the available pre-roll (the first three onset
+	// frames), then forwards live frames and the hangover. The feed order must be exactly
+	// the inbound order with no replay or duplication.
+	inbound := utteranceFrames()
+	var expected [][]byte
+	expected = append(expected, inbound[0:3]...)
+	expected = append(expected, inbound[3:]...)
+	if len(sttAudio) != len(expected) {
+		t.Fatalf("STT chunks = %d, want %d streaming frames", len(sttAudio), len(expected))
 	}
-	for i := 0; i < 30; i++ {
-		expected = append(expected, make([]byte, domain.FrameBytes)...)
-	}
-	var gotAudio []byte
-	for _, chunk := range sttAudio {
+	for i, chunk := range sttAudio {
 		if len(chunk) != domain.FrameBytes {
 			t.Fatalf("STT audio chunk length = %d, want %d", len(chunk), domain.FrameBytes)
 		}
-		gotAudio = append(gotAudio, chunk...)
-	}
-	if len(sttAudio) != 40 {
-		t.Errorf("STT chunks = %d, want 40", len(sttAudio))
-	}
-	if !bytes.Equal(gotAudio, expected) {
-		t.Fatal("STT audio bytes differ from the expected 10 active + 30 silence frames")
+		if !bytes.Equal(chunk, expected[i]) {
+			t.Fatalf("STT feed order differs at frame %d", i)
+		}
 	}
 	if language != "de" {
 		t.Errorf("STT language = %q, want de", language)
@@ -591,18 +748,22 @@ func TestM0IntegrationBookedFullChain(t *testing.T) {
 		}
 	}
 
-	// TTS: greeting, first assistant text, final reply.
-	if len(ttsTexts) != 3 {
-		t.Fatalf("TTS texts = %d, want 3", len(ttsTexts))
+	// TTS: separate disclosure + purpose greeting segments, then one bounded segment per
+	// assistant text segment.
+	if len(ttsTexts) != 4 {
+		t.Fatalf("TTS texts = %d, want 4 (disclosure, purpose, reply 1, reply 2): %q", len(ttsTexts), ttsTexts)
 	}
-	if !strings.Contains(ttsTexts[0], "Synthetic Patient") || !strings.Contains(ttsTexts[0], "KI-Assistent") {
-		t.Errorf("greeting text was not spoken through TTS: %q", ttsTexts[0])
+	if !strings.Contains(ttsTexts[0], "KI-Assistent") {
+		t.Errorf("AI disclosure was not spoken: %q", ttsTexts[0])
 	}
-	if ttsTexts[1] != "Einen Moment bitte. " {
-		t.Errorf("turn-1 text = %q", ttsTexts[1])
+	if !strings.Contains(ttsTexts[1], "Synthetic Patient") {
+		t.Errorf("greeting purpose was not spoken: %q", ttsTexts[1])
 	}
-	if ttsTexts[2] != "Gerne, der Termin ist gebucht." {
-		t.Errorf("final text = %q", ttsTexts[2])
+	if ttsTexts[2] != "Einen Moment bitte." {
+		t.Errorf("turn-1 text = %q", ttsTexts[2])
+	}
+	if ttsTexts[3] != "Gerne, der Termin ist gebucht." {
+		t.Errorf("final text = %q", ttsTexts[3])
 	}
 
 	// Outbound canonical audio: every frame 640 bytes, at least one non-zero sample.
@@ -730,4 +891,14 @@ func TestM0IntegrationRemoteFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+// tonePCMFrame generates a stationary canonical sine tone for hold fixtures.
+func tonePCMFrame(freq float64, amplitude int16) []byte {
+	frame := make([]byte, domain.FrameBytes)
+	for i := 0; i < domain.FrameBytes/2; i++ {
+		v := int16(float64(amplitude) * math.Sin(2*math.Pi*freq*float64(i)/16000))
+		binary.LittleEndian.PutUint16(frame[2*i:], uint16(v))
+	}
+	return frame
 }

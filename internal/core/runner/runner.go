@@ -219,7 +219,7 @@ preAgent:
 	// call nor closes the event channel.
 	defer relay.shutdown()
 
-	agentOutcome, agentErr := r.cfg.Agent.Run(callCtx, state.order, session, relay.agentChannel())
+	agentOutcome, agentErr := r.cfg.Agent.Run(callCtx, state.order, session, relay.agentChannel(), relay.controlChannel())
 
 	// Always hang up once after a successful Dial, using a context independent of the
 	// canceled call, then give the provider a bounded chance to close the event stream.
@@ -307,6 +307,9 @@ func (r *Runner) handlePreAgentEvent(ctx context.Context, id domain.OrderID, st 
 		}
 	case domain.EventDTMF:
 		r.log.Debug("runner: dtmf ignored", "order_id", id, "dtmf_len", len(ev.DTMF))
+	case domain.EventPlaybackMark:
+		// Playback evidence before the agent starts cannot belong to any core segment.
+		return fmt.Errorf("runner: order %s: %w: playback mark before answer", id, errProviderContract)
 	case domain.EventError:
 		st.providerErr = true
 	case domain.EventEnded:

@@ -12,7 +12,17 @@ import (
 // timeZone is the policy timezone used to interpret relative dates in the prompt.
 const timeZone = "Europe/Vienna"
 
-const greetingTemplate = "Guten Tag, hier ist Insteadly, ein KI-Assistent. Ich rufe im Auftrag von %s an, um einen Arzttermin zu vereinbaren."
+const greetingDisclosureSegment = "Guten Tag, hier ist Insteadly, ein KI-Assistent."
+
+const greetingPurposeTemplate = "Ich rufe im Auftrag von %s an, um einen Arzttermin zu vereinbaren."
+
+const promptGreetingComplete = "Der Anruf wurde bereits mit einer kurzen Begrüßung eröffnet, in der du dich als KI-Assistent vorgestellt und den Zweck genannt hast; wiederhole diese Begrüßung nicht."
+
+const promptGreetingMissingBoth = "Die Begrüßung wurde unterbrochen, bevor du dich als KI-Assistent vorgestellt und den Zweck genannt hast. Stelle dich in deiner ersten Antwort als KI-Assistent vor, nenne den Zweck des Anrufs und wiederhole bereits Gesagtes nicht."
+
+const promptGreetingMissingPurpose = "Die Begrüßung wurde unterbrochen, bevor du den Zweck des Anrufs genannt hast. Nenne in deiner ersten Antwort den Zweck des Anrufs und wiederhole bereits Gesagtes nicht."
+
+const promptGreetingMissingDisclosure = "Die Begrüßung wurde unterbrochen, bevor du dich als KI-Assistent vorgestellt hast. Stelle dich in deiner ersten Antwort als KI-Assistent vor und wiederhole bereits Gesagtes nicht."
 
 // pleaseRepeatPrompt is spoken once after the first empty/inaudible utterance.
 const pleaseRepeatPrompt = "Entschuldigung, ich habe Sie nicht verstanden. Könnten Sie das bitte wiederholen?"
@@ -53,15 +63,30 @@ type promptOrder struct {
 	TimeZone               string       `json:"time_zone"`
 }
 
-// greeting is the fixed AI disclosure spoken before the first listen.
-func greeting(order domain.Order) string {
-	return fmt.Sprintf(greetingTemplate, strings.TrimSpace(order.Patient.FullName))
+// greetingState records which fixed greeting segments provider playback confirmed. A
+// cleared greeting is never treated as spoken.
+type greetingState struct {
+	Disclosure bool
+	Purpose    bool
+}
+
+// greetingSegments splits the fixed greeting into its AI-disclosure and purpose segments so
+// each can be marked and confirmed separately.
+func greetingSegments(order domain.Order) []string {
+	return []string{
+		greetingDisclosureSegment,
+		greetingPurposeSegment(order),
+	}
+}
+
+func greetingPurposeSegment(order domain.Order) string {
+	return fmt.Sprintf(greetingPurposeTemplate, strings.TrimSpace(order.Patient.FullName))
 }
 
 // buildSystemPrompt returns the fixed policy plus deterministic JSON order context. The
 // current time is captured once at Run start from the same injected clock the booking
 // tools use, so relative dates agree.
-func buildSystemPrompt(order domain.Order, now time.Time) string {
+func buildSystemPrompt(order domain.Order, now time.Time, greeting greetingState) string {
 	data := promptOrder{
 		ClinicName:             strings.TrimSpace(order.Clinic.Name),
 		PatientFullName:        strings.TrimSpace(order.Patient.FullName),
@@ -84,5 +109,21 @@ func buildSystemPrompt(order domain.Order, now time.Time) string {
 		// The DTO only contains strings/slices, which always marshal.
 		encoded = []byte(`{"current_time":"` + now.Format(time.RFC3339) + `","time_zone":"` + timeZone + `"}`)
 	}
-	return promptPolicy + string(encoded)
+	return promptPolicyFor(greeting) + string(encoded)
+}
+
+// promptPolicyFor selects the greeting clause that matches what was actually confirmed.
+// The model must repair a missing AI disclosure/purpose in its first real response instead
+// of believing a cleared greeting was heard.
+func promptPolicyFor(greeting greetingState) string {
+	clause := promptGreetingComplete
+	switch {
+	case !greeting.Disclosure && !greeting.Purpose:
+		clause = promptGreetingMissingBoth
+	case !greeting.Purpose:
+		clause = promptGreetingMissingPurpose
+	case !greeting.Disclosure:
+		clause = promptGreetingMissingDisclosure
+	}
+	return strings.Replace(promptPolicy, promptGreetingComplete, clause, 1)
 }

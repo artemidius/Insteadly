@@ -78,6 +78,14 @@ type SpeechStream interface {
 	// before Close has been synthesized.
 	Audio() <-chan domain.AudioChunk
 
+	// Abort stops generation without flushing pending text. It discards queued/unread
+	// synthesis, closes Audio after bounded transport cleanup, and is idempotent. It is
+	// safe after normal Close and safe after call cancellation. Abort's context bounds
+	// cleanup only; it must not be used to continue synthesis. Audio chunks already
+	// returned to the core may still exist and must be discarded by the caller's
+	// playback generation.
+	Abort(ctx context.Context) error
+
 	// Close flushes and releases provider resources. Idempotent.
 	Close(ctx context.Context) error
 }

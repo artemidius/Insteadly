@@ -44,6 +44,7 @@ func (t *Telephony) Dial(ctx context.Context, order domain.Order) (ports.CallSes
 		log:     t.log,
 		events:  make(chan domain.CallEvent, 16),
 		inbound: make(chan domain.AudioChunk, 16),
+		marks:   make(chan string, 8),
 		done:    make(chan struct{}),
 	}
 	go s.run(ctx)
@@ -55,7 +56,12 @@ type callSession struct {
 	log     *slog.Logger
 	events  chan domain.CallEvent
 	inbound chan domain.AudioChunk
+	marks   chan string
 	done    chan struct{}
+
+	mu         sync.Mutex
+	clearCount int
+	markCount  int
 
 	hangupOnce sync.Once
 }
@@ -81,10 +87,19 @@ func (s *callSession) run(ctx context.Context) {
 	s.inbound <- domain.AudioChunk{Data: make([]byte, domain.FrameBytes)}
 
 	reason := domain.EndAborted
-	select {
-	case <-s.done:
-		reason = domain.EndCompleted
-	case <-ctx.Done():
+loop:
+	for {
+		select {
+		case id := <-s.marks:
+			// The fake has no provider: a local mark is reached immediately. This is
+			// deterministic playback evidence, never a claim that a human heard it.
+			s.events <- domain.CallEvent{CallID: s.id, Kind: domain.EventPlaybackMark, PlaybackID: id, At: time.Now()}
+		case <-s.done:
+			reason = domain.EndCompleted
+			break loop
+		case <-ctx.Done():
+			break loop
+		}
 	}
 	s.events <- domain.CallEvent{CallID: s.id, Kind: domain.EventEnded, EndReason: reason, At: time.Now()}
 }
@@ -98,6 +113,42 @@ func (s *callSession) SendAudio(ctx context.Context, chunk domain.AudioChunk) er
 func (s *callSession) SendDTMF(ctx context.Context, digits string) error {
 	s.log.Debug("stub telephony: dtmf ignored", "call_id", s.id, "digits", digits)
 	return nil
+}
+
+// ClearAudio models a local queue purge: the fake keeps no outbound queue, so the clear
+// is an observable no-op counter.
+func (s *callSession) ClearAudio(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.clearCount++
+	s.mu.Unlock()
+	return nil
+}
+
+// MarkPlayback emits one local playback mark after the previously accepted fake audio.
+func (s *callSession) MarkPlayback(ctx context.Context, playbackID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.markCount++
+	s.mu.Unlock()
+	select {
+	case s.marks <- playbackID:
+		return nil
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *callSession) clearCountValue() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clearCount
 }
 
 // Hangup ends the call. Idempotent and safe from multiple goroutines.
