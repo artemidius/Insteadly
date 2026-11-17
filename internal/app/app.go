@@ -4,14 +4,20 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/artemidius/insteadly/internal/core/agent"
 	"github.com/artemidius/insteadly/internal/core/config"
+	"github.com/artemidius/insteadly/internal/core/events"
 	"github.com/artemidius/insteadly/internal/core/ports"
 	"github.com/artemidius/insteadly/internal/core/runner"
+	"github.com/artemidius/insteadly/internal/core/scheduler"
 )
 
 // App is the fully wired object graph. It is the ONLY type that knows concrete
@@ -27,24 +33,35 @@ type App struct {
 	Notify    ports.Notifier // nil until C7
 	Log       *slog.Logger
 
-	// Agent is the stateless answered-call loop; Runner owns one call attempt. There is
-	// deliberately no public HTTP call endpoint in C3 (see docs/agent.md): callers invoke
-	// Runner.Run directly until C5 owns authenticated scheduling.
+	// Agent is the stateless answered-call loop; Runner owns one call attempt.
 	Agent  *agent.Agent
 	Runner *runner.Runner
+
+	// Scheduler drives due orders through Runner.Run and owns retries/requeues.
+	// App.Start starts it; App.Close stops it before the runner.
+	Scheduler *scheduler.Scheduler
+
+	// Events is the in-process order-status hub. The runner/scheduler publish; the SSE
+	// endpoint subscribes. App.Close closes it after the runner and scheduler stop.
+	Events *events.Hub
 
 	// Webhooks is the provider-facing HTTP surface (Twilio webhooks/Media Streams).
 	// Nil when the selected provider has none. internal/httpapi mounts it; the core
 	// never sees it.
 	Webhooks http.Handler
+
+	// storageCloser releases the storage handle (the Postgres pool); it is closed last,
+	// after the scheduler, runner, and HTTP server are done.
+	storageCloser io.Closer
 }
 
 // New validates nothing itself (config.Load does that) but fails when a configured
 // provider has no adapter yet: a clear "not implemented" beats a half-wired binary.
 func New(cfg config.Config) (*App, error) {
 	log := newLogger(cfg.Log)
+	hub := events.NewHub(events.DefaultBuffer)
 
-	storage, err := buildStorage(cfg.Storage)
+	storage, schedulerStore, storageCloser, err := buildStorage(context.Background(), cfg.Storage, log)
 	if err != nil {
 		return nil, fmt.Errorf("storage: %w", err)
 	}
@@ -80,30 +97,102 @@ func New(cfg config.Config) (*App, error) {
 		Orders:    storage.Orders(),
 		Agent:     ag,
 		Logger:    log,
+		Events:    hub,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("runner: %w", err)
 	}
 
+	windowsJSON := cfg.Scheduler.WindowsJSON
+	if strings.TrimSpace(windowsJSON) == "" {
+		// config.Load supplies the default; a hand-built Config (tests, embedders) should
+		// still get a working scheduler rather than an unparsable empty window set.
+		windowsJSON = config.DefaultSchedulerWindows
+	}
+	windows, err := scheduler.ParseWindows(windowsJSON)
+	if err != nil {
+		return nil, err
+	}
+	sched, err := scheduler.New(scheduler.Config{
+		Store:           schedulerStore,
+		Orders:          storage.Orders(),
+		Runner:          run,
+		Events:          hub,
+		Windows:         windows,
+		Tick:            cfg.Scheduler.Tick,
+		MaxAttempts:     cfg.Scheduler.MaxAttempts,
+		MaxConcurrent:   cfg.Scheduler.MaxConcurrent,
+		Lease:           cfg.Scheduler.Lease,
+		BusyBackoff:     cfg.Scheduler.BusyBackoff,
+		NoAnswerBackoff: cfg.Scheduler.NoAnswerBackoff,
+		ErrorBackoff:    cfg.Scheduler.ErrorBackoff,
+		Logger:          log,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: %w", err)
+	}
+
 	return &App{
-		Config:    cfg,
-		Storage:   storage,
-		Telephony: telephony,
-		STT:       stt,
-		TTS:       tts,
-		Dialogue:  dialogue,
-		Log:       log,
-		Agent:     ag,
-		Runner:    run,
-		Webhooks:  webhooks,
+		Config:        cfg,
+		Storage:       storage,
+		Telephony:     telephony,
+		STT:           stt,
+		TTS:           tts,
+		Dialogue:      dialogue,
+		Log:           log,
+		Agent:         ag,
+		Runner:        run,
+		Scheduler:     sched,
+		Events:        hub,
+		Webhooks:      webhooks,
+		storageCloser: storageCloser,
 	}, nil
 }
 
-// Close drains active calls before process shutdown. Storage and adapters need no close
-// API in C3.
+// Start begins the scheduler when it is enabled. It is idempotent.
+func (a *App) Start(ctx context.Context) {
+	if a == nil || a.Scheduler == nil || !a.Config.Scheduler.Enabled {
+		return
+	}
+	a.Scheduler.Start(ctx)
+}
+
+// Close drains the scheduler, then active calls, then the event hub. The HTTP server
+// must be shut down after this and the storage pool last (CloseStorage), so a persisting
+// runner or scheduler never touches a closed pool. It is idempotent.
 func (a *App) Close(ctx context.Context) error {
-	if a == nil || a.Runner == nil {
+	if a == nil {
 		return nil
 	}
-	return a.Runner.Close(ctx)
+	var errs []error
+	if a.Scheduler != nil {
+		if err := a.Scheduler.Close(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("scheduler: %w", err))
+		}
+	}
+	if a.Runner != nil {
+		if err := a.Runner.Close(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("runner: %w", err))
+		}
+	}
+	if a.Events != nil {
+		if err := a.Events.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("events: %w", err))
+		}
+	}
+	return errors.Join(errs...)
 }
+
+// CloseStorage releases the storage handle (the Postgres pool). It must be called last,
+// after Close and HTTP shutdown. It is idempotent.
+func (a *App) CloseStorage() error {
+	if a == nil || a.storageCloser == nil {
+		return nil
+	}
+	closer := a.storageCloser
+	a.storageCloser = nil
+	return closer.Close()
+}
+
+// storageOpenTimeout bounds pool creation and migration during startup.
+const storageOpenTimeout = 30 * time.Second

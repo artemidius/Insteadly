@@ -6,11 +6,14 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Config is the complete, validated configuration of the binary.
@@ -21,6 +24,8 @@ type Config struct {
 	TTS       TTS
 	Dialogue  Dialogue
 	Storage   Storage
+	Scheduler Scheduler
+	API       API
 	Recording Policy
 	Mistral   Mistral // shared by STT/TTS/Dialogue when their provider == "mistral"
 	Log       Log
@@ -62,13 +67,49 @@ type Dialogue struct{ Provider string } // "mistral" | "stub"
 
 // Storage selects the persistence adapter.
 type Storage struct {
-	Provider string // "local"
+	Provider string // "local" | "postgres"
 	Local    Local
+	Postgres Postgres
 }
 
-// Local configures the local-disk storage adapter.
+// Local configures the local-disk storage adapter. In postgres mode it still hosts
+// blobs (C5 does not build a Postgres blob store).
 type Local struct {
 	Dir string // data dir, default "./data"
+}
+
+// Postgres configures the Postgres order/scheduler store. DSN is a secret; config only
+// trims and checks non-empty, while the adapter parses it (keeping config dependency-free).
+type Postgres struct {
+	DSN string // secret; full libpq/URL connstring
+}
+
+// DefaultSchedulerWindows is the no-env opening window: Mon–Fri 08:00–18:00 in the
+// scheduler's configured location (Europe/Vienna). It is config, not hardcoded policy.
+const DefaultSchedulerWindows = `[{"dow":"mon","start":"08:00","end":"18:00"},` +
+	`{"dow":"tue","start":"08:00","end":"18:00"},` +
+	`{"dow":"wed","start":"08:00","end":"18:00"},` +
+	`{"dow":"thu","start":"08:00","end":"18:00"},` +
+	`{"dow":"fri","start":"08:00","end":"18:00"}]`
+
+// Scheduler configures the in-process orchestration loop.
+type Scheduler struct {
+	Enabled         bool
+	Tick            time.Duration
+	MaxAttempts     int
+	MaxConcurrent   int
+	Lease           time.Duration
+	BusyBackoff     time.Duration
+	NoAnswerBackoff time.Duration
+	ErrorBackoff    time.Duration
+	WindowsJSON     string // JSON array: [{"dow":"mon","start":"08:00","end":"18:00"}, …]
+}
+
+// API configures the prototype place-call surface. Key is a secret; an empty key
+// disables auth (development only, never production security).
+type API struct {
+	Key            string // secret
+	IdempotencyTTL time.Duration
 }
 
 // Policy holds the global recording defaults (DESIGN.md §3.4).
@@ -118,7 +159,7 @@ var (
 	twilioModes        = []string{"voice-api", "sip-trunk"}
 	aiProviders        = []string{"mistral", "stub"}
 	mistralTTSModes    = []string{"realtime", "offline"}
-	storageProviders   = []string{"local"}
+	storageProviders   = []string{"local", "postgres"}
 	logLevels          = []string{"debug", "info", "warn", "error"}
 	logFormats         = []string{"text", "json"}
 
@@ -143,6 +184,9 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Storage.Local.Dir) == "" {
 		return fmt.Errorf("config: storage.local.dir is required")
+	}
+	if c.Storage.Provider == "postgres" && strings.TrimSpace(c.Storage.Postgres.DSN) == "" {
+		return fmt.Errorf("config: postgres.dsn: required when storage.provider is postgres")
 	}
 	if err := checkEnum("log.level", c.Log.Level, logLevels); err != nil {
 		return err
@@ -174,7 +218,105 @@ func (c Config) Validate() error {
 	if err := checkEnum("dialogue.provider", c.Dialogue.Provider, aiProviders); err != nil {
 		return err
 	}
+	if err := c.validateScheduler(); err != nil {
+		return err
+	}
+	if c.API.IdempotencyTTL <= 0 {
+		return fmt.Errorf("config: api.idempotency_ttl: must be positive")
+	}
 	return c.validateMistral()
+}
+
+// validateScheduler rejects zero/negative timing knobs and malformed opening windows.
+// It is unconditional: a disabled scheduler still holds values that a future start would
+// trust, and the defaults keep a no-env boot valid.
+func (c Config) validateScheduler() error {
+	s := c.Scheduler
+	for _, d := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"scheduler.tick", s.Tick},
+		{"scheduler.lease", s.Lease},
+		{"scheduler.busy_backoff", s.BusyBackoff},
+		{"scheduler.no_answer_backoff", s.NoAnswerBackoff},
+		{"scheduler.error_backoff", s.ErrorBackoff},
+	} {
+		if d.value <= 0 {
+			return fmt.Errorf("config: %s: must be positive", d.name)
+		}
+	}
+	if s.MaxAttempts < 1 {
+		return fmt.Errorf("config: scheduler.max_attempts: must be at least 1")
+	}
+	if s.MaxConcurrent < 1 {
+		return fmt.Errorf("config: scheduler.max_concurrent: must be at least 1")
+	}
+	if err := validateWindowsJSON(s.WindowsJSON); err != nil {
+		return err
+	}
+	return nil
+}
+
+type windowSetting struct {
+	Dow   string `json:"dow"`
+	Start string `json:"start"`
+	End   string `json:"end"`
+}
+
+var weekdayNames = map[string]time.Weekday{
+	"sun": time.Sunday,
+	"mon": time.Monday,
+	"tue": time.Tuesday,
+	"wed": time.Wednesday,
+	"thu": time.Thursday,
+	"fri": time.Friday,
+	"sat": time.Saturday,
+}
+
+// validateWindowsJSON parses the opening-window array independently of the scheduler
+// package, so config stays a dependency-free, fail-fast surface.
+func validateWindowsJSON(raw string) error {
+	var windows []windowSetting
+	if err := json.Unmarshal([]byte(raw), &windows); err != nil {
+		return fmt.Errorf("config: scheduler.windows: invalid JSON: %w", err)
+	}
+	if len(windows) == 0 {
+		return fmt.Errorf("config: scheduler.windows: at least one window is required")
+	}
+	for i, w := range windows {
+		if _, ok := weekdayNames[strings.ToLower(w.Dow)]; !ok {
+			return fmt.Errorf("config: scheduler.windows[%d].dow: unknown day %q", i, w.Dow)
+		}
+		start, err := parseClockSetting(w.Start)
+		if err != nil {
+			return fmt.Errorf("config: scheduler.windows[%d].start: %w", i, err)
+		}
+		end, err := parseClockSetting(w.End)
+		if err != nil {
+			return fmt.Errorf("config: scheduler.windows[%d].end: %w", i, err)
+		}
+		if start >= end {
+			return fmt.Errorf("config: scheduler.windows[%d]: start must be before end", i)
+		}
+	}
+	return nil
+}
+
+func parseClockSetting(raw string) (int, error) {
+	parts := strings.Split(raw, ":")
+	if len(parts) != 2 || len(parts[0]) != 2 || len(parts[1]) != 2 {
+		return 0, fmt.Errorf("invalid time %q (want HH:MM)", raw)
+	}
+	hour, err := strconv.Atoi(parts[0])
+	if err != nil || hour < 0 || hour > 23 {
+		return 0, fmt.Errorf("invalid time %q (want HH:MM)", raw)
+	}
+	minute, err := strconv.Atoi(parts[1])
+	if err != nil || minute < 0 || minute > 59 {
+		return 0, fmt.Errorf("invalid time %q (want HH:MM)", raw)
+	}
+	return hour*60 + minute, nil
 }
 
 // validateMistral checks the shared Mistral settings. Model/voice/base-URL/delay/mode
@@ -283,8 +425,16 @@ func checkEnum(name, value string, allowed []string) error {
 	return fmt.Errorf("config: %s: unknown value %q (want one of %s)", name, value, strings.Join(allowed, ", "))
 }
 
+// redacted reports only whether a secret is configured, never its value.
+func redacted(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "<unset>"
+	}
+	return "<redacted>"
+}
+
 // Summary returns non-secret values for startup logging and /healthz.
-// NEVER include AccountSID, AuthToken, or APIKey.
+// NEVER include AccountSID, AuthToken, APIKey, or the Postgres DSN.
 func (c Config) Summary() map[string]any {
 	return map[string]any{
 		"http.addr":                             c.HTTP.Addr,
@@ -297,6 +447,17 @@ func (c Config) Summary() map[string]any {
 		"dialogue.provider":                     c.Dialogue.Provider,
 		"storage.provider":                      c.Storage.Provider,
 		"storage.local.dir":                     c.Storage.Local.Dir,
+		"postgres.dsn":                          redacted(c.Storage.Postgres.DSN),
+		"scheduler.enabled":                     c.Scheduler.Enabled,
+		"scheduler.tick":                        c.Scheduler.Tick.String(),
+		"scheduler.max_attempts":                c.Scheduler.MaxAttempts,
+		"scheduler.max_concurrent":              c.Scheduler.MaxConcurrent,
+		"scheduler.lease":                       c.Scheduler.Lease.String(),
+		"scheduler.busy_backoff":                c.Scheduler.BusyBackoff.String(),
+		"scheduler.no_answer_backoff":           c.Scheduler.NoAnswerBackoff.String(),
+		"scheduler.error_backoff":               c.Scheduler.ErrorBackoff.String(),
+		"scheduler.windows":                     c.Scheduler.WindowsJSON,
+		"api.idempotency_ttl":                   c.API.IdempotencyTTL.String(),
 		"recording.enabled":                     c.Recording.RecordingEnabled,
 		"transcript.enabled":                    c.Recording.TranscriptEnabled,
 		"audio.enabled":                         c.Recording.AudioEnabled,

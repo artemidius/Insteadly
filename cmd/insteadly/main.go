@@ -39,6 +39,13 @@ func run() error {
 	// Summary never contains secrets; see config.Summary.
 	a.Log.Info("starting insteadly", "config", cfg.Summary(), "version", version)
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Start the scheduler before serving traffic: an order placed in the same process
+	// must be pickable by the loop. Start is idempotent and a no-op when disabled.
+	a.Start(ctx)
+
 	srv := httpapi.New(cfg, a, version)
 
 	errCh := make(chan error, 1)
@@ -47,31 +54,34 @@ func run() error {
 		errCh <- srv.ListenAndServe()
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	select {
 	case err := <-errCh:
-		// The listener failed or was closed unexpectedly; still drain active calls.
-		shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		runErr := a.Close(shCtx)
-		cancel()
+		// The listener failed or was closed unexpectedly; still drain scheduler, calls,
+		// the event hub, HTTP, and finally the storage pool.
+		shErr := shutdown(a, srv)
 		if errors.Is(err, http.ErrServerClosed) {
-			return runErr
+			return shErr
 		}
-		return errors.Join(err, runErr)
+		return errors.Join(err, shErr)
 	case <-ctx.Done():
 		a.Log.Info("shutting down")
 		return shutdown(a, srv)
 	}
 }
 
-// shutdown closes the runner before http.Server.Shutdown: active calls need the telephony
-// HTTP/WebSocket surface while they cancel and hang up.
+// shutdown implements the C5 order (plan §8): Scheduler → Runner → event hub → HTTP →
+// Postgres pool last. Active calls need the telephony HTTP/WebSocket surface while they
+// cancel and hang up, so the HTTP server drains after the runner, not before it. Each
+// stage gets its own bound so one slow stage cannot starve the next.
 func shutdown(a *app.App, srv *http.Server) error {
-	shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	runErr := a.Close(shCtx)
-	srvErr := srv.Shutdown(shCtx)
-	return errors.Join(runErr, srvErr)
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), 15*time.Second)
+	closeErr := a.Close(closeCtx)
+	cancelClose()
+
+	srvCtx, cancelSrv := context.WithTimeout(context.Background(), 5*time.Second)
+	srvErr := srv.Shutdown(srvCtx)
+	cancelSrv()
+
+	storageErr := a.CloseStorage()
+	return errors.Join(closeErr, srvErr, storageErr)
 }

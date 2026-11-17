@@ -13,20 +13,27 @@ swappable adapters.
 is **✅ code complete** after its real-Mistral no-phone live gate. C4 (conversation:
 streaming VAD/turn-taking, barge-in, playback marks/clear, deterministic IVR, hold detection,
 bounded structured-outcome repair) is **✅ code complete** after its real-Mistral no-phone
-M1 live gate — see [PROGRESS.md](PROGRESS.md). The binary still boots and serves a working API
-with **no credentials and no external network calls** (all providers default to deterministic
-stubs). Selecting `INSTEADLY_TELEPHONY_PROVIDER=twilio` activates the real Twilio Voice +
+M1 live gate. C5 (M2 orchestration: Postgres order store, scheduler with retries and
+callback requeue, status API + SSE, place-call eligibility endpoint) is **🔵 code
+complete pending the conductor's final verification** — see [PROGRESS.md](PROGRESS.md). The
+binary still boots and serves a working API with **no credentials and no external network
+calls** (all providers default to deterministic stubs). Selecting `INSTEADLY_TELEPHONY_PROVIDER=twilio` activates the real Twilio Voice +
 Media Streams adapter; selecting `INSTEADLY_{STT,TTS,DIALOGUE}_PROVIDER=mistral` activates the
 real Mistral speech and dialogue adapters (see [docs/mistral.md](docs/mistral.md)).
 
 C4's conversation engine is proven credential-free against loopback fake Mistral servers and
 scripted fake telephony, and the full C4 unit/race suite is green, plus a real-Mistral
-no-phone loopback (barge-in with clear, deterministic IVR, hold, outcome repair). Twilio live
-audio and outbound DTMF remain blocked on the current **trial** account, so DESIGN's real-phone M1 exit
-(and the earlier real-phone M0 exit) is still deferred. C4 deliberately does **not** implement
-acoustic echo cancellation, speaker diarization, recorded audio/transcripts, a free-form
-digits tool, a real human transfer (`escalate_to_human` stays honestly `unavailable`), retries,
-or any new env/API surface. See [docs/agent.md](docs/agent.md).
+no-phone loopback (barge-in with clear, deterministic IVR, hold, outcome repair). C5 adds
+the durable orchestration layer: a Postgres `OrderStore` + lease-claiming `SchedulerStore`
+(`FOR UPDATE SKIP LOCKED`), an in-process scheduler with opening windows (Europe/Vienna),
+bounded concurrency, retry backoff, history-preserving callback requeue, an order-status SSE
+stream, and the API-key-gated place-call eligibility endpoint. Orders move to Postgres when
+`INSTEADLY_STORAGE_PROVIDER=postgres`; blobs stay on local disk. Twilio live audio and
+outbound DTMF remain blocked on the current **trial** account, so DESIGN's real-phone M1 exit
+(and the earlier real-phone M0 exit) is still deferred. C5 deliberately does **not** implement
+River/a job queue, per-clinic opening hours (Q3), payments capture, recording persistence,
+horizontal runner scaling, or real user auth (the API key is a prototype gate). See
+[docs/architecture.md](docs/architecture.md) and [PROGRESS.md](PROGRESS.md).
 
 Design of record: [DESIGN.md](DESIGN.md). Chunk plans live in [`plans/`](plans/).
 
@@ -45,12 +52,20 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/orders \
        "patient":{"full_name":"Max Mustermann","phone":"+436641234567","reason":"test"}}'
 ```
 
-Zero configuration is required: all providers default to `stub` and storage to
-`./data`. The API is described in [docs/api.md](docs/api.md); internals in
+Zero configuration is required: all providers default to `stub`, storage to `./data`, and
+the scheduler is enabled. To let the scheduler dial an order, make it eligible through the
+place-call endpoint (the scheduler picks it up outside opening windows only when the window
+allows; the default is Mon–Fri 08:00–18:00 Europe/Vienna):
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/api/v1/orders/<id>/call
+curl -N http://127.0.0.1:8080/api/v1/orders/<id>/events   # live status SSE
+```
+
+The API is described in [docs/api.md](docs/api.md); internals in
 [docs/architecture.md](docs/architecture.md), with the call runner/agent engine in
-[docs/agent.md](docs/agent.md). There is deliberately **no public place-a-call endpoint** in
-C4: a future scheduler invokes `Runner.Run` directly until C5 owns authenticated,
-idempotent orchestration.
+[docs/agent.md](docs/agent.md). `POST /call` is an **eligibility** endpoint, never a
+synchronous dialer: `Runner.Run` remains the only dial path.
 
 > macOS note: `/usr/bin/make` is a shim that may fail while `xcode-select` points at a
 > broken Xcode. If `make` errors with `xcodebuild ... -find make`, run
@@ -79,8 +94,20 @@ ignored.
 | `INSTEADLY_STT_PROVIDER` | `stub` | `stub`, `mistral` |
 | `INSTEADLY_TTS_PROVIDER` | `stub` | `stub`, `mistral` |
 | `INSTEADLY_DIALOGUE_PROVIDER` | `stub` | `stub`, `mistral` |
-| `INSTEADLY_STORAGE_PROVIDER` | `local` | `local` |
-| `INSTEADLY_STORAGE_LOCAL_DIR` | `./data` | storage root |
+| `INSTEADLY_STORAGE_PROVIDER` | `local` | `local`, `postgres` |
+| `INSTEADLY_STORAGE_LOCAL_DIR` | `./data` | storage root; also hosts blobs in postgres mode |
+| `INSTEADLY_POSTGRES_DSN` | — | **secret**; full libpq/URL DSN, required when provider is `postgres` |
+| `INSTEADLY_SCHEDULER_ENABLED` | `true` | run the in-process scheduler |
+| `INSTEADLY_SCHEDULER_TICK` | `5s` | eligibility scan interval |
+| `INSTEADLY_SCHEDULER_MAX_ATTEMPTS` | `3` | total dial attempts including the first |
+| `INSTEADLY_SCHEDULER_MAX_CONCURRENT` | `8` | in-flight `Runner.Run` calls |
+| `INSTEADLY_SCHEDULER_LEASE` | `2m` | claim lease (eligibility guard; the call timeout is 6m) |
+| `INSTEADLY_SCHEDULER_BUSY_BACKOFF` | `15m` | base retry delay for `busy` |
+| `INSTEADLY_SCHEDULER_NO_ANSWER_BACKOFF` | `30m` | base retry delay for `no_answer`/`ivr_dead_end` |
+| `INSTEADLY_SCHEDULER_ERROR_BACKOFF` | `5m` | base retry delay for `error` |
+| `INSTEADLY_SCHEDULER_WINDOWS` | Mon–Fri 08:00–18:00 Europe/Vienna | JSON opening windows `[{"dow":"mon","start":"08:00","end":"18:00"},…]` |
+| `INSTEADLY_API_KEY` | — | **secret**; Bearer key for `POST /call`; empty disables auth (dev only) |
+| `INSTEADLY_API_IDEMPOTENCY_TTL` | `10m` | in-process idempotency-key lifetime |
 | `INSTEADLY_RECORDING_ENABLED` | `false` | global default (DESIGN.md §3.4) |
 | `INSTEADLY_TRANSCRIPT_ENABLED` | `false` | global default |
 | `INSTEADLY_AUDIO_ENABLED` | `false` | global default |
@@ -113,6 +140,7 @@ contract, and the live-test recipe are described in [docs/mistral.md](docs/mistr
 | `make build` | build `bin/insteadly` (version via `VERSION=...`) |
 | `make run` | `go run ./cmd/insteadly` |
 | `make test` | `go test -race -count=1 ./...` |
+| `make test-postgres` | `go test -tags postgres -count=1 ./...`; **requires Docker** (testcontainers `postgres:16-alpine`), not part of `verify` |
 | `make cover` | tests with coverage + one-line total |
 | `make live-test` | **opt-in** real Twilio call (`-tags live`); needs a public tunnel, credentials and credit |
 | `make live-test-mistral` | **opt-in** real Mistral smoke (`-tags live`); needs `LIVE_MISTRAL=1` and `MISTRAL_API_KEY` |
@@ -124,9 +152,11 @@ contract, and the live-test recipe are described in [docs/mistral.md](docs/mistr
 | `make fmt` | `gofmt -w .` |
 | `make clean` / `make clean-data` | remove `bin/` / `data/` |
 
-Dependencies: exactly **one** third-party module — `github.com/coder/websocket` v1.8.15
-(pure Go, zero transitive dependencies) for the Twilio Media Streams and Mistral realtime
-WebSocket clients. A further dependency needs a plan-level decision.
+Dependencies: `github.com/coder/websocket` v1.8.15 (Twilio Media Streams and Mistral
+realtime WebSockets) plus, as approved in the C5 plan, `github.com/jackc/pgx/v5` v5.13.0
+(Postgres driver/pool). `github.com/testcontainers/testcontainers-go` v0.45.0 and its
+Postgres module are **test-only** and build-tagged `postgres`. No ORM and no second SQL
+driver. A further dependency needs a plan-level decision.
 
 ### Layout
 
@@ -137,9 +167,11 @@ internal/core/domain/     pure types + order state machine (stdlib only)
 internal/core/ports/      the six+1 port contracts the core consumes
 internal/core/agent/      answered-call loop: greeting, M0 gate, STT, tools, TTS
 internal/core/runner/     single-attempt call runner: claim, dial, events, Finish, Hangup
+internal/core/scheduler/  eligibility loop, windows, retries, callback requeue
+internal/core/events/     in-process order-status hub (runner/scheduler → SSE)
 internal/core/config/     env loader, validation, secret-safe summary
-internal/adapters/        implementations: storage/local, stub, telephony/twilio,
-                          stt/mistral, tts/mistral, dialogue/mistral
+internal/adapters/        implementations: storage/local, storage/postgres, stub,
+                          telephony/twilio, stt/mistral, tts/mistral, dialogue/mistral
 internal/app/             composition root (the only core+adapters importer)
 internal/httpapi/         JSON API, middleware, error envelope
 ```
@@ -152,7 +184,10 @@ internal/app → core/{agent,runner,config,ports,domain} + adapters  (compositio
 internal/httpapi → core/{ports,domain,config} + app
 internal/adapters/* → core/{ports,domain}
 internal/core/agent → core/{ports,domain} + stdlib/log/slog
-internal/core/runner → core/agent + core/{ports,domain} + stdlib/log/slog
+internal/core/runner → core/agent + core/{events,ports,domain} + stdlib/log/slog
+internal/core/scheduler → core/{events,ports,domain} + stdlib/log/slog
+internal/core/events → internal/core/domain + stdlib
+internal/core/config → stdlib only (no pgx; the adapter parses the DSN)
 internal/core/ports → internal/core/domain
 internal/core/domain → stdlib only
 ```
@@ -195,6 +230,7 @@ write` for releases).
 | C2 | Mistral STT / TTS / dialogue adapters | ✅ code complete; live smoke passed |
 | C3 | call runner + agent engine, end-to-end M0 walk | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | C4 | conversation: VAD/turn-taking, barge-in, IVR, hold, outcome repair | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
-| C5+ | orchestration, web app, swapability | ⬜ |
+| C5 | orchestration: Postgres order store, scheduler, status SSE, place-call | 🔵 code complete pending conductor verification |
+| C6/C7 | web app, payments, swapability, recording, notifications | ⬜ |
 
 See [PROGRESS.md](PROGRESS.md) for the authoritative status and session log.

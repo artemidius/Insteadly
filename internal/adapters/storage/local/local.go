@@ -18,15 +18,25 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/artemidius/insteadly/internal/core/domain"
 	"github.com/artemidius/insteadly/internal/core/ports"
 )
 
-// Store is the local-disk implementation of ports.Storage.
+// Store is the local-disk implementation of ports.Storage. It also implements
+// ports.SchedulerStore; its lease map is in-memory because the local store is
+// single-process (the runner's status check is the only fence it needs).
 type Store struct {
-	mu  sync.RWMutex
-	dir string
+	mu     sync.RWMutex
+	dir    string
+	leases map[domain.OrderID]lease
+}
+
+// lease is one in-memory scheduler claim held by owner until until.
+type lease struct {
+	owner string
+	until time.Time
 }
 
 // New creates the storage directories eagerly so an unwritable path fails at startup
@@ -41,7 +51,7 @@ func New(dir string) (*Store, error) {
 			return nil, fmt.Errorf("local storage: create %s: %w", p, err)
 		}
 	}
-	return &Store{dir: dir}, nil
+	return &Store{dir: dir, leases: make(map[domain.OrderID]lease)}, nil
 }
 
 // Orders returns the order store (the Store itself).
