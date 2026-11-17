@@ -458,18 +458,30 @@ func speechPCMFrame(seed int) []byte {
 	return frame
 }
 
-// sendFrames emits canonical 20 ms chunks.
-func (s *integrationSession) sendFrames(frames [][]byte) {
+// trySendFrame enqueues one canonical frame unless the call already ended.
+func (s *integrationSession) trySendFrame(frame []byte) bool {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	s.mu.Lock()
 	ended := s.ended
 	s.mu.Unlock()
 	if ended {
-		return
+		return false
 	}
+	s.inbound <- domain.AudioChunk{Data: frame}
+	return true
+}
+
+// sendFrames bursts canonical chunks for deterministic credential-free fixtures. Live
+// telephony must NOT use this: real inbound audio arrives at 20 ms/frame (50 fps), and a
+// multi-second burst can overflow the bounded STT worker queue while a real WebSocket
+// handshake is in flight. m1_live_test.go paces the live no-phone path at canonical real
+// time; a burst is a test-harness artifact, not a VAD/queue defect.
+func (s *integrationSession) sendFrames(frames [][]byte) {
 	for _, frame := range frames {
-		s.inbound <- domain.AudioChunk{Data: frame}
+		if !s.trySendFrame(frame) {
+			return
+		}
 	}
 }
 
