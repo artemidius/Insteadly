@@ -117,27 +117,44 @@ func (h *holdDetector) evaluate(full bool) (candidate, confirmed bool) {
 	if h.count == 0 {
 		return false, false
 	}
+	start := 0
+	if h.count == len(h.frames) {
+		start = h.next // oldest slot in the ring
+	}
+
 	toneByProbe := [4]int{}
 	tones := 0
 	activeFrames := 0
 	speechFrames := 0
 	peakFrames := 0
 	fluxFrames := 0
-	runs := 0
-	prevTone := false
+
+	type toneRun struct {
+		on bool
+		n  int
+	}
+	var runs []toneRun
+	run := toneRun{}
+	haveRun := false
 	for i := 0; i < h.count; i++ {
-		fr := h.frames[i]
+		fr := h.frames[(start+i)%len(h.frames)]
+		// Run-length accounting is chronological so cadence similarity is meaningful even
+		// after the ring wrapped.
+		if !haveRun {
+			run = toneRun{on: fr.tone, n: 1}
+			haveRun = true
+		} else if run.on == fr.tone {
+			run.n++
+		} else {
+			runs = append(runs, run)
+			run = toneRun{on: fr.tone, n: 1}
+		}
+
 		if fr.tone {
 			tones++
 			if fr.probe >= 0 && fr.probe < len(toneByProbe) {
 				toneByProbe[fr.probe]++
 			}
-			if !prevTone {
-				runs++
-			}
-			prevTone = true
-		} else {
-			prevTone = false
 		}
 		if fr.active {
 			activeFrames++
@@ -152,6 +169,10 @@ func (h *holdDetector) evaluate(full bool) (candidate, confirmed bool) {
 			fluxFrames++
 		}
 	}
+	if haveRun {
+		runs = append(runs, run)
+	}
+
 	maxTone := 0
 	for _, n := range toneByProbe {
 		if n > maxTone {
@@ -160,7 +181,46 @@ func (h *holdDetector) evaluate(full bool) (candidate, confirmed bool) {
 	}
 
 	toneContinuous := maxTone >= holdToneContinuousFrames
-	cadence := tones >= holdToneCadenceFrames && runs >= 2
+	// Cadence requires the same probe, at least two similar on-bursts separated by an
+	// audible off gap. Total tone count or a single long burst alone is not a cadence.
+	sameProbe := tones > 0 && maxTone*100 >= 80*tones
+	onLengths := make([]int, 0, len(runs))
+	internalOff := false
+	for i, r := range runs {
+		if r.on {
+			onLengths = append(onLengths, r.n)
+			continue
+		}
+		// An off run is an internal gap only when a tone run precedes and follows it.
+		if i > 0 && i < len(runs)-1 && runs[i-1].on && runs[i+1].on && r.n >= 2 {
+			internalOff = true
+		}
+	}
+	similarBursts := false
+	if len(onLengths) >= 2 {
+		first, second := 0, 0
+		for _, n := range onLengths {
+			switch {
+			case n >= first:
+				second, first = first, n
+			case n > second:
+				second = n
+			}
+		}
+		if second >= 2 {
+			diff := first - second
+			if diff < 0 {
+				diff = -diff
+			}
+			tolerance := first / 2
+			if tolerance < 3 {
+				tolerance = 3
+			}
+			similarBursts = diff <= tolerance
+		}
+	}
+	cadence := tones >= holdToneCadenceFrames && sameProbe && similarBursts && internalOff
+
 	music := activeFrames*100 >= holdMusicActivePercent*h.count &&
 		speechFrames*100 < holdMusicSpeechPercent*h.count &&
 		peakFrames*100 >= holdMusicPeaksPercent*h.count &&

@@ -653,3 +653,70 @@ func TestExecuteToolsOrderAndIDs(t *testing.T) {
 		t.Error("tool result is not valid JSON")
 	}
 }
+
+func TestRunSilentSynthesisDoesNotUnlockTools(t *testing.T) {
+	order := testOrder()
+	store := newFakeStore(order)
+	propose := `{"start":"` + slotStart + `","end":"` + slotEnd + `"}`
+	dlg := &fakeDialogue{scripts: []turnScript{{
+		chunks: []string{"Einen Moment."},
+		result: ports.TurnResult{ToolCalls: []ports.ToolCall{{ID: "c1", Name: ToolProposeSlot, Arguments: []byte(propose)}}},
+	}}}
+	tools := &fakeToolExecutor{}
+	cfg := testConfig(store)
+	cfg.STT = &fakeSTT{script: fakeSTTScript{finals: []string{"bitte buchen"}}}
+	cfg.Dialogue = dlg
+	cfg.TTS = &fakeTTS{script: fakeTTSScript{suppressText: "Einen Moment."}}
+	cfg.NewTools = func(domain.Order) ToolExecutor { return tools }
+	a := fastAgent(t, cfg)
+	call := newFakeCall()
+	done := startAgent(t, a, order, call, nil)
+	waitFor(t, "greeting confirmed", func() bool { return len(call.markIDs()) >= 2 })
+	call.push(utteranceAudio()...)
+	_, err := resultOf(t, done)
+	if !errors.Is(err, errNoPlaybackAudio) {
+		t.Fatalf("err = %v, want errNoPlaybackAudio", err)
+	}
+	if len(tools.executed) != 0 {
+		t.Fatalf("silent assistant text unlocked tools: %+v", tools.executed)
+	}
+	dlg.mu.Lock()
+	defer dlg.mu.Unlock()
+	if len(dlg.results) != 0 {
+		t.Errorf("silent assistant text submitted tool results: %d", len(dlg.results))
+	}
+}
+
+func TestRunCleanupBudgetIsFreshAtExit(t *testing.T) {
+	order := testOrder()
+	store := newFakeStore(order)
+	dlg := textOnlyDialogue("ok")
+	cfg := testConfig(store)
+	cfg.Dialogue = dlg
+	cfg.STT = &fakeSTT{script: fakeSTTScript{finals: []string{"hallo"}}}
+	cfg.CleanupTimeout = 40 * time.Millisecond
+	cfg.InterruptionTimeout = 10 * time.Millisecond
+	cfg.MaxCallDuration = 250 * time.Millisecond
+	cfg.ListenTimeout = 5 * time.Second
+	call := newFakeCall()
+	done := startAgent(t, fastAgent(t, cfg), order, call, nil)
+	waitFor(t, "greeting confirmed", func() bool { return len(call.markIDs()) >= 2 })
+	call.push(utteranceAudio()...)
+	waitFor(t, "dialogue session created", func() bool {
+		dlg.mu.Lock()
+		defer dlg.mu.Unlock()
+		return dlg.opens == 1
+	})
+	_, err := resultOf(t, done)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the call deadline", err)
+	}
+	dlg.mu.Lock()
+	defer dlg.mu.Unlock()
+	if dlg.closed != 1 {
+		t.Fatalf("dialogue closes = %d, want 1", dlg.closed)
+	}
+	if dlg.closeCtxErr != nil {
+		t.Fatalf("dialogue close received an expired cleanup context: %v", dlg.closeCtxErr)
+	}
+}

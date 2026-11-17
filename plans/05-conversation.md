@@ -1112,3 +1112,47 @@ was run**. The following reviewable deviations/decisions are recorded here and i
 9. **Live evidence.** Neither `TestLiveM1NoPhone` nor `TestLiveM1Phone` was run in this
    session, and no secret/.env value was read. The no-phone gate remains the C4 exit gate;
    real-phone M1 remains blocked by the Twilio trial/controlled-IVR prerequisites.
+
+### 2026-11-17 — post-review corrections (PR #6)
+
+A reviewer review of PR #6 found five blocking correctness issues and two contract gaps. All
+were fixed on `feat/c4-conversation` before merge; no live test was run.
+
+1. **STT end-of-input now drains accepted audio.** The worker's separate `end` signal could win
+   a select against frames already accepted into the bounded feed queue, closing STT with
+   pre-roll/live audio unread (observed in CI/repeated runs). `closeInput` now closes the feed
+   channel itself; a closed buffered channel yields its buffered frames before closure, so the
+   normal end path always forwards every accepted frame before `Close`. New tests:
+   `TestUtteranceWorkerDrainsQueuedFramesBeforeClose`,
+   `TestUtteranceWorkerSlowFeedStillDrainsAcceptedFrames`,
+   `TestListenerDelayedHandshakeDrainsEveryAcceptedFrame`; the observed M0 integration case was
+   stress-run `-race -count=100`.
+2. **IVR purpose evidence is option-local.** The parser now uses hard punctuation clauses and
+   nearest-digit partitions inside a clause; an imperative may be shared across coordinated
+   options, but a target/exclusion in a different clause cannot justify a digit. Added
+   `terminvergabe` to the target list. New tests:
+   `TestIvrOfficeHoursMenuDoesNotPressAppointmentDigit`,
+   `TestIvrOptionLocalPurposeSelectsOnlyTheMatchingDigit`.
+3. **Human/hold activity cancels the post-digit wait.** A non-menu final and confirmed hold
+   clear `ivrState.waitUntil`, so a stale 15 s menu timer cannot fire `ivr_dead_end` after the
+   caller entered normal dialogue or hold. New test:
+   `TestIvrHumanActivityCancelsPostDigitTimeout` (waits past the original deadline).
+4. **Control-relay overflow can never persist success.** After shutting the relay down, the
+   runner consults `relay.controlError()` and, if set, persists `failed/error` with
+   `detailControlLost` even when the agent raced to a valid outcome. New test:
+   `TestRunnerControlOverflowNeverPersistsAValidOutcome`.
+5. **Playback confirmation requires nonempty audio.** A segment is marked/confirmed only after
+   at least one nonempty canonical frame was successfully sent for that generation; an empty
+   provider synthesis returns `errNoPlaybackAudio`, confirms no text, and cannot unlock tools
+   or an outcome. New tests: `TestPlayerRequiresNonemptyPlaybackAudio`,
+   `TestRunSilentSynthesisDoesNotUnlockTools`.
+6. **Fresh cleanup budget at exit.** The listener join and dialogue close each receive a fresh
+   `CleanupTimeout` budget created at Run exit, not one created at Run entry that is already
+   expired after a long call. New test: `TestRunCleanupBudgetIsFreshAtExit`.
+7. **Stricter hold cadence.** Cadence now requires the same dominant probe, at least two
+   similar on-bursts, and an internal off gap; a single dominant burst or alternating probes no
+   longer qualify. New test: `TestHoldDetectorCadenceRequiresSimilarSameProbeBursts`.
+
+Verification after these fixes is recorded in `PROGRESS.md`; `make verify`, `make cover`,
+`-race -count=10` on the required packages, live-test compile/SKIP, lint, dependency and drift
+checks were re-run. No live test was run and no secret was read.

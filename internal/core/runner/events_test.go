@@ -229,3 +229,46 @@ func TestRunnerUsesAgentIVRDeadEndOutcome(t *testing.T) {
 		t.Errorf("hangup count = %d, want 1", telephony.session.hangups())
 	}
 }
+
+func TestRunnerControlOverflowNeverPersistsAValidOutcome(t *testing.T) {
+	order := testOrder()
+	store := newFakeStore(order)
+	session := newFakeSession()
+	ag := newFakeAgent(bookedOutcome(), nil)
+	ag.session = session
+	ag.onRun = func(_ context.Context, s *fakeSession) {
+		for i := 0; i < controlBuffer+5; i++ {
+			s.send(domain.CallEvent{Kind: domain.EventDTMF, DTMF: "1"})
+		}
+	}
+	r := testRunner(t, store, &fakeTelephony{session: session}, ag)
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Run(context.Background(), order.ID)
+		done <- err
+	}()
+	session.send(domain.CallEvent{Kind: domain.EventDialing})
+	session.send(domain.CallEvent{Kind: domain.EventRinging})
+	session.send(domain.CallEvent{Kind: domain.EventAnswered})
+	select {
+	case err := <-done:
+		if !errors.Is(err, errControlOverflow) {
+			t.Fatalf("err = %v, want errControlOverflow", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner did not return")
+	}
+	final, err := store.Get(context.Background(), order.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if final.Outcome == nil || final.Outcome.Kind != domain.OutcomeFailed || final.Outcome.FailReason != "error" {
+		t.Fatalf("a valid outcome was persisted after a control drop: %+v", final.Outcome)
+	}
+	if store.finishCount != 1 {
+		t.Errorf("finish count = %d, want 1", store.finishCount)
+	}
+	if session.hangups() != 1 {
+		t.Errorf("hangup count = %d, want 1", session.hangups())
+	}
+}

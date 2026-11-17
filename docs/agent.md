@@ -54,7 +54,8 @@ caller (test/future scheduler)   runner                        telephony / agent
   is mirrored there and the relay keeps draining until the adapter closes the channel.
 - **Control relay is bounded and ordered.** Post-answer `EventDTMF` and `EventPlaybackMark`
   go to a capacity-64 control channel in wire order. A full buffer records an overflow,
-  closes `control`, and fails the attempt — digits/marks are never silently dropped,
+  closes `control`, and fails the attempt — even if the agent races to an otherwise valid
+  outcome, the runner refuses to persist it. Digits/marks are never silently dropped,
   reordered, or placed behind a terminal event.
 - Pre-answer `EventDTMF` remains debug-logged; a pre-answer `EventPlaybackMark` is a
   provider-contract error (no core segment can have produced it).
@@ -113,8 +114,10 @@ C3's single TTS stream could not say which generated words were played. C4 split
 assistant text into bounded segments at `.?!`/newline, preferring a comma/semicolon/space
 before a hard split at 240 Unicode code points. Each segment gets its own `SpeechStream`,
 exact segment text, and an opaque core-generated marker. After the last `SendAudio` the
-speaker queues `MarkPlayback` and waits for the normalized provider mark. At most one
-segment awaits a mark; a 30 s ack timeout is a playback error.
+speaker queues `MarkPlayback` and waits for the normalized provider mark. A segment is
+confirmed only after at least one nonempty canonical frame was actually forwarded; a
+zero-audio provider result is a playback error that confirms no text and cannot unlock tools
+or an outcome. At most one segment awaits a mark; a 30 s ack timeout is a playback error.
 
 **A mark means provider playback reached that point — never that a person heard or
 understood it.** Only complete marked segments enter confirmed dialogue history; an
@@ -136,7 +139,8 @@ Barge-in sequence on confirmed assistant-state onset:
    audio → the existing bounded repeat behavior; no synthetic user text).
 
 Hold detection (`150`-frame / 3 s slate) distinguishes silence from tone holds (same strong
-probe in ≥120/150 frames, or a repeated cadence) and music-like audio (≥90% energy, <20%
+probe in ≥120/150 frames, or a cadence requiring the same dominant probe, at least two similar
+on-bursts, and an internal off gap) and music-like audio (≥90% energy, <20%
 speech-classified, low spectral variation, ≥2 stable peaks). On confirmed hold: clear
 playback, never open STT for hold audio, never send hold text to dialogue, keep processing
 DTMF/terminal events. Speech exits with pre-roll; 500 ms silence returns to listening; 90 s
@@ -155,9 +159,14 @@ normalizes German/English text and number words, then requires an explicit menu 
 adjacent to a **single** digit/`*`/`#` and an option purpose. Digits in dates, phone numbers,
 office hours, or ordinary speech are not options.
 
-- Appointment/reception targets (`termin`, `anmeldung`, `rezeption`, `ordination`,
-  `appointment`, `reception`, …) are sent only when exactly one target digit is present in
-  the **current** menu; ambiguous or unrelated/emergency-only menus press nothing.
+- The imperative and the digit's purpose must be scoped to the **same option**: hard
+  punctuation separates clauses, and within a coordinated clause each digit owns a
+  nearest-digit purpose segment. A purpose in a different clause (for example "Press 1 for
+  office hours; for appointments, stay on the line") cannot justify pressing that digit.
+- Appointment/reception targets (`termin`, `termine`, `terminvereinbarung`, `terminvergabe`,
+  `anmeldung`, `rezeption`, `ordination`, `appointment`, `reception`, …) are sent only when
+  exactly one target digit is present in the **current** menu; ambiguous or
+  unrelated/emergency-only menus press nothing.
 - One `SendDTMF` per menu evidence; the menu is cleared after success. The port accepting a
   digit is not proof the menu advanced.
 - Human speech without menu syntax exits IVR and goes through normal dialogue; an IVR-only
@@ -217,8 +226,11 @@ transfer**, and the prompt continues to say no handoff occurred.
 
 - Every STT/TTS/dialogue worker has one owner, bounded queues, and a joined cleanup. On
   exit the agent stops/cancels its audio workers first, then closes the dialogue session;
-  the runner shuts the control relay down afterwards. No channel is closed by both producer
-  and consumer.
+  each phase receives a fresh bounded cleanup budget created at exit (not a context created
+  at Run entry, which would already be expired after a long call). The runner shuts the
+  control relay down afterwards. No channel is closed by both producer and consumer. STT
+  end-of-input is ordered behind the bounded feed queue, so accepted audio is always drained
+  before `Close`.
 - Cleanup timeout is **35 s** so per-segment closes exceed C2's 15 s STT and 30 s realtime
   TTS final-drain limits. The interruption bound is a separate **2 s**; the runner's 5 s
   hangup/finalization timeout is unchanged.

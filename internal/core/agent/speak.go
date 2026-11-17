@@ -110,9 +110,10 @@ type segmentPlayer struct {
 	control *controlRouter
 	gen     uint64
 
-	mu        sync.Mutex
-	confirmed []string
-	spoke     bool
+	mu          sync.Mutex
+	confirmed   []string
+	spoke       bool
+	audioFrames int
 }
 
 func newSegmentPlayer(a *Agent, call AudioSession, pb *playbackState, control *controlRouter) *segmentPlayer {
@@ -149,6 +150,7 @@ func (p *segmentPlayer) play(ctx context.Context, text, marker string) error {
 	p.spoke = true
 	p.mu.Unlock()
 
+	before := p.playbackFrames()
 	drainDone := make(chan error, 1)
 	go p.drain(ctx, stream.Audio(), drainDone)
 
@@ -158,6 +160,12 @@ func (p *segmentPlayer) play(ctx context.Context, text, marker string) error {
 	// A barge/hold cancellation must not report unconfirmed text or ask for a mark.
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// Playback evidence requires at least one actually forwarded nonempty canonical frame.
+	// An empty provider synthesis must never unlock tool/outcome behavior or be recorded as
+	// spoken assistant text.
+	if p.playbackFrames() == before {
+		return errNoPlaybackAudio
 	}
 	if err := p.call.MarkPlayback(ctx, marker); err != nil {
 		if errors.Is(err, errTerminalDuringTurn) {
@@ -216,7 +224,9 @@ func (p *segmentPlayer) drain(ctx context.Context, audio <-chan domain.AudioChun
 			} else {
 				firstErr = fmt.Errorf("send audio: %w", err)
 			}
+			continue
 		}
+		p.notePlaybackFrame()
 	}
 	done <- firstErr
 }
@@ -253,6 +263,18 @@ func (p *segmentPlayer) confirmedSegments() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]string(nil), p.confirmed...)
+}
+
+func (p *segmentPlayer) notePlaybackFrame() {
+	p.mu.Lock()
+	p.audioFrames++
+	p.mu.Unlock()
+}
+
+func (p *segmentPlayer) playbackFrames() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.audioFrames
 }
 
 func (p *segmentPlayer) anySpoke() bool {

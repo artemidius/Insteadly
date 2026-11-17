@@ -287,21 +287,24 @@ func (a *Agent) Run(ctx context.Context, order domain.Order, call AudioSession,
 	}
 	st.tools = a.newToolExecutor(order, st.now)
 
-	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(runCtx), a.cfg.CleanupTimeout)
-	defer cancelCleanup()
-
 	hints := make([]string, 0, 1)
 	if name := strings.TrimSpace(order.Clinic.Name); name != "" {
 		hints = append(hints, name)
 	}
 	l := newListener(a, call, hints)
 	l.start()
-	// Worker cancellation/join happens before the dialogue session close below.
-	defer l.stop(cleanupCtx)
+	// Each cleanup phase gets a FRESH bounded budget at exit. A context created at Run
+	// entry would already be expired after a call longer than CleanupTimeout, letting the
+	// joined worker/dialogue cleanup be skipped.
 	defer func() {
 		if st.session != nil {
-			a.closeDialogue(cleanupCtx, st.session, order.ID)
+			a.closeDialogue(context.Background(), st.session, order.ID)
 		}
+	}()
+	defer func() {
+		cctx, cancel := context.WithTimeout(context.Background(), a.cfg.CleanupTimeout)
+		defer cancel()
+		l.stop(cctx)
 	}()
 
 	greet, err := a.greet(runCtx, call, l, st)
@@ -826,6 +829,9 @@ func (a *Agent) interruptFixed(ctx context.Context, call AudioSession, l *listen
 // holdLoop waits in the holding state: speech resumes an ordinary utterance, 500 ms of
 // silence returns to listening, and 90 s of continuous hold is failed/other.
 func (a *Agent) holdLoop(ctx context.Context, call AudioSession, l *listener, st *callState) (*domain.Outcome, error) {
+	// Confirmed hold is activity: it supersedes any post-digit IVR wait.
+	st.ivr.active = false
+	st.ivr.waitUntil = time.Time{}
 	l.setMode(modeHolding)
 	timer := time.NewTimer(a.cfg.Hold.MaxContinuous)
 	defer timer.Stop()

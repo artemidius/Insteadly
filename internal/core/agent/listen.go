@@ -57,10 +57,9 @@ type utteranceWorker struct {
 	hints    []string
 	cleanup  time.Duration
 	feed     chan []byte
-	end      chan struct{}
 	done     chan<- workerResult
 	discard  atomic.Bool
-	endOnce  sync.Once
+	feedOnce sync.Once
 }
 
 func newUtteranceWorker(stt ports.SpeechToText, language string, hints []string, cleanup time.Duration, done chan<- workerResult) *utteranceWorker {
@@ -70,14 +69,16 @@ func newUtteranceWorker(stt ports.SpeechToText, language string, hints []string,
 		hints:    hints,
 		cleanup:  cleanup,
 		feed:     make(chan []byte, audioFeedBuffer),
-		end:      make(chan struct{}),
 		done:     done,
 	}
 }
 
-// closeInput signals end-of-input exactly once.
+// closeInput signals end-of-input exactly once by closing the feed queue. Closing the
+// channel (rather than selecting a separate end signal) orders end-of-input behind every
+// already-accepted frame: a closed buffered channel still yields its buffered values before
+// the reader observes closure, so the worker always drains accepted audio before Close.
 func (w *utteranceWorker) closeInput() {
-	w.endOnce.Do(func() { close(w.end) })
+	w.feedOnce.Do(func() { close(w.feed) })
 }
 
 func (w *utteranceWorker) run(ctx context.Context) {
@@ -118,8 +119,6 @@ feed:
 				feedErr = fmt.Errorf("stt feed: %w", err)
 				break feed
 			}
-		case <-w.end:
-			break feed
 		case <-ctx.Done():
 			feedErr = ctx.Err()
 			break feed

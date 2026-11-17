@@ -214,3 +214,97 @@ func TestInboundDTMFIsEvidenceNotEcho(t *testing.T) {
 		t.Errorf("inbound DTMF was echoed back: %q", c.call.dtmf)
 	}
 }
+
+func TestIvrOfficeHoursMenuDoesNotPressAppointmentDigit(t *testing.T) {
+	// The appointment phrase belongs to a different, digit-less option clause; it must not
+	// supply the purpose for digit 1.
+	menu := "Press 1 for office hours; for appointments, stay on the line."
+	p := parseMenu(menu)
+	if !p.IsMenu {
+		t.Fatal("menu syntax not recognized")
+	}
+	if len(p.Targets) != 0 {
+		t.Fatalf("targets = %v, want none (wrong-digit hazard)", p.Targets)
+	}
+
+	cfg := testConfig(newFakeStore(testOrder()))
+	cfg.STT = &fakeSTT{scripts: []fakeSTTScript{
+		{finals: []string{menu}},
+		{finals: []string{menu}},
+	}}
+	cfg.Dialogue = textOnlyDialogue("x")
+	c := startConversation(t, cfg)
+	c.call.push(utteranceAudio()...)
+	time.Sleep(100 * time.Millisecond)
+	c.call.push(utteranceAudio()...)
+	outcome, err := resultOf(t, c.done)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if outcome.FailReason != "ivr_dead_end" {
+		t.Fatalf("outcome = %+v", outcome)
+	}
+	c.call.mu.Lock()
+	defer c.call.mu.Unlock()
+	if len(c.call.dtmf) != 0 {
+		t.Fatalf("office-hours menu pressed %q", c.call.dtmf)
+	}
+}
+
+func TestIvrOptionLocalPurposeSelectsOnlyTheMatchingDigit(t *testing.T) {
+	cases := map[string][]string{
+		"Drücken Sie 1 für Termine; für Rezepte drücken Sie 2.":    {"1"},
+		"Für Termine drücken Sie 1, für Rezepte drücken Sie 2.":    {"1"},
+		"Drücken Sie 1 für Rezepte; für Termine bleiben Sie dran.": nil,
+	}
+	for text, want := range cases {
+		p := parseMenu(text)
+		if !p.IsMenu {
+			t.Fatalf("%q: not recognized as a menu", text)
+		}
+		if len(p.Targets) != len(want) {
+			t.Fatalf("%q: targets = %v, want %v", text, p.Targets, want)
+		}
+		for i := range want {
+			if p.Targets[i] != want[i] {
+				t.Errorf("%q: target %d = %q, want %q", text, i, p.Targets[i], want[i])
+			}
+		}
+	}
+}
+
+func TestIvrHumanActivityCancelsPostDigitTimeout(t *testing.T) {
+	cfg := testConfig(newFakeStore(testOrder()))
+	cfg.STT = &fakeSTT{scripts: []fakeSTTScript{
+		{finals: []string{"Drücken Sie die 1 für Termine."}},
+		{finals: []string{"Ich habe noch eine Frage."}},
+	}}
+	dlg := textOnlyDialogue("Gerne.")
+	cfg.Dialogue = dlg
+	cfg.IVRWaitTimeout = 60 * time.Millisecond
+	c := startConversation(t, cfg)
+	c.call.push(utteranceAudio()...)
+	waitFor(t, "digit sent", func() bool {
+		c.call.mu.Lock()
+		defer c.call.mu.Unlock()
+		return len(c.call.dtmf) == 1
+	})
+	// A human final arrives well inside the post-digit window and enters dialogue.
+	c.call.push(utteranceAudio()...)
+	waitFor(t, "human turn answered", func() bool {
+		dlg.mu.Lock()
+		defer dlg.mu.Unlock()
+		return len(dlg.texts) == 1
+	})
+	// Wait past the original IVR deadline: the stale timer must not fire a dead end.
+	time.Sleep(150 * time.Millisecond)
+	select {
+	case r := <-c.done:
+		t.Fatalf("stale IVR timeout fired after a human turn: outcome=%+v err=%v", r.outcome, r.err)
+	default:
+	}
+	close(c.ended)
+	if _, err := resultOf(t, c.done); !errors.Is(err, ErrCallEnded) {
+		t.Fatalf("err = %v", err)
+	}
+}

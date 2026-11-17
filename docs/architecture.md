@@ -222,7 +222,8 @@ local Hangup reason (`EndAborted`); otherwise a fixed fallback maps the terminal
 `EndReason`/provider error to `aborted` or `failed/{busy,no_answer,rejected,ivr_dead_end,
 error,other}`. Post-answer `EventDTMF`/`EventPlaybackMark` are relayed on a separate
 capacity-64 control channel; overflow closes it and fails the attempt rather than silently
-losing a digit or mark. The terminal `EventEnded` signal stays capacity-one and independent.
+losing a digit or mark — even if the agent raced to a valid outcome, the runner checks the
+relay error and refuses to persist it. The terminal `EventEnded` signal stays capacity-one and independent.
 `Runner.Run` is synchronous; `Runner.Close` rejects new runs, cancels and waits for active
 calls, and `cmd/insteadly` drains it before `http.Server.Shutdown`.
 

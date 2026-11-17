@@ -67,6 +67,9 @@ var (
 	// errPlaybackAckTimeout means a provider playback mark did not arrive in time. The
 	// segment is not treated as confirmed speech.
 	errPlaybackAckTimeout = errors.New("agent: playback acknowledgement timeout")
+	// errNoPlaybackAudio means a segment produced no nonempty canonical audio. Text is never
+	// confirmed as spoken without audible playback evidence.
+	errNoPlaybackAudio = errors.New("agent: segment produced no playback audio")
 	// errOutcomeRecoveryExhausted means the per-call outcome-recovery budget was spent.
 	errOutcomeRecoveryExhausted = errors.New("agent: outcome recovery budget exhausted")
 	// errTerminalDuringTurn means a terminal call event won while a turn was in flight.

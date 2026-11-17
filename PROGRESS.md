@@ -119,6 +119,34 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
   wall-clock IVR wait; hold classification in assistant mode; Twilio ordered item queue;
   recovery always rolls back before control; music-hold synthetic fixture; unchanged
   config/API/module surfaces). No live test was run and no secret was read.
+- **Post-review corrections (PR #6 review):** fixed all five blockers and both contract
+  gaps — (1) STT end-of-input now closes the feed channel so every already-accepted frame
+  is drained before `Close`; (2) IVR purpose/imperative evidence is option-local
+  (hard-punctuation clauses + nearest-digit partitions; `terminvergabe` added); (3) human
+  speech and confirmed hold clear the post-digit IVR wait; (4) the runner fails on
+  control-relay overflow even if the agent raced to a valid outcome; (5) a segment is
+  confirmed only after at least one nonempty canonical frame was sent (`errNoPlaybackAudio`
+  otherwise); (6) listener/dialogue cleanup gets a fresh bounded budget at Run exit; (7)
+  hold cadence requires the same dominant probe, two similar on-bursts, and an internal off
+  gap. New regression tests:
+  `TestUtteranceWorkerDrainsQueuedFramesBeforeClose`,
+  `TestUtteranceWorkerSlowFeedStillDrainsAcceptedFrames`,
+  `TestListenerDelayedHandshakeDrainsEveryAcceptedFrame`,
+  `TestIvrOfficeHoursMenuDoesNotPressAppointmentDigit`,
+  `TestIvrOptionLocalPurposeSelectsOnlyTheMatchingDigit`,
+  `TestIvrHumanActivityCancelsPostDigitTimeout`,
+  `TestRunnerControlOverflowNeverPersistsAValidOutcome`,
+  `TestPlayerRequiresNonemptyPlaybackAudio`,
+  `TestRunSilentSynthesisDoesNotUnlockTools`,
+  `TestRunCleanupBudgetIsFreshAtExit`,
+  `TestHoldDetectorCadenceRequiresSimilarSameProbeBursts`. The previously observed M0
+  integration drop was stress-run `-race -count=100` (PASS) and listener feed/end races
+  `-race -count=100` (PASS). Dated details are in `plans/05-conversation.md` §13.
+- **Post-fix verification (observed):** `make verify` PASS; `make cover` total **87.5 %**
+  (agent 89.6 %, runner 94.1 %, Twilio 83.7 %, dialogue 89.2 %, tts 87.9 %, app 81.4 %);
+  required `-race -count=10` PASS (agent 112.2 s, app 15.0 s, others 2.4–5.8 s); live M1
+  tests SKIP/SKIP; `go vet -tags live ./...` clean; golangci-lint v2.15.0 **0 issues**;
+  `go.mod`/`go.sum`, config/httpapi/api drift, and `git diff --check` unchanged/clean.
 - **Status:** C4 → 🔵 code complete pending the conductor's `make live-test-m1` no-phone
   gate. Real-phone M1 remains blocked by the Twilio trial/outbound-DTMF/controlled
   IVR+hold prerequisites; C1 and the real-phone M0 exit remain blocked as before.

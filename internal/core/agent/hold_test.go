@@ -206,3 +206,48 @@ func TestHoldDuringAssistantCancelsPlaybackAndClears(t *testing.T) {
 	close(c.ended)
 	_, _ = resultOf(t, c.done)
 }
+
+func TestHoldDetectorCadenceRequiresSimilarSameProbeBursts(t *testing.T) {
+	observe := func(list [][]byte) (confirmed bool) {
+		t.Helper()
+		h := newHoldDetector(testHoldConfig())
+		for _, f := range analyzeFrames(t, list) {
+			_, c := h.observe(f, false, true)
+			confirmed = confirmed || c
+		}
+		return confirmed
+	}
+
+	// Equal same-probe bursts are a real cadence.
+	equal := flatten(
+		frames(20, toneFrame(440, 12000)),
+		frames(5, silenceFrame()),
+		frames(20, toneFrame(440, 12000)),
+		frames(105, silenceFrame()),
+	)
+	if !observe(equal) {
+		t.Fatal("similar same-probe cadence was not detected")
+	}
+
+	// Wildly unequal bursts with the same total tone count are not a cadence.
+	unequal := flatten(
+		frames(5, toneFrame(440, 12000)),
+		frames(2, silenceFrame()),
+		frames(35, toneFrame(440, 12000)),
+		frames(108, silenceFrame()),
+	)
+	if observe(unequal) {
+		t.Fatal("unequal single-dominant burst was misclassified as cadence")
+	}
+
+	// Alternating different probes are not a same-probe cadence.
+	mixed := flatten(
+		frames(20, toneFrame(350, 12000)),
+		frames(5, silenceFrame()),
+		frames(20, toneFrame(440, 12000)),
+		frames(105, silenceFrame()),
+	)
+	if observe(mixed) {
+		t.Fatal("mixed-probe tone sequence was misclassified as cadence")
+	}
+}

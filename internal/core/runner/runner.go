@@ -229,6 +229,14 @@ preAgent:
 	cancelWait()
 	relay.shutdown()
 
+	// A dropped DTMF/mark is never a silent success: even if the agent raced to a valid
+	// outcome, the runner refuses to persist a navigation/reconciliation result after a
+	// control relay overflow.
+	if cerr := relay.controlError(); cerr != nil {
+		final, finErr := r.persist(callerCtx, id, failedOutcome("error", detailControlLost), state.order)
+		return final, errors.Join(cerr, finErr)
+	}
+
 	terminal, haveTerminal := relay.terminal()
 	providerErr := relay.providerError()
 

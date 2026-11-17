@@ -73,7 +73,10 @@ func TestSegmenterBoundedAt240Runes(t *testing.T) {
 
 func playerFixture(t *testing.T, cfg Config) (*Agent, *segmentPlayer, *fakeCall, *fakeTTS, *controlRouter) {
 	t.Helper()
-	tts := &fakeTTS{}
+	tts, ok := cfg.TTS.(*fakeTTS)
+	if !ok {
+		tts = &fakeTTS{}
+	}
 	cfg.TTS = tts
 	if cfg.PlaybackAckTimeout == 0 {
 		cfg.PlaybackAckTimeout = time.Second
@@ -216,5 +219,24 @@ func TestSpeakerStreamsEachSegmentWithItsOwnMark(t *testing.T) {
 	call.mu.Unlock()
 	if len(marks) != 2 || marks[0] == marks[1] {
 		t.Errorf("marks = %q, want two unique IDs", marks)
+	}
+}
+
+func TestPlayerRequiresNonemptyPlaybackAudio(t *testing.T) {
+	cfg := testConfig(newFakeStore())
+	tts := &fakeTTS{script: fakeTTSScript{suppressText: "Stummer Satz."}}
+	cfg.TTS = tts
+	_, p, call, _, _ := playerFixture(t, cfg)
+	err := p.play(context.Background(), "Stummer Satz.", "m1")
+	if !errors.Is(err, errNoPlaybackAudio) {
+		t.Fatalf("err = %v, want errNoPlaybackAudio", err)
+	}
+	if got := p.confirmedText(); got != "" {
+		t.Fatalf("empty synthesis was recorded as confirmed: %q", got)
+	}
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	if len(call.marks) != 0 {
+		t.Errorf("empty synthesis requested a playback mark: %q", call.marks)
 	}
 }

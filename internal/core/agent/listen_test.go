@@ -178,3 +178,124 @@ func TestListenerStopJoinsWorkers(t *testing.T) {
 	}
 	_ = domain.FrameBytes
 }
+
+func TestUtteranceWorkerDrainsQueuedFramesBeforeClose(t *testing.T) {
+	gate := make(chan struct{})
+	stt := &fakeSTT{openGate: gate, script: fakeSTTScript{finals: []string{"fertig"}}}
+	done := make(chan workerResult, 1)
+	w := newUtteranceWorker(stt, "de-AT", nil, time.Second, done)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.run(ctx)
+
+	// The handshake is deliberately delayed while the whole utterance is accepted into the
+	// bounded queue; end-of-input follows every accepted frame.
+	const n = 50
+	for i := 0; i < n; i++ {
+		w.feed <- speechFrame(i)
+	}
+	w.closeInput()
+	time.Sleep(20 * time.Millisecond)
+	stt.mu.Lock()
+	openedFeeds := len(stt.feeds)
+	stt.mu.Unlock()
+	if openedFeeds != 0 {
+		t.Fatalf("worker fed audio before the handshake completed: %d", openedFeeds)
+	}
+	close(gate)
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("worker: %v", res.err)
+		}
+		if res.text != "fertig" {
+			t.Fatalf("text = %q", res.text)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker did not finish")
+	}
+	stt.mu.Lock()
+	defer stt.mu.Unlock()
+	if len(stt.feeds) != n {
+		t.Fatalf("feeds = %d, want all %d accepted frames before Close", len(stt.feeds), n)
+	}
+	for i := 0; i < n; i++ {
+		if hex.EncodeToString(stt.feeds[i]) != hex.EncodeToString(speechFrame(i)) {
+			t.Fatalf("feed %d was lost or reordered", i)
+		}
+	}
+}
+
+func TestUtteranceWorkerSlowFeedStillDrainsAcceptedFrames(t *testing.T) {
+	stt := &fakeSTT{feedDelay: time.Millisecond, script: fakeSTTScript{finals: []string{"ok"}}}
+	done := make(chan workerResult, 1)
+	w := newUtteranceWorker(stt, "de-AT", nil, 2*time.Second, done)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.run(ctx)
+	const n = 40
+	for i := 0; i < n; i++ {
+		w.feed <- speechFrame(i)
+	}
+	w.closeInput()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("worker: %v", res.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker did not finish")
+	}
+	stt.mu.Lock()
+	defer stt.mu.Unlock()
+	if len(stt.feeds) != n {
+		t.Fatalf("feeds = %d, want %d", len(stt.feeds), n)
+	}
+}
+
+func TestListenerDelayedHandshakeDrainsEveryAcceptedFrame(t *testing.T) {
+	gate := make(chan struct{})
+	stt := &fakeSTT{openGate: gate, script: fakeSTTScript{finals: []string{"spaet"}}}
+	l, call := startTestListener(t, stt)
+	l.setMode(modeListening)
+
+	// 57 frames are accepted (15 pre-roll + 7 remaining speech + 35 hangover), below the
+	// bounded 64-frame worker queue, so the delayed handshake must drain all of them.
+	inbound := flatten(frames(15, silenceFrame()), speechFrames(10), frames(35, silenceFrame()))
+	call.push(inbound...)
+	// The VAD has ended the utterance and closed the worker's input before the handshake
+	// completes; release it only after the listener had time to enqueue everything.
+	time.Sleep(30 * time.Millisecond)
+	close(gate)
+	res := waitResult(t, l)
+	if res.text != "spaet" {
+		t.Fatalf("text = %q", res.text)
+	}
+	stt.mu.Lock()
+	defer stt.mu.Unlock()
+	if len(stt.feeds) < 35 {
+		t.Fatalf("feeds = %d, want the hangover frames at minimum", len(stt.feeds))
+	}
+	// All accepted audio must be one contiguous ordered window ending at the final frame.
+	want := inbound[len(inbound)-1]
+	if hex.EncodeToString(stt.feeds[len(stt.feeds)-1]) != hex.EncodeToString(want) {
+		t.Fatal("the final accepted frame was dropped before STT Close")
+	}
+	start := -1
+	for i := 0; i+len(stt.feeds) <= len(inbound); i++ {
+		match := true
+		for j := range stt.feeds {
+			if hex.EncodeToString(stt.feeds[j]) != hex.EncodeToString(inbound[i+j]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatal("fed audio is not a contiguous ordered inbound window")
+	}
+}

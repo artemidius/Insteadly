@@ -116,11 +116,24 @@ type fakeSTT struct {
 	opts     []ports.StreamOptions
 	streams  []*fakeTranscriptionStream
 	closeCtx []error
+
+	openGate  <-chan struct{}
+	feedDelay time.Duration
 }
 
 func (f *fakeSTT) TranscribeStream(ctx context.Context, opts ports.StreamOptions) (ports.TranscriptionStream, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	f.mu.Lock()
+	gate := f.openGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -155,9 +168,20 @@ func (s *fakeTranscriptionStream) Feed(ctx context.Context, chunk domain.AudioCh
 		return err
 	}
 	s.owner.mu.Lock()
+	delay := s.owner.feedDelay
+	feedErr := s.script.feedErr
+	s.owner.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	s.owner.mu.Lock()
 	defer s.owner.mu.Unlock()
-	if s.script.feedErr != nil {
-		return s.script.feedErr
+	if feedErr != nil {
+		return feedErr
 	}
 	s.owner.feeds = append(s.owner.feeds, append([]byte(nil), chunk.Data...))
 	if s.script.partialOnFeed != "" {
@@ -194,11 +218,12 @@ func (s *fakeTranscriptionStream) Close(ctx context.Context) error {
 // --- TTS fake -------------------------------------------------------------------
 
 type fakeTTSScript struct {
-	openErr   error
-	feedErr   error
-	closeErr  error
-	offline   bool
-	chunkSize int
+	openErr      error
+	feedErr      error
+	closeErr     error
+	offline      bool
+	chunkSize    int
+	suppressText string // emit no audio for exactly this text
 }
 
 type fakeTTS struct {
@@ -256,6 +281,9 @@ func (s *fakeSpeechStream) FeedText(ctx context.Context, text string) error {
 		s.buffer = append(s.buffer, text)
 		return nil
 	}
+	if script.suppressText != "" && text == script.suppressText {
+		return nil
+	}
 	s.emit()
 	return nil
 }
@@ -289,7 +317,10 @@ func (s *fakeSpeechStream) Close(ctx context.Context) error {
 		script := s.owner.script
 		s.owner.mu.Unlock()
 		if script.offline {
-			for range s.buffer {
+			for _, text := range s.buffer {
+				if script.suppressText != "" && text == script.suppressText {
+					continue
+				}
 				s.emit()
 			}
 		}
@@ -462,16 +493,17 @@ type turnScript struct {
 }
 
 type fakeDialogue struct {
-	mu         sync.Mutex
-	scripts    []turnScript
-	requests   []ports.SessionRequest
-	opens      int
-	closed     int
-	texts      []string
-	results    [][]ports.ToolResult
-	interrupts []string
-	controls   []string
-	failOpen   error
+	mu          sync.Mutex
+	scripts     []turnScript
+	requests    []ports.SessionRequest
+	opens       int
+	closed      int
+	texts       []string
+	results     [][]ports.ToolResult
+	interrupts  []string
+	controls    []string
+	closeCtxErr error
+	failOpen    error
 }
 
 func (d *fakeDialogue) NewSession(ctx context.Context, req ports.SessionRequest) (ports.DialogueSession, error) {
@@ -549,10 +581,11 @@ func (s *fakeDialogueSession) SendControl(ctx context.Context, instruction strin
 	return s.next("control")
 }
 
-func (s *fakeDialogueSession) Close(context.Context) error {
+func (s *fakeDialogueSession) Close(ctx context.Context) error {
 	s.owner.mu.Lock()
 	defer s.owner.mu.Unlock()
 	s.owner.closed++
+	s.owner.closeCtxErr = ctx.Err()
 	return nil
 }
 

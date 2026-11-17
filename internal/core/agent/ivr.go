@@ -22,7 +22,7 @@ var (
 		"press": true, "dial": true, "taste": true, "tippen": true, "geben": true,
 	}
 	menuTargets = map[string]bool{
-		"termin": true, "termine": true, "terminvereinbarung": true, "anmeldung": true,
+		"termin": true, "termine": true, "terminvereinbarung": true, "terminvergabe": true, "anmeldung": true,
 		"rezeption": true, "ordination": true, "appointment": true, "appointments": true,
 		"reception": true, "booking": true,
 	}
@@ -77,33 +77,14 @@ func parseMenu(text string) menuParse {
 		strings.Contains(norm, "no option") ||
 		strings.Contains(norm, "no route")
 
-	tokens := strings.Fields(norm)
-	for i, tok := range tokens {
-		if !isMenuDigit(tok) {
+	for _, clause := range splitMenuClauses(strings.Fields(norm)) {
+		if !containsAny(clause, menuImperatives) {
 			continue
 		}
-		lo := i - 8
-		if lo < 0 {
-			lo = 0
+		for _, opt := range clauseOptions(clause) {
+			p.Options = append(p.Options, opt)
+			p.IsMenu = true
 		}
-		hi := i + 8
-		if hi > len(tokens) {
-			hi = len(tokens)
-		}
-		window := tokens[lo:hi]
-		if !containsAny(window, menuImperatives) {
-			continue
-		}
-		digit := tok
-		if mapped, ok := menuNumberWords[tok]; ok {
-			digit = mapped
-		}
-		opt := menuOption{Digit: digit}
-		if containsAny(window, menuTargets) && !containsAny(window, menuExclusions) {
-			opt.Target = true
-		}
-		p.Options = append(p.Options, opt)
-		p.IsMenu = true
 	}
 	if !p.IsMenu {
 		return p
@@ -117,6 +98,75 @@ func parseMenu(text string) menuParse {
 	}
 	p.Ambiguous = len(p.Targets) > 1
 	return p
+}
+
+// splitMenuClauses breaks a normalized menu on hard punctuation. Coordinating words such as
+// "oder"/"or" stay in the clause so an imperative may be shared, while each digit's purpose
+// is still scoped to its own nearest-digit segment by clauseOptions.
+func splitMenuClauses(tokens []string) [][]string {
+	var clauses [][]string
+	var cur []string
+	for _, tok := range tokens {
+		if tok == "|" {
+			if len(cur) > 0 {
+				clauses = append(clauses, cur)
+				cur = nil
+			}
+			continue
+		}
+		cur = append(cur, tok)
+	}
+	if len(cur) > 0 {
+		clauses = append(clauses, cur)
+	}
+	return clauses
+}
+
+// clauseOptions partitions a clause's tokens by nearest digit so each option's purpose is
+// local: in "press 1 for office hours or 2 for appointments" the words around "1" cannot
+// supply the purpose for "2". The clause-level imperative check remains shared, which is
+// how coordinated menus ("drücken Sie 1 für Termine oder 2 für …") are expressed.
+func clauseOptions(clause []string) []menuOption {
+	var digitIdx []int
+	for i, tok := range clause {
+		if isMenuDigit(tok) {
+			digitIdx = append(digitIdx, i)
+		}
+	}
+	if len(digitIdx) == 0 {
+		return nil
+	}
+	opts := make([]menuOption, 0, len(digitIdx))
+	for k, idx := range digitIdx {
+		start := 0
+		if k > 0 {
+			start = (digitIdx[k-1]+idx)/2 + 1
+		}
+		end := len(clause) - 1
+		if k < len(digitIdx)-1 {
+			end = (idx + digitIdx[k+1]) / 2
+		}
+		if start < 0 {
+			start = 0
+		}
+		if end >= len(clause) {
+			end = len(clause) - 1
+		}
+		if start > idx || end < idx {
+			continue
+		}
+		seg := clause[start : end+1]
+		digit := clause[idx]
+		if mapped, ok := menuNumberWords[digit]; ok && len(mapped) == 1 {
+			digit = mapped
+		}
+		opt := menuOption{Digit: digit}
+		if containsAny(seg, menuTargets) && !containsAny(seg, menuExclusions) {
+			opt.Target = true
+		}
+		opts = append(opts, opt)
+	}
+	return opts
 }
 
 func normalizeMenuText(text string) string {
@@ -136,6 +186,8 @@ func normalizeMenuText(text string) string {
 			b.WriteByte(' ')
 			b.WriteRune(r)
 			b.WriteByte(' ')
+		case '.', ',', ';', ':', '!', '?', '|', '\n':
+			b.WriteString(" | ")
 		default:
 			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
 				b.WriteRune(r)
@@ -195,7 +247,10 @@ type ivrState struct {
 func (a *Agent) handleMenuTranscript(ctx context.Context, call AudioSession, st *callState, text string) (bool, *domain.Outcome, error) {
 	p := parseMenu(text)
 	if !p.IsMenu {
+		// Human speech exits IVR mode and must also cancel the post-digit timeout: the
+		// caller is now in ordinary dialogue, so a stale menu timer cannot force a dead end.
 		st.ivr.active = false
+		st.ivr.waitUntil = time.Time{}
 		return false, nil, nil
 	}
 	st.ivr.active = true
