@@ -17,6 +17,7 @@ import (
 	"github.com/artemidius/insteadly/internal/core/domain"
 	"github.com/artemidius/insteadly/internal/core/events"
 	"github.com/artemidius/insteadly/internal/core/ports"
+	"github.com/artemidius/insteadly/internal/core/recorder"
 )
 
 // ErrClosed is returned by Run after the runner has been closed.
@@ -40,6 +41,12 @@ type Config struct {
 	// persisted status change (dialing, ringing, in_call, finished). A nil publisher
 	// is a no-op, so neither tests nor non-orchestrated callers need a hub.
 	Events events.Publisher
+
+	// Recorder is optional: when set, the dialed session is wrapped exactly once so the
+	// recording flags can capture audio. A nil recorder (the default) is today's
+	// behavior, and a recorder whose resolved flags are off returns the session
+	// unchanged.
+	Recorder recorder.Recorder
 
 	CallTimeout      time.Duration
 	CleanupTimeout   time.Duration
@@ -143,6 +150,13 @@ func (r *Runner) Run(callerCtx context.Context, id domain.OrderID) (domain.Order
 		}
 		final, finErr := r.persist(callerCtx, id, outcome, claimed)
 		return final, errors.Join(runErr, finErr)
+	}
+
+	// The single recording seam: wrap the dialed session once, after a successful Dial
+	// and before the pre-agent loop. With no recorder, or flags resolving to no capture,
+	// the session is returned unchanged and behavior is byte-for-byte identical.
+	if r.cfg.Recorder != nil {
+		session = r.cfg.Recorder.Wrap(session, claimed)
 	}
 
 	hangup := r.newHangup(callerCtx, session)
