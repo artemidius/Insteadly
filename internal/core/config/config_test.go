@@ -155,14 +155,18 @@ func TestMalformedDotEnvLine(t *testing.T) {
 
 func TestSummaryContainsNoSecrets(t *testing.T) {
 	const (
-		sid   = "AC-super-secret-sid"
-		token = "super-secret-token"
-		key   = "sk-super-secret-key"
+		sid    = "AC-super-secret-sid"
+		token  = "super-secret-token"
+		key    = "sk-super-secret-key"
+		dsn    = "postgres://insteadly:super-secret-dsn-password@db.example.test:5432/insteadly"
+		apiKey = "super-secret-api-key"
 	)
 	cfg, err := load("", []string{
 		"INSTEADLY_TWILIO_ACCOUNT_SID=" + sid,
 		"INSTEADLY_TWILIO_AUTH_TOKEN=" + token,
 		"INSTEADLY_MISTRAL_API_KEY=" + key,
+		"INSTEADLY_POSTGRES_DSN=" + dsn,
+		"INSTEADLY_API_KEY=" + apiKey,
 	})
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -178,6 +182,10 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 		"mistral.api_base_url", "mistral.stt.realtime_model", "mistral.stt.batch_model",
 		"mistral.stt.streaming_delay_ms", "mistral.tts.model", "mistral.tts.voice",
 		"mistral.tts.mode", "mistral.dialogue.model",
+		"postgres.dsn", "scheduler.enabled", "scheduler.tick", "scheduler.max_attempts",
+		"scheduler.max_concurrent", "scheduler.lease", "scheduler.busy_backoff",
+		"scheduler.no_answer_backoff", "scheduler.error_backoff", "scheduler.windows",
+		"api.idempotency_ttl",
 	}
 	for _, k := range wantKeys {
 		if _, ok := summary[k]; !ok {
@@ -194,20 +202,24 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 			t.Errorf("summary key %q looks like a secret field", k)
 		}
 		str, _ := v.(string)
-		for _, secret := range []string{sid, token, key} {
+		for _, secret := range []string{sid, token, key, dsn, apiKey, "super-secret-dsn-password"} {
 			if strings.Contains(str, secret) {
 				t.Errorf("summary key %q leaks a secret value", k)
 			}
 		}
 	}
 
+	if got := summary["postgres.dsn"]; got != "<redacted>" {
+		t.Errorf("postgres.dsn = %v, want <redacted>", got)
+	}
 	// The secret flag in the registry is what documents which names are sensitive;
 	// make sure the test suite actually covers those entries.
 	for name, s := range registry {
 		if !s.secret {
 			continue
 		}
-		if !strings.Contains(name, "SID") && !strings.Contains(name, "TOKEN") && !strings.Contains(name, "KEY") {
+		if !strings.Contains(name, "SID") && !strings.Contains(name, "TOKEN") &&
+			!strings.Contains(name, "KEY") && !strings.Contains(name, "DSN") {
 			t.Errorf("registry entry %q is marked secret but its name does not look secret", name)
 		}
 	}
@@ -531,5 +543,121 @@ func TestUnprefixedMistralKeyIgnored(t *testing.T) {
 	}
 	if cfg.Mistral.APIKey != "" {
 		t.Error("unprefixed MISTRAL_API_KEY must not be read into app config")
+	}
+}
+
+func TestSchedulerDefaults(t *testing.T) {
+	cfg, err := load("", nil)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	s := cfg.Scheduler
+	if !s.Enabled {
+		t.Error("scheduler must default to enabled")
+	}
+	if s.Tick.Seconds() != 5 || s.MaxAttempts != 3 || s.MaxConcurrent != 8 || s.Lease.Minutes() != 2 {
+		t.Errorf("scheduler defaults = %+v", s)
+	}
+	if s.BusyBackoff.Minutes() != 15 || s.NoAnswerBackoff.Minutes() != 30 || s.ErrorBackoff.Minutes() != 5 {
+		t.Errorf("backoff defaults = %+v", s)
+	}
+	if s.WindowsJSON != DefaultSchedulerWindows {
+		t.Errorf("windows default = %q", s.WindowsJSON)
+	}
+	if cfg.API.IdempotencyTTL.Minutes() != 10 || cfg.API.Key != "" {
+		t.Errorf("api defaults = %+v", cfg.API)
+	}
+	if cfg.Storage.Provider != "local" || cfg.Storage.Postgres.DSN != "" {
+		t.Errorf("storage defaults = %+v", cfg.Storage)
+	}
+}
+
+func TestSchedulerEnvOverrides(t *testing.T) {
+	cfg, err := load("", []string{
+		"INSTEADLY_SCHEDULER_ENABLED=false",
+		"INSTEADLY_SCHEDULER_TICK=2s",
+		"INSTEADLY_SCHEDULER_MAX_ATTEMPTS=4",
+		"INSTEADLY_SCHEDULER_MAX_CONCURRENT=3",
+		"INSTEADLY_SCHEDULER_LEASE=90s",
+		"INSTEADLY_SCHEDULER_BUSY_BACKOFF=1m",
+		"INSTEADLY_SCHEDULER_NO_ANSWER_BACKOFF=2m",
+		"INSTEADLY_SCHEDULER_ERROR_BACKOFF=3m",
+		"INSTEADLY_SCHEDULER_WINDOWS=[{\"dow\":\"sat\",\"start\":\"10:00\",\"end\":\"12:00\"}]",
+		"INSTEADLY_API_IDEMPOTENCY_TTL=30s",
+		"INSTEADLY_API_KEY=dev-key",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	s := cfg.Scheduler
+	if s.Enabled || s.Tick.Seconds() != 2 || s.MaxAttempts != 4 || s.MaxConcurrent != 3 {
+		t.Errorf("scheduler = %+v", s)
+	}
+	if s.Lease.Seconds() != 90 || s.BusyBackoff.Minutes() != 1 || s.NoAnswerBackoff.Minutes() != 2 || s.ErrorBackoff.Minutes() != 3 {
+		t.Errorf("durations = %+v", s)
+	}
+	if !strings.Contains(s.WindowsJSON, "sat") {
+		t.Errorf("windows = %q", s.WindowsJSON)
+	}
+	if cfg.API.IdempotencyTTL.Seconds() != 30 || cfg.API.Key != "dev-key" {
+		t.Errorf("api = %+v", cfg.API)
+	}
+}
+
+func TestSchedulerValidation(t *testing.T) {
+	cases := map[string]string{
+		"zero tick":            "INSTEADLY_SCHEDULER_TICK=0s",
+		"negative tick":        "INSTEADLY_SCHEDULER_TICK=-1s",
+		"zero attempts":        "INSTEADLY_SCHEDULER_MAX_ATTEMPTS=0",
+		"zero concurrent":      "INSTEADLY_SCHEDULER_MAX_CONCURRENT=0",
+		"zero lease":           "INSTEADLY_SCHEDULER_LEASE=0s",
+		"zero busy backoff":    "INSTEADLY_SCHEDULER_BUSY_BACKOFF=0s",
+		"zero no-answer":       "INSTEADLY_SCHEDULER_NO_ANSWER_BACKOFF=0s",
+		"zero error backoff":   "INSTEADLY_SCHEDULER_ERROR_BACKOFF=0s",
+		"zero idempotency ttl": "INSTEADLY_API_IDEMPOTENCY_TTL=0s",
+		"bad duration":         "INSTEADLY_SCHEDULER_TICK=soon",
+		"invalid windows json": `INSTEADLY_SCHEDULER_WINDOWS=[{"dow":`,
+		"empty windows":        `INSTEADLY_SCHEDULER_WINDOWS=[]`,
+		"unknown dow":          `INSTEADLY_SCHEDULER_WINDOWS=[{"dow":"funday","start":"08:00","end":"18:00"}]`,
+		"bad start":            `INSTEADLY_SCHEDULER_WINDOWS=[{"dow":"mon","start":"8:00","end":"18:00"}]`,
+		"end after midnight":   `INSTEADLY_SCHEDULER_WINDOWS=[{"dow":"mon","start":"08:00","end":"24:00"}]`,
+		"start not before end": `INSTEADLY_SCHEDULER_WINDOWS=[{"dow":"mon","start":"18:00","end":"08:00"}]`,
+	}
+	for name, kv := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := load("", []string{kv}); err == nil {
+				t.Fatalf("expected validation error for %s", kv)
+			}
+		})
+	}
+}
+
+func TestPostgresProviderValidation(t *testing.T) {
+	_, err := load("", []string{"INSTEADLY_STORAGE_PROVIDER=postgres"})
+	if err == nil || !strings.Contains(err.Error(), "postgres.dsn") {
+		t.Fatalf("err = %v, want a postgres.dsn error", err)
+	}
+	cfg, err := load("", []string{
+		"INSTEADLY_STORAGE_PROVIDER=postgres",
+		"INSTEADLY_POSTGRES_DSN=  postgres://insteadly@localhost/insteadly  ",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Storage.Postgres.DSN != "postgres://insteadly@localhost/insteadly" {
+		t.Errorf("dsn = %q, want trimmed", cfg.Storage.Postgres.DSN)
+	}
+	if cfg.Storage.Local.Dir != "./data" {
+		t.Errorf("local dir = %q, want the blob host dir", cfg.Storage.Local.Dir)
+	}
+}
+
+func TestNoEnvStillBoots(t *testing.T) {
+	cfg, err := load("", nil)
+	if err != nil {
+		t.Fatalf("no-env load: %v", err)
+	}
+	if cfg.Storage.Provider != "local" || !cfg.Scheduler.Enabled || cfg.API.Key != "" {
+		t.Errorf("no-env config = %+v", cfg)
 	}
 }

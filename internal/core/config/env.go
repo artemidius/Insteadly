@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // envPrefix marks every variable Insteadly owns. Anything else in the environment
@@ -38,11 +39,41 @@ var registry = map[string]setter{
 	"INSTEADLY_TWILIO_RING_TIMEOUT_SECONDS": {
 		apply: intSetter(func(c *Config, v int) { c.Telephony.Twilio.RingTimeoutSeconds = v }),
 	},
-	"INSTEADLY_STT_PROVIDER":       {apply: strSetter(func(c *Config, v string) { c.STT.Provider = v })},
-	"INSTEADLY_TTS_PROVIDER":       {apply: strSetter(func(c *Config, v string) { c.TTS.Provider = v })},
-	"INSTEADLY_DIALOGUE_PROVIDER":  {apply: strSetter(func(c *Config, v string) { c.Dialogue.Provider = v })},
-	"INSTEADLY_STORAGE_PROVIDER":   {apply: strSetter(func(c *Config, v string) { c.Storage.Provider = v })},
-	"INSTEADLY_STORAGE_LOCAL_DIR":  {apply: strSetter(func(c *Config, v string) { c.Storage.Local.Dir = v })},
+	"INSTEADLY_STT_PROVIDER":      {apply: strSetter(func(c *Config, v string) { c.STT.Provider = v })},
+	"INSTEADLY_TTS_PROVIDER":      {apply: strSetter(func(c *Config, v string) { c.TTS.Provider = v })},
+	"INSTEADLY_DIALOGUE_PROVIDER": {apply: strSetter(func(c *Config, v string) { c.Dialogue.Provider = v })},
+	"INSTEADLY_STORAGE_PROVIDER":  {apply: strSetter(func(c *Config, v string) { c.Storage.Provider = v })},
+	"INSTEADLY_STORAGE_LOCAL_DIR": {apply: strSetter(func(c *Config, v string) { c.Storage.Local.Dir = v })},
+	"INSTEADLY_POSTGRES_DSN":      {apply: strSetter(func(c *Config, v string) { c.Storage.Postgres.DSN = v }), secret: true},
+	"INSTEADLY_SCHEDULER_ENABLED": {apply: boolSetter(func(c *Config, v bool) { c.Scheduler.Enabled = v })},
+	"INSTEADLY_SCHEDULER_TICK": {
+		apply: durationSetter(func(c *Config, v time.Duration) { c.Scheduler.Tick = v }),
+	},
+	"INSTEADLY_SCHEDULER_MAX_ATTEMPTS": {
+		apply: intSetter(func(c *Config, v int) { c.Scheduler.MaxAttempts = v }),
+	},
+	"INSTEADLY_SCHEDULER_MAX_CONCURRENT": {
+		apply: intSetter(func(c *Config, v int) { c.Scheduler.MaxConcurrent = v }),
+	},
+	"INSTEADLY_SCHEDULER_LEASE": {
+		apply: durationSetter(func(c *Config, v time.Duration) { c.Scheduler.Lease = v }),
+	},
+	"INSTEADLY_SCHEDULER_BUSY_BACKOFF": {
+		apply: durationSetter(func(c *Config, v time.Duration) { c.Scheduler.BusyBackoff = v }),
+	},
+	"INSTEADLY_SCHEDULER_NO_ANSWER_BACKOFF": {
+		apply: durationSetter(func(c *Config, v time.Duration) { c.Scheduler.NoAnswerBackoff = v }),
+	},
+	"INSTEADLY_SCHEDULER_ERROR_BACKOFF": {
+		apply: durationSetter(func(c *Config, v time.Duration) { c.Scheduler.ErrorBackoff = v }),
+	},
+	"INSTEADLY_SCHEDULER_WINDOWS": {
+		apply: strSetter(func(c *Config, v string) { c.Scheduler.WindowsJSON = v }),
+	},
+	"INSTEADLY_API_KEY": {apply: strSetter(func(c *Config, v string) { c.API.Key = v }), secret: true},
+	"INSTEADLY_API_IDEMPOTENCY_TTL": {
+		apply: durationSetter(func(c *Config, v time.Duration) { c.API.IdempotencyTTL = v }),
+	},
 	"INSTEADLY_RECORDING_ENABLED":  {apply: boolSetter(func(c *Config, v bool) { c.Recording.RecordingEnabled = v })},
 	"INSTEADLY_TRANSCRIPT_ENABLED": {apply: boolSetter(func(c *Config, v bool) { c.Recording.TranscriptEnabled = v })},
 	"INSTEADLY_AUDIO_ENABLED":      {apply: boolSetter(func(c *Config, v bool) { c.Recording.AudioEnabled = v })},
@@ -99,6 +130,17 @@ func intSetter(fn func(*Config, int)) func(*Config, string) error {
 	}
 }
 
+func durationSetter(fn func(*Config, time.Duration)) func(*Config, string) error {
+	return func(c *Config, v string) error {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("expected a duration like 5s or 2m, got %q", v)
+		}
+		fn(c, d)
+		return nil
+	}
+}
+
 func defaults() Config {
 	return Config{
 		HTTP:      HTTP{Addr: "127.0.0.1:8080"},
@@ -107,6 +149,18 @@ func defaults() Config {
 		TTS:       TTS{Provider: "stub"},
 		Dialogue:  Dialogue{Provider: "stub"},
 		Storage:   Storage{Provider: "local", Local: Local{Dir: "./data"}},
+		Scheduler: Scheduler{
+			Enabled:         true,
+			Tick:            5 * time.Second,
+			MaxAttempts:     3,
+			MaxConcurrent:   8,
+			Lease:           2 * time.Minute,
+			BusyBackoff:     15 * time.Minute,
+			NoAnswerBackoff: 30 * time.Minute,
+			ErrorBackoff:    5 * time.Minute,
+			WindowsJSON:     DefaultSchedulerWindows,
+		},
+		API: API{IdempotencyTTL: 10 * time.Minute},
 		Mistral: Mistral{
 			BaseURL: "https://api.mistral.ai",
 			STT: MistralSTT{
@@ -146,6 +200,9 @@ func load(path string, environ []string) (Config, error) {
 	// webhook URLs into "https://host//webhooks/...". Normalize once, before validation.
 	c.HTTP.PublicURL = strings.TrimRight(c.HTTP.PublicURL, "/")
 	c.Mistral.BaseURL = strings.TrimRight(strings.TrimSpace(c.Mistral.BaseURL), "/")
+	// Config only trims the DSN; parsing/validating it belongs to the adapter, keeping
+	// this package free of pgx.
+	c.Storage.Postgres.DSN = strings.TrimSpace(c.Storage.Postgres.DSN)
 	if err := c.Validate(); err != nil {
 		return c, err
 	}
