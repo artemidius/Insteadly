@@ -6,9 +6,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	dialoguemistral "github.com/artemidius/insteadly/internal/adapters/dialogue/mistral"
+	"github.com/artemidius/insteadly/internal/adapters/password/bcrypt"
+	paymentsstripe "github.com/artemidius/insteadly/internal/adapters/payments/stripe"
+	paymentsstub "github.com/artemidius/insteadly/internal/adapters/payments/stub"
 	"github.com/artemidius/insteadly/internal/adapters/storage/local"
 	"github.com/artemidius/insteadly/internal/adapters/storage/postgres"
 	sttmistral "github.com/artemidius/insteadly/internal/adapters/stt/mistral"
@@ -22,35 +26,35 @@ import (
 // Each builder is one switch: adding a provider means one new case and one adapter
 // package, never a core edit (DESIGN.md §2.3).
 
-// buildStorage returns the order/blob storage, the scheduler store, and a closer for the
-// durable handle. In postgres mode blobs stay on the local adapter (C5 does not build a
-// Postgres blob store), so Local.Dir remains required.
-func buildStorage(ctx context.Context, c config.Storage, log *slog.Logger) (ports.Storage, ports.SchedulerStore, io.Closer, error) {
+// buildStorage returns the order/blob storage, the scheduler store, the auth store, and a
+// closer for the durable handle. In postgres mode blobs stay on the local adapter (C5 does
+// not build a Postgres blob store), so Local.Dir remains required.
+func buildStorage(ctx context.Context, c config.Storage, log *slog.Logger) (ports.Storage, ports.SchedulerStore, ports.AuthStore, io.Closer, error) {
 	switch c.Provider {
 	case "local":
 		store, err := local.New(c.Local.Dir)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
-		return store, store, nopCloser{}, nil
+		return store, store, store, nopCloser{}, nil
 	case "postgres":
 		blobs, err := local.New(c.Local.Dir)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		openCtx, cancel := context.WithTimeout(ctx, storageOpenTimeout)
 		defer cancel()
 		store, err := postgres.New(openCtx, postgres.Config{DSN: c.Postgres.DSN, Logger: log})
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		if err := store.Migrate(openCtx); err != nil {
 			_ = store.Close()
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
-		return compositeStorage{orders: store, blobs: blobs}, store, store, nil
+		return compositeStorage{orders: store, blobs: blobs}, store, store, store, nil
 	default:
-		return nil, nil, nil, fmt.Errorf("unknown provider %q", c.Provider)
+		return nil, nil, nil, nil, fmt.Errorf("unknown provider %q", c.Provider)
 	}
 }
 
@@ -148,6 +152,51 @@ func buildDialogue(c config.Dialogue, mistral config.Mistral, log *slog.Logger) 
 			BaseURL: mistral.BaseURL,
 			Model:   mistral.Dialogue.Model,
 			Logger:  log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return adapter, nil
+	default:
+		return nil, fmt.Errorf("unknown provider %q", c.Provider)
+	}
+}
+
+// buildPasswordHasher selects the password hasher. bcrypt lives in the adapter layer; the
+// core auth service only sees ports.PasswordHasher. A zero cost means the default (12).
+func buildPasswordHasher(c config.Auth, log *slog.Logger) (ports.PasswordHasher, error) {
+	hasher, err := bcrypt.New(c.BcryptCost)
+	if err != nil {
+		return nil, err
+	}
+	cost := c.BcryptCost
+	if cost == 0 {
+		cost = bcrypt.DefaultCost
+	}
+	if log != nil {
+		log.Debug("auth: password hasher configured", "bcrypt_cost", cost)
+	}
+	return hasher, nil
+}
+
+// buildPayments selects the payments adapter. Stripe keys are consumed only here and in
+// the adapter; config merely trimmed and non-empty-checked them.
+func buildPayments(c config.Payments, publicURL string, log *slog.Logger) (ports.Payments, error) {
+	switch c.Provider {
+	case "stub", "":
+		return paymentsstub.New(log), nil
+	case "stripe":
+		base := strings.TrimRight(strings.TrimSpace(publicURL), "/")
+		if base == "" {
+			return nil, fmt.Errorf("stripe: http.public_url is required for checkout redirect URLs")
+		}
+		adapter, err := paymentsstripe.New(paymentsstripe.Config{
+			SecretKey:     c.Stripe.SecretKey,
+			WebhookSecret: c.Stripe.WebhookSecret,
+			PriceID:       c.Stripe.PriceID,
+			SuccessURL:    base + "/dashboard",
+			CancelURL:     base + "/orders",
+			Logger:        log,
 		})
 		if err != nil {
 			return nil, err

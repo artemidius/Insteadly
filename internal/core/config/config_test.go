@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeDotEnv(t *testing.T, content string) string {
@@ -155,11 +156,13 @@ func TestMalformedDotEnvLine(t *testing.T) {
 
 func TestSummaryContainsNoSecrets(t *testing.T) {
 	const (
-		sid    = "AC-super-secret-sid"
-		token  = "super-secret-token"
-		key    = "sk-super-secret-key"
-		dsn    = "postgres://insteadly:super-secret-dsn-password@db.example.test:5432/insteadly"
-		apiKey = "super-secret-api-key"
+		sid           = "AC-super-secret-sid"
+		token         = "super-secret-token"
+		key           = "sk-super-secret-key"
+		dsn           = "postgres://insteadly:super-secret-dsn-password@db.example.test:5432/insteadly"
+		apiKey        = "super-secret-api-key"
+		stripeKey     = "sk_live_super_secret_stripe_key"
+		stripeWebhook = "whsec_super_secret_webhook"
 	)
 	cfg, err := load("", []string{
 		"INSTEADLY_TWILIO_ACCOUNT_SID=" + sid,
@@ -167,6 +170,8 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 		"INSTEADLY_MISTRAL_API_KEY=" + key,
 		"INSTEADLY_POSTGRES_DSN=" + dsn,
 		"INSTEADLY_API_KEY=" + apiKey,
+		"INSTEADLY_STRIPE_SECRET_KEY=" + stripeKey,
+		"INSTEADLY_STRIPE_WEBHOOK_SECRET=" + stripeWebhook,
 	})
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -186,6 +191,8 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 		"scheduler.max_concurrent", "scheduler.lease", "scheduler.busy_backoff",
 		"scheduler.no_answer_backoff", "scheduler.error_backoff", "scheduler.windows",
 		"api.idempotency_ttl",
+		"auth.mode", "auth.session_ttl", "auth.cookie_name", "auth.bcrypt_cost",
+		"payments.provider", "stripe.secret_key", "stripe.webhook_secret", "stripe.price_id",
 	}
 	for _, k := range wantKeys {
 		if _, ok := summary[k]; !ok {
@@ -198,19 +205,24 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 
 	for k, v := range summary {
 		s := strings.ToLower(k)
-		if strings.Contains(s, "sid") || strings.Contains(s, "token") || strings.Contains(s, "key") {
-			t.Errorf("summary key %q looks like a secret field", k)
-		}
 		str, _ := v.(string)
-		for _, secret := range []string{sid, token, key, dsn, apiKey, "super-secret-dsn-password"} {
+		if strings.Contains(s, "sid") || strings.Contains(s, "token") ||
+			strings.Contains(s, "key") || strings.Contains(s, "secret") {
+			if str != "<redacted>" && str != "<unset>" {
+				t.Errorf("summary key %q looks secret but is not redacted: %v", k, v)
+			}
+		}
+		for _, secret := range []string{sid, token, key, dsn, apiKey, stripeKey, stripeWebhook, "super-secret-dsn-password"} {
 			if strings.Contains(str, secret) {
 				t.Errorf("summary key %q leaks a secret value", k)
 			}
 		}
 	}
 
-	if got := summary["postgres.dsn"]; got != "<redacted>" {
-		t.Errorf("postgres.dsn = %v, want <redacted>", got)
+	for _, key := range []string{"postgres.dsn", "stripe.secret_key", "stripe.webhook_secret"} {
+		if got := summary[key]; got != "<redacted>" {
+			t.Errorf("%s = %v, want <redacted>", key, got)
+		}
 	}
 	// The secret flag in the registry is what documents which names are sensitive;
 	// make sure the test suite actually covers those entries.
@@ -219,7 +231,8 @@ func TestSummaryContainsNoSecrets(t *testing.T) {
 			continue
 		}
 		if !strings.Contains(name, "SID") && !strings.Contains(name, "TOKEN") &&
-			!strings.Contains(name, "KEY") && !strings.Contains(name, "DSN") {
+			!strings.Contains(name, "KEY") && !strings.Contains(name, "DSN") &&
+			!strings.Contains(name, "SECRET") {
 			t.Errorf("registry entry %q is marked secret but its name does not look secret", name)
 		}
 	}
@@ -659,5 +672,140 @@ func TestNoEnvStillBoots(t *testing.T) {
 	}
 	if cfg.Storage.Provider != "local" || !cfg.Scheduler.Enabled || cfg.API.Key != "" {
 		t.Errorf("no-env config = %+v", cfg)
+	}
+}
+
+func TestAuthDefaults(t *testing.T) {
+	cfg, err := load("", nil)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Auth.Mode != "off" || cfg.Auth.SessionTTL != 24*time.Hour ||
+		cfg.Auth.CookieName != "insteadly_session" || cfg.Auth.BcryptCost != 12 {
+		t.Errorf("auth defaults = %+v", cfg.Auth)
+	}
+	if cfg.Payments.Provider != "stub" {
+		t.Errorf("payments default = %q, want stub", cfg.Payments.Provider)
+	}
+	if cfg.Payments.Stripe.SecretKey != "" || cfg.Payments.Stripe.WebhookSecret != "" {
+		t.Error("stripe secrets must default empty")
+	}
+}
+
+func TestAuthEnvOverrides(t *testing.T) {
+	cfg, err := load("", []string{
+		"INSTEADLY_AUTH_MODE=cookie",
+		"INSTEADLY_AUTH_SESSION_TTL=2h",
+		"INSTEADLY_AUTH_COOKIE_NAME=insteadly_test",
+		"INSTEADLY_AUTH_BCRYPT_COST=10",
+		"INSTEADLY_PAYMENTS_PROVIDER=stub",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Auth.Mode != "cookie" || cfg.Auth.SessionTTL != 2*time.Hour ||
+		cfg.Auth.CookieName != "insteadly_test" || cfg.Auth.BcryptCost != 10 {
+		t.Errorf("auth = %+v", cfg.Auth)
+	}
+}
+
+func TestAuthValidation(t *testing.T) {
+	cases := map[string]struct {
+		kv   string
+		want string
+	}{
+		"bad mode":     {"INSTEADLY_AUTH_MODE=jwt", "auth.mode"},
+		"zero ttl":     {"INSTEADLY_AUTH_SESSION_TTL=0s", "auth.session_ttl"},
+		"negative ttl": {"INSTEADLY_AUTH_SESSION_TTL=-1h", "auth.session_ttl"},
+		"bad cookie":   {"INSTEADLY_AUTH_COOKIE_NAME=bad cookie", "auth.cookie_name"},
+		"empty cookie": {"INSTEADLY_AUTH_COOKIE_NAME=", "auth.cookie_name"},
+		"low cost":     {"INSTEADLY_AUTH_BCRYPT_COST=3", "auth.bcrypt_cost"},
+		"high cost":    {"INSTEADLY_AUTH_BCRYPT_COST=32", "auth.bcrypt_cost"},
+		"non-int cost": {"INSTEADLY_AUTH_BCRYPT_COST=high", "INSTEADLY_AUTH_BCRYPT_COST"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := load("", []string{tc.kv})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func stripeEnv() []string {
+	return []string{
+		"INSTEADLY_PAYMENTS_PROVIDER=stripe",
+		"INSTEADLY_HTTP_PUBLIC_URL=https://example.test",
+		"INSTEADLY_STRIPE_SECRET_KEY=sk_test_123",
+		"INSTEADLY_STRIPE_WEBHOOK_SECRET=whsec_test_123",
+		"INSTEADLY_STRIPE_PRICE_ID=price_test_123",
+	}
+}
+
+func TestPaymentsValidation(t *testing.T) {
+	cfg, err := load("", stripeEnv())
+	if err != nil {
+		t.Fatalf("valid stripe config rejected: %v", err)
+	}
+	if cfg.Payments.Provider != "stripe" || cfg.Payments.Stripe.PriceID != "price_test_123" {
+		t.Errorf("payments = %+v", cfg.Payments)
+	}
+
+	cases := map[string]struct {
+		mutate func([]string) []string
+		want   string
+	}{
+		"unknown provider": {
+			mutate: func(env []string) []string {
+				return replaceEnv(env, "INSTEADLY_PAYMENTS_PROVIDER=paypal")
+			},
+			want: "payments.provider",
+		},
+		"missing secret key": {
+			mutate: func(env []string) []string {
+				return replaceEnv(env, "INSTEADLY_STRIPE_SECRET_KEY=")
+			},
+			want: "stripe.secret_key",
+		},
+		"missing webhook secret": {
+			mutate: func(env []string) []string {
+				return replaceEnv(env, "INSTEADLY_STRIPE_WEBHOOK_SECRET=")
+			},
+			want: "stripe.webhook_secret",
+		},
+		"missing price": {
+			mutate: func(env []string) []string {
+				return replaceEnv(env, "INSTEADLY_STRIPE_PRICE_ID=")
+			},
+			want: "stripe.price_id",
+		},
+		"missing public url": {
+			mutate: func(env []string) []string {
+				return removeEnv(env, "INSTEADLY_HTTP_PUBLIC_URL")
+			},
+			want: "http.public_url is required",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := load("", tc.mutate(stripeEnv()))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestStripeValidationErrorsNeverLeakSecrets(t *testing.T) {
+	env := removeEnv(stripeEnv(), "INSTEADLY_HTTP_PUBLIC_URL")
+	_, err := load("", env)
+	if err == nil {
+		t.Fatal("expected a validation error")
+	}
+	for _, secret := range []string{"sk_test_123", "whsec_test_123"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("error leaks %q: %v", secret, err)
+		}
 	}
 }

@@ -28,6 +28,10 @@ func (a *API) orderEvents(w http.ResponseWriter, r *http.Request) {
 		a.writeStoreError(w, r, err)
 		return
 	}
+	if !a.ownsOrder(r, order) {
+		writeError(w, http.StatusNotFound, "not_found", "requested resource was not found")
+		return
+	}
 
 	// Subscribe before the snapshot so an event published after the read is buffered
 	// rather than lost. A closed hub degrades to a snapshot-only stream.

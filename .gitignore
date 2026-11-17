@@ -5,3 +5,5 @@
 *.log
 /coverage.out
 /dist/
+/web/node_modules/
+/web/dist/

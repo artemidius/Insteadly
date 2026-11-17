@@ -96,6 +96,15 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: Set up Node
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # make build embeds the real React bundle (webembed), so the web tests and build
+      # run here too; the lint/test jobs above remain Node-free.
       - name: Build
         run: make build VERSION="${GITHUB_SHA::12}"
 

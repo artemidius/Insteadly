@@ -38,8 +38,18 @@ jobs:
             exit 1
           fi
 
+      - name: Set up Node
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Run tests
         run: go test -race -count=1 ./...
+
+      - name: Build web bundle
+        run: cd web && npm ci && npm run build
 
       - name: Cross-compile binaries
         run: |
@@ -50,7 +60,7 @@ jobs:
             goarch="${target#*/}"
             out="dist/insteadly_${VERSION}_${goos}_${goarch}"
             echo "building $out"
-            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath \
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -tags webembed -trimpath \
               -ldflags "-s -w -X main.version=${VERSION}" -o "$out" ./cmd/insteadly
           done
           ( cd dist && sha256sum insteadly_* > checksums.txt )

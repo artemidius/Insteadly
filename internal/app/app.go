@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/artemidius/insteadly/internal/core/agent"
+	coreauth "github.com/artemidius/insteadly/internal/core/auth"
 	"github.com/artemidius/insteadly/internal/core/config"
 	"github.com/artemidius/insteadly/internal/core/events"
 	"github.com/artemidius/insteadly/internal/core/ports"
@@ -29,8 +30,9 @@ type App struct {
 	STT       ports.SpeechToText
 	TTS       ports.TextToSpeech
 	Dialogue  ports.Dialogue
-	Payments  ports.Payments // nil until C6
-	Notify    ports.Notifier // nil until C7
+	Payments  ports.Payments    // stub or stripe (C6)
+	Auth      *coreauth.Service // user accounts/sessions (C6)
+	Notify    ports.Notifier    // nil until C7
 	Log       *slog.Logger
 
 	// Agent is the stateless answered-call loop; Runner owns one call attempt.
@@ -61,7 +63,7 @@ func New(cfg config.Config) (*App, error) {
 	log := newLogger(cfg.Log)
 	hub := events.NewHub(events.DefaultBuffer)
 
-	storage, schedulerStore, storageCloser, err := buildStorage(context.Background(), cfg.Storage, log)
+	storage, schedulerStore, authStore, storageCloser, err := buildStorage(context.Background(), cfg.Storage, log)
 	if err != nil {
 		return nil, fmt.Errorf("storage: %w", err)
 	}
@@ -81,6 +83,16 @@ func New(cfg config.Config) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dialogue: %w", err)
 	}
+
+	hasher, err := buildPasswordHasher(cfg.Auth, log)
+	if err != nil {
+		return nil, fmt.Errorf("auth hasher: %w", err)
+	}
+	payments, err := buildPayments(cfg.Payments, cfg.HTTP.PublicURL, log)
+	if err != nil {
+		return nil, fmt.Errorf("payments: %w", err)
+	}
+	authService := coreauth.New(authStore, hasher, cfg.Auth.SessionTTL)
 
 	ag, err := agent.New(agent.Config{
 		STT:      stt,
@@ -139,6 +151,8 @@ func New(cfg config.Config) (*App, error) {
 		STT:           stt,
 		TTS:           tts,
 		Dialogue:      dialogue,
+		Payments:      payments,
+		Auth:          authService,
 		Log:           log,
 		Agent:         ag,
 		Runner:        run,

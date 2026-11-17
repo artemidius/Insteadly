@@ -10,34 +10,42 @@ import (
 
 // orderColumns is the domain column list; lease columns are selected only where the
 // scheduler needs them so ordinary reads cannot accidentally expose lease state.
-const orderColumns = `id, status, clinic, patient, outcome, recording, created_at, updated_at, attempts, next_attempt_at, attempt_history`
+const orderColumns = `id, status, clinic, patient, outcome, recording, created_at, updated_at, attempts, next_attempt_at, attempt_history, user_id, paid_at, payment_reference`
 
 type rowScanner interface {
 	Scan(dest ...any) error
 }
 
 type orderRow struct {
-	id            string
-	status        string
-	clinic        []byte
-	patient       []byte
-	outcome       []byte
-	recording     []byte
-	createdAt     time.Time
-	updatedAt     time.Time
-	attempts      int32
-	nextAttemptAt *time.Time
-	history       []byte
+	id               string
+	status           string
+	clinic           []byte
+	patient          []byte
+	outcome          []byte
+	recording        []byte
+	createdAt        time.Time
+	updatedAt        time.Time
+	attempts         int32
+	nextAttemptAt    *time.Time
+	history          []byte
+	userID           *string
+	paidAt           *time.Time
+	paymentReference *string
 }
 
 func (r orderRow) order() (domain.Order, error) {
 	o := domain.Order{
-		ID:            domain.OrderID(r.id),
-		Status:        domain.OrderStatus(r.status),
-		CreatedAt:     r.createdAt,
-		UpdatedAt:     r.updatedAt,
-		Attempts:      int(r.attempts),
-		NextAttemptAt: r.nextAttemptAt,
+		ID:               domain.OrderID(r.id),
+		Status:           domain.OrderStatus(r.status),
+		CreatedAt:        r.createdAt,
+		UpdatedAt:        r.updatedAt,
+		Attempts:         int(r.attempts),
+		NextAttemptAt:    r.nextAttemptAt,
+		PaidAt:           r.paidAt,
+		PaymentReference: r.paymentReference,
+	}
+	if r.userID != nil {
+		o.UserID = domain.UserID(*r.userID)
 	}
 	if err := json.Unmarshal(r.clinic, &o.Clinic); err != nil {
 		return domain.Order{}, fmt.Errorf("decode clinic: %w", err)
@@ -74,6 +82,7 @@ func scanOrder(row rowScanner) (domain.Order, error) {
 	if err := row.Scan(
 		&r.id, &r.status, &r.clinic, &r.patient, &r.outcome, &r.recording,
 		&r.createdAt, &r.updatedAt, &r.attempts, &r.nextAttemptAt, &r.history,
+		&r.userID, &r.paidAt, &r.paymentReference,
 	); err != nil {
 		return domain.Order{}, err
 	}
@@ -87,7 +96,7 @@ func scanOrderWithLease(row rowScanner) (domain.Order, *time.Time, error) {
 	if err := row.Scan(
 		&r.id, &r.status, &r.clinic, &r.patient, &r.outcome, &r.recording,
 		&r.createdAt, &r.updatedAt, &r.attempts, &r.nextAttemptAt, &r.history,
-		&leaseUntil,
+		&r.userID, &r.paidAt, &r.paymentReference, &leaseUntil,
 	); err != nil {
 		return domain.Order{}, nil, err
 	}
@@ -97,11 +106,14 @@ func scanOrderWithLease(row rowScanner) (domain.Order, *time.Time, error) {
 
 // encodedOrder is the JSONB column payload for one order.
 type encodedOrder struct {
-	clinic    []byte
-	patient   []byte
-	outcome   []byte
-	recording []byte
-	history   []byte
+	clinic           []byte
+	patient          []byte
+	outcome          []byte
+	recording        []byte
+	history          []byte
+	userID           *string
+	paidAt           *time.Time
+	paymentReference *string
 }
 
 func encodeOrder(o domain.Order) (encodedOrder, error) {
@@ -134,5 +146,18 @@ func encodeOrder(o domain.Order) (encodedOrder, error) {
 			return encodedOrder{}, fmt.Errorf("encode attempt history: %w", err)
 		}
 	}
-	return encodedOrder{clinic: clinic, patient: patient, outcome: outcome, recording: recording, history: history}, nil
+	enc := encodedOrder{
+		clinic:           clinic,
+		patient:          patient,
+		outcome:          outcome,
+		recording:        recording,
+		history:          history,
+		paidAt:           o.PaidAt,
+		paymentReference: o.PaymentReference,
+	}
+	if o.UserID != "" {
+		userID := string(o.UserID)
+		enc.userID = &userID
+	}
+	return enc, nil
 }

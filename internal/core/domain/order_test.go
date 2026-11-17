@@ -320,3 +320,68 @@ func TestAttemptHistoryAppendOrdering(t *testing.T) {
 		t.Errorf("history reasons = %+v", o.AttemptHistory)
 	}
 }
+
+func TestMarkPaidFromCreated(t *testing.T) {
+	when := time.Date(2026, 11, 17, 9, 30, 0, 0, time.UTC)
+	o := Order{ID: NewOrderID(), Status: OrderCreated}
+	if err := o.MarkPaid("  cs_test_123  ", when); err != nil {
+		t.Fatalf("MarkPaid: %v", err)
+	}
+	if o.Status != OrderPaid {
+		t.Errorf("status = %q, want paid", o.Status)
+	}
+	if o.PaidAt == nil || !o.PaidAt.Equal(when) {
+		t.Errorf("paid_at = %v, want %v", o.PaidAt, when)
+	}
+	if o.PaymentReference == nil || *o.PaymentReference != "cs_test_123" {
+		t.Errorf("payment_reference = %v, want trimmed cs_test_123", o.PaymentReference)
+	}
+	if o.UpdatedAt.IsZero() {
+		t.Error("UpdatedAt was not stamped")
+	}
+}
+
+func TestMarkPaidZeroTimeUsesNow(t *testing.T) {
+	before := time.Now()
+	o := Order{ID: NewOrderID(), Status: OrderCreated}
+	if err := o.MarkPaid("ref", time.Time{}); err != nil {
+		t.Fatalf("MarkPaid: %v", err)
+	}
+	after := time.Now()
+	if o.PaidAt == nil || o.PaidAt.Before(before) || o.PaidAt.After(after) {
+		t.Errorf("paid_at = %v, want between %v and %v", o.PaidAt, before, after)
+	}
+}
+
+func TestMarkPaidIdempotentAfterCreated(t *testing.T) {
+	when := time.Date(2026, 11, 17, 9, 30, 0, 0, time.UTC)
+	for _, status := range []OrderStatus{OrderPaid, OrderScheduled, OrderDialing, OrderRinging, OrderInCall, OrderFinished} {
+		t.Run(string(status), func(t *testing.T) {
+			o := Order{ID: NewOrderID(), Status: status}
+			if err := o.MarkPaid("cs_replay", when); err != nil {
+				t.Fatalf("MarkPaid: %v", err)
+			}
+			if o.Status != status {
+				t.Errorf("status = %q, want unchanged %q", o.Status, status)
+			}
+			if o.PaidAt != nil || o.PaymentReference != nil {
+				t.Errorf("replay mutated payment fields: paid_at=%v ref=%v", o.PaidAt, o.PaymentReference)
+			}
+		})
+	}
+}
+
+func TestMarkPaidDoesNotChangeSpine(t *testing.T) {
+	// MarkPaid is not a shortcut through the state machine: created may still only move
+	// to paid, and skipping steps remains illegal.
+	o := Order{ID: NewOrderID(), Status: OrderCreated}
+	if err := o.Transition(OrderScheduled); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("created -> scheduled err = %v, want ErrInvalidTransition", err)
+	}
+	if err := o.MarkPaid("ref", time.Now()); err != nil {
+		t.Fatalf("MarkPaid: %v", err)
+	}
+	if err := o.Transition(OrderPaid); !errors.Is(err, ErrInvalidTransition) {
+		t.Errorf("paid -> paid err = %v, want ErrInvalidTransition", err)
+	}
+}

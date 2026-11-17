@@ -12,12 +12,14 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/artemidius/insteadly/internal/app"
 	"github.com/artemidius/insteadly/internal/core/config"
 	"github.com/artemidius/insteadly/internal/core/events"
 	"github.com/artemidius/insteadly/internal/core/ports"
+	"github.com/artemidius/insteadly/web"
 )
 
 const (
@@ -60,21 +62,63 @@ func New(cfg config.Config, a *app.App, version string) *http.Server {
 func (a *API) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.health)
-	mux.HandleFunc("GET /api/v1/orders", a.listOrders)
-	mux.HandleFunc("POST /api/v1/orders", a.createOrder)
-	mux.HandleFunc("GET /api/v1/orders/{id}", a.getOrder)
+
+	// C6 auth surface. sessionAuth is a passthrough in auth.mode=off, where the handlers
+	// themselves answer 501 so the C5 no-env API is unchanged.
+	mux.HandleFunc("POST /api/v1/auth/register", a.register)
+	mux.HandleFunc("POST /api/v1/auth/login", a.login)
+	mux.HandleFunc("POST /api/v1/auth/logout", a.sessionAuth(a.logout))
+	mux.HandleFunc("GET /api/v1/auth/me", a.sessionAuth(a.me))
+
+	// Order routes are scoped to the session user in cookie mode.
+	mux.HandleFunc("GET /api/v1/orders", a.sessionAuth(a.listOrders))
+	mux.HandleFunc("POST /api/v1/orders", a.sessionAuth(a.createOrder))
+	mux.HandleFunc("GET /api/v1/orders/{id}", a.sessionAuth(a.getOrder))
+	mux.HandleFunc("GET /api/v1/orders/{id}/events", a.sessionAuth(a.orderEvents))
+	mux.HandleFunc("POST /api/v1/orders/{id}/checkout", a.sessionAuth(a.checkout))
+	mux.HandleFunc("GET /api/v1/orders/{id}/checkout/simulate", a.sessionAuth(a.simulateCheckout))
 
 	// C5 orchestration surface. Place-call is an eligibility endpoint, never a direct
-	// dial: the scheduler picks the order up on its next tick.
+	// dial: the scheduler picks the order up on its next tick. It stays API-key-gated and
+	// is deliberately not the user payment path.
 	mux.HandleFunc("POST /api/v1/orders/{id}/call", a.apiKeyAuth(a.callOrder))
-	mux.HandleFunc("GET /api/v1/orders/{id}/events", a.orderEvents)
 
 	// Provider webhooks are mounted only when the selected adapter has them. They are
 	// not part of the JSON API: Twilio posts form-encoded requests and expects TwiML.
 	if a.app != nil && a.app.Webhooks != nil {
-		mux.Handle("/webhooks/telephony/twilio/", a.app.Webhooks)
+		// The provider handler serves POST callbacks and one GET WebSocket route; method
+		// patterns keep Go's ServeMux from conflicting with the GET-only SPA fallback.
+		mux.Handle("GET /webhooks/telephony/twilio/", a.app.Webhooks)
+		mux.Handle("POST /webhooks/telephony/twilio/", a.app.Webhooks)
 	}
+	if a.paymentsProvider() == "stripe" {
+		mux.HandleFunc("POST /webhooks/payments/stripe", a.stripeWebhook)
+	}
+	// An unmounted webhook path is 404, not the SPA and not a confusing 405.
+	mux.HandleFunc("GET /webhooks/", notFound)
+	mux.HandleFunc("POST /webhooks/", notFound)
+
+	// The SPA is registered last and only for GET: /api/v1, /webhooks, and /healthz always
+	// win, while a wrong method on an API route still gets 405 (not the SPA). Unknown
+	// /api and /webhooks paths are 404, never index.html.
+	mux.Handle("GET /", spaFallback())
 	return mux
+}
+
+func notFound(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, http.StatusNotFound, "not_found", "requested resource was not found")
+}
+
+// spaFallback serves the SPA for browser routes but never masks an API/webhook miss.
+func spaFallback() http.Handler {
+	handler := web.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/webhooks/") {
+			writeError(w, http.StatusNotFound, "not_found", "requested resource was not found")
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
 }
 
 // withMiddleware wraps h with the shared middleware chain. Outermost first: recoverer ->
@@ -128,6 +172,8 @@ func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 			"tts":       a.cfg.TTS.Provider,
 			"dialogue":  a.cfg.Dialogue.Provider,
 			"storage":   a.cfg.Storage.Provider,
+			"auth":      a.cfg.Auth.Mode,
+			"payments":  a.cfg.Payments.Provider,
 		},
 	})
 }

@@ -74,6 +74,26 @@ var registry = map[string]setter{
 	"INSTEADLY_API_IDEMPOTENCY_TTL": {
 		apply: durationSetter(func(c *Config, v time.Duration) { c.API.IdempotencyTTL = v }),
 	},
+	"INSTEADLY_AUTH_MODE": {apply: strSetter(func(c *Config, v string) { c.Auth.Mode = v })},
+	"INSTEADLY_AUTH_SESSION_TTL": {
+		apply: durationSetter(func(c *Config, v time.Duration) { c.Auth.SessionTTL = v }),
+	},
+	"INSTEADLY_AUTH_COOKIE_NAME": {apply: strSetter(func(c *Config, v string) { c.Auth.CookieName = v })},
+	"INSTEADLY_AUTH_BCRYPT_COST": {
+		apply: intSetter(func(c *Config, v int) { c.Auth.BcryptCost = v }),
+	},
+	"INSTEADLY_PAYMENTS_PROVIDER": {apply: strSetter(func(c *Config, v string) { c.Payments.Provider = v })},
+	"INSTEADLY_STRIPE_SECRET_KEY": {
+		apply:  strSetter(func(c *Config, v string) { c.Payments.Stripe.SecretKey = v }),
+		secret: true,
+	},
+	"INSTEADLY_STRIPE_WEBHOOK_SECRET": {
+		apply:  strSetter(func(c *Config, v string) { c.Payments.Stripe.WebhookSecret = v }),
+		secret: true,
+	},
+	"INSTEADLY_STRIPE_PRICE_ID": {
+		apply: strSetter(func(c *Config, v string) { c.Payments.Stripe.PriceID = v }),
+	},
 	"INSTEADLY_RECORDING_ENABLED":  {apply: boolSetter(func(c *Config, v bool) { c.Recording.RecordingEnabled = v })},
 	"INSTEADLY_TRANSCRIPT_ENABLED": {apply: boolSetter(func(c *Config, v bool) { c.Recording.TranscriptEnabled = v })},
 	"INSTEADLY_AUDIO_ENABLED":      {apply: boolSetter(func(c *Config, v bool) { c.Recording.AudioEnabled = v })},
@@ -161,6 +181,13 @@ func defaults() Config {
 			WindowsJSON:     DefaultSchedulerWindows,
 		},
 		API: API{IdempotencyTTL: 10 * time.Minute},
+		Auth: Auth{
+			Mode:       "off",
+			SessionTTL: 24 * time.Hour,
+			CookieName: "insteadly_session",
+			BcryptCost: 12,
+		},
+		Payments: Payments{Provider: "stub"},
 		Mistral: Mistral{
 			BaseURL: "https://api.mistral.ai",
 			STT: MistralSTT{
@@ -200,6 +227,14 @@ func load(path string, environ []string) (Config, error) {
 	// webhook URLs into "https://host//webhooks/...". Normalize once, before validation.
 	c.HTTP.PublicURL = strings.TrimRight(c.HTTP.PublicURL, "/")
 	c.Mistral.BaseURL = strings.TrimRight(strings.TrimSpace(c.Mistral.BaseURL), "/")
+	// Secret-safe normalization: trim every new C6 string before validation. Values are
+	// never logged or echoed in errors.
+	c.Auth.Mode = strings.TrimSpace(c.Auth.Mode)
+	c.Auth.CookieName = strings.TrimSpace(c.Auth.CookieName)
+	c.Payments.Provider = strings.TrimSpace(c.Payments.Provider)
+	c.Payments.Stripe.SecretKey = strings.TrimSpace(c.Payments.Stripe.SecretKey)
+	c.Payments.Stripe.WebhookSecret = strings.TrimSpace(c.Payments.Stripe.WebhookSecret)
+	c.Payments.Stripe.PriceID = strings.TrimSpace(c.Payments.Stripe.PriceID)
 	// Config only trims the DSN; parsing/validating it belongs to the adapter, keeping
 	// this package free of pgx.
 	c.Storage.Postgres.DSN = strings.TrimSpace(c.Storage.Postgres.DSN)

@@ -17,4 +17,8 @@ type PaymentEvent struct {
 	Paid     bool
 	Refunded bool
 	At       time.Time
+	// Reference is the provider's opaque payment id (for Stripe, the checkout session
+	// id). C6 adds it additively so the webhook bridge can persist payment_reference for
+	// durable replay idempotency; it is empty when a provider has no such id.
+	Reference string
 }

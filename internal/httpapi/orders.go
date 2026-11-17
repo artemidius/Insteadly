@@ -42,6 +42,24 @@ func (a *API) createOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", `field "status" must be empty or "created"`)
 		return
 	}
+	// Ownership and payment state are server-assigned; a client must not be able to mint
+	// a paid/owned order.
+	if order.UserID != "" {
+		writeError(w, http.StatusBadRequest, "bad_request", `field "user_id" is server-assigned and must be empty`)
+		return
+	}
+	if order.PaidAt != nil || order.PaymentReference != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", `payment fields are server-assigned and must be empty`)
+		return
+	}
+	if a.authCookieMode() {
+		user, ok := currentUser(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "a valid session is required")
+			return
+		}
+		order.UserID = user.ID
+	}
 	if problems := validateNewOrder(order); len(problems) > 0 {
 		writeError(w, http.StatusBadRequest, "bad_request", strings.Join(problems, "; "))
 		return
@@ -56,12 +74,27 @@ func (a *API) createOrder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, stored)
 }
 
-// listOrders returns all orders, newest first. An empty store yields [] and never null.
+// listOrders returns orders, newest first; empty yields [] and never null. In cookie mode
+// the list is scoped to the session user (handler-side; SQL filtering is a C7 optimization).
 func (a *API) listOrders(w http.ResponseWriter, r *http.Request) {
 	orders, err := a.app.Storage.Orders().List(r.Context())
 	if err != nil {
 		a.writeStoreError(w, r, err)
 		return
+	}
+	user, scoped := currentUser(r)
+	if a.authCookieMode() && !scoped {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "a valid session is required")
+		return
+	}
+	if a.authCookieMode() {
+		owned := make([]domain.Order, 0, len(orders))
+		for _, order := range orders {
+			if order.UserID != "" && order.UserID == user.ID {
+				owned = append(owned, order)
+			}
+		}
+		orders = owned
 	}
 	if orders == nil {
 		orders = []domain.Order{}
@@ -80,6 +113,10 @@ func (a *API) getOrder(w http.ResponseWriter, r *http.Request) {
 	order, err := a.app.Storage.Orders().Get(r.Context(), id)
 	if err != nil {
 		a.writeStoreError(w, r, err)
+		return
+	}
+	if !a.ownsOrder(r, order) {
+		writeError(w, http.StatusNotFound, "not_found", "requested resource was not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, order)

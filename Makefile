@@ -1,10 +1,22 @@
 BIN      := bin/insteadly
 VERSION  ?= dev
 
-.PHONY: build run test test-postgres live-test live-test-mistral live-test-m0 live-test-m0-phone live-test-m1 live-test-m1-phone lint fmt check-deps verify cover clean clean-data
+.PHONY: build build-go web web-build run test test-postgres live-test live-test-mistral live-test-m0 live-test-m0-phone live-test-m1 live-test-m1-phone lint fmt check-deps verify cover clean clean-data
 
-build:
+# Release build: the real SPA is embedded. Requires Node/npm.
+build: web-build
+	CGO_ENABLED=0 go build -tags webembed -trimpath -ldflags "-X main.version=$(VERSION)" -o $(BIN) ./cmd/insteadly
+
+# Backend-only build (no Node, placeholder SPA). Used by verify/CI lint+test.
+build-go:
 	CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$(VERSION)" -o $(BIN) ./cmd/insteadly
+
+# Frontend: install, typecheck/build the bundle, and run Vitest.
+web:
+	cd web && npm ci && npm run build && npm test
+
+web-build:
+	cd web && npm ci && npm run build
 
 run:
 	go run ./cmd/insteadly
@@ -38,7 +50,7 @@ cover:
 	go test -race -count=1 -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tail -n 1
 
-verify: lint test check-deps build
+verify: lint test check-deps build-go
 
 lint:
 	@test -z "$$(gofmt -l .)" || (echo "gofmt needed:"; gofmt -l .; exit 1)
@@ -55,7 +67,7 @@ fmt:
 	gofmt -w .
 
 clean:
-	rm -rf bin
+	rm -rf bin web/dist
 
 clean-data:
 	rm -rf data
