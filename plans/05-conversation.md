@@ -1276,3 +1276,28 @@ frames have near-zero flux, yet 3 barge frames fire) and
 Existing synthetic VAD/listener/barge tests were updated for the 60 ms threshold. `docs/agent.md`
 and the plan's §3.7/§5/§7/§9 text now state the tuned rule. No live test was run in this fix
 session; fake-only verification is recorded in `PROGRESS.md`.
+
+### 2026-11-17 — live no-phone outbound-audio accounting (test harness only)
+
+The conductor's gate run on merged `main` (`d56ec91`, tuned barge) succeeded at the barge:
+`clears >= 1` and a terminal `aborted` outcome. The remaining failure was a harness accounting
+bug: `"no real outbound audio"`. `integrationSession.ClearAudio` correctly models “clear queued
+playback” by setting `sentAudio = nil`; the live test then copied `sentAudio` **after** the
+barge clear and found no frames, even though the greeting audio had been sent and played.
+
+Correction (test harness only; no production change):
+
+- `integrationSession` now keeps cumulative outbound evidence that `ClearAudio` never resets:
+  `sentAudioTotal`, `sentAudioNonZero`, and `sentAudioBadLen`. `SendAudio` updates them for
+  every frame; the existing queued `sentAudio` slice keeps its prior semantics for the other
+  fixtures.
+- `TestLiveM1NoPhone` asserts `sentAudioTotal >= 1`, no non-canonical frame length, and at
+  least one non-zero sample from the cumulative fields (captured under `session.mu` alongside
+  clears/hangups). The log line uses the cumulative total.
+- Added `TestIntegrationSessionOutboundAccountingSurvivesClear`, a credential-free regression
+  that sends one canonical non-silent frame, calls `ClearAudio`, and asserts the queued slice
+  is empty while the cumulative total/non-zero evidence survives.
+
+No live test was run in this fix session. Verification before re-running the gate: `make
+verify`, `go test -race -count=10 ./internal/app -run 'TestM1Integration'`, live-tag
+compile/SKIP, lint, module and drift checks are recorded in `PROGRESS.md`.
