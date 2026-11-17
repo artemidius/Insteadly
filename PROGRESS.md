@@ -13,24 +13,31 @@
 - **Phase:** C0 ✅; **C1 code complete** (live audio + outbound DTMF blocked by Twilio
   trial); **C2 ✅** (Mistral adapters, fake suites green, live smoke passed); **C3 ✅ code
   complete** (call runner + agent engine v0; real-Mistral no-phone live gate passed);
-  **C4 ✅ code complete** — streaming VAD/turn-taking, barge-in with Twilio `clear`/`mark`,
-  deterministic IVR, hold detection, and bounded structured-outcome repair are implemented
-  with credential-free fake-Mistral/fake-telephony integration coverage AND the
-  real-Mistral no-phone M1 live gate **passed** (`clears=2`, terminal `aborted`,
-  non-silent outbound). DESIGN's **real-phone M0 and M1 exits** remain blocked by the
-  Twilio trial stripping `<Stream>` (and, for M1, by the unproven outbound-DTMF path plus
-  the need for controlled IVR/hold destinations).
-- **Current chunk:** C4 done (code complete). Next: write `plans/06-orchestration.md` and
-  start C5 (Postgres order store, scheduler, status API + SSE).
-- **First action of the next session:** write the C5 plan (`plans/06-orchestration.md`).
+  **C4 ✅ code complete** (streaming VAD/turn-taking, barge-in with Twilio `clear`/`mark`,
+  deterministic IVR, hold detection, bounded structured-outcome repair; real-Mistral
+  no-phone M1 live gate passed); **C5 🔵 code complete pending the conductor's final
+  verification** — Postgres order/scheduler store (migrations, `FOR UPDATE`, `SKIP
+  LOCKED`), in-process scheduler (windows, bounded concurrency, retry backoff,
+  history-preserving callback requeue), order-status SSE hub + endpoint, and the
+  API-key-gated place-call eligibility endpoint. DESIGN's **real-phone M0 and M1 exits**
+  remain blocked by the Twilio trial stripping `<Stream>` (and, for M1, by the unproven
+  outbound-DTMF path plus the need for controlled IVR/hold destinations).
+- **Current chunk:** C5 (implementation done, PR open, awaiting conductor verification).
+  Next: conductor verifies C5, then C6 plan (web app, payments, real auth).
+- **First action of the next session:** verify PR #12 / C5 acceptance in `plans/06-orchestration.md`
+  §10, then write `plans/07-web-app.md`.
 - **Blockers:** DESIGN's real-phone M0/M1 exits remain blocked by the Twilio trial stripping
   `<Stream>` and the unproven outbound-DTMF path — need an upgraded account, a controlled
-  IVR/hold destination, and explicit approval before the end-to-end phone walk. Operational:
-  `golangci-lint` absent locally (optional; CI installs v2.15.0; the C3 session used the
-  /tmp v2.15.0 binary); `/usr/bin/make` broken by the Xcode 16.2/macOS 26 issue — use
+  IVR/hold destination, and explicit approval before the end-to-end phone walk. C5
+  deployment blockers (not code-complete blockers): no real-phone/Mistral evidence was
+  produced or re-run, the API key is a prototype gate (C6 owns real auth), the scheduler is
+  single-process with no River yet, and multi-instance runner draining is untested.
+  Operational: `golangci-lint` absent locally (optional; CI installs v2.15.0; the /tmp
+  v2.15.0 binary was run); `/usr/bin/make` broken by the Xcode 16.2/macOS 26 issue — use
   `/Library/Developer/CommandLineTools/usr/bin/make`. Build/test commands may need a
-  `/tmp` GOCACHE/GOMODCACHE in this sandbox (`~/Library/Caches/go-build` and
-  `~/go/pkg/mod` are not writable here).
+  `/tmp` GOCACHE/GOMODCACHE/GOPATH in this sandbox (`~/Library/Caches/go-build`,
+  `~/go/pkg/mod`, and `~/go/pkg/sumdb` are not writable here). Postgres-tagged tests need
+  `CGO_ENABLED=0` while Xcode clang is broken.
 
 ---
 
@@ -43,7 +50,7 @@
 | **C2** | M0 | Mistral adapters for STT / TTS / Dialogue (raw WS/JSON APIs, no Go SDK exists). | [plans/03-mistral-ai.md](plans/03-mistral-ai.md) | ✅ code complete; live smoke passed |
 | **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | [plans/04-m0-e2e.md](plans/04-m0-e2e.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | **C4** | M1 | Conversation: streaming VAD/turn-taking, barge-in, playback clear/marks, deterministic IVR, hold detection, bounded structured-outcome repair. | [plans/05-conversation.md](plans/05-conversation.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
-| **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE. | `plans/06-orchestration.md` (TBD) | ⬜ |
+| **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE, place-call. | [plans/06-orchestration.md](plans/06-orchestration.md) | 🔵 code complete pending conductor verification |
 | **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | `plans/07-web-app.md` (TBD) | ⬜ |
 | **C7** | M4 | Swapability proof + hardening: second telephony adapter (Telnyx or Twilio SIP trunk), one alternative AI provider, recording/storage flags end-to-end, notifications. | `plans/08-swapability.md` (TBD) | ⬜ |
 
@@ -56,6 +63,97 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C5 implementation session (Europe/Vienna)
+
+- Implemented [plans/06-orchestration.md](plans/06-orchestration.md) end to end on
+  `feat/c5-orchestration` in the §7 order 1–13, **without running any live phone/Mistral
+  test** and without reading any secret/`.env` value. PR #12 against `main`; not merged.
+  Branch/PR details are reported to the conductor; §14 of the plan records the dated
+  implementation amendments (Hub struct vs interface, exhausted-outcome rewrite,
+  Claim/wall-clock due re-check + fake-clock test alignment, pool close in
+  `App.CloseStorage`, single-Update place-call, SSE overrun-on-close, attempt-history
+  length after busy→booked, test tag split, internal `buildStorage` signature).
+- **Domain/ports (additive only):** `Order.NextAttemptAt` + `AttemptHistory`,
+  `AttemptRecord`, `Order.Schedule` (paid→scheduled), `Order.Requeue` (finished →
+  scheduled with history append, guardrails for callback/retryable-failed); unchanged
+  `Transition`/`Finish`/spine table. New `ports.SchedulerStore`
+  (`ListEligible`/`Claim`/`Release`) + `ports.ErrNotEligible`; a claim is a lease, never a
+  status change.
+- **New core packages:** `internal/core/events` (bounded in-process hub; slow subscriber
+  dropped/closed and counted; nil-safe publisher; `Close`/unsubscribe idempotent) and
+  `internal/core/scheduler` (injectable `Clock`/`FakeClock`; config windows with DST-safe
+  Europe/Vienna math; tick loop + deterministic `RunOnce`/`Wait`; atomic lease claims;
+  paid→scheduled via `Schedule`; bounded `Runner.Run` concurrency; outcome→retry table;
+  linear backoff advanced to the next window; `callback_needed` requeue at `callback_at`;
+  cap → terminal `failed/attempts_exhausted`; release on every exit; `Close` cancels and
+  waits in-flight attempts). The scheduler never mutates an order to `dialing`.
+- **Runner:** optional `Events events.Publisher`; publishes dialing/ringing/in_call/finished
+  after the corresponding persisted transitions; nil publisher is a no-op. The exactly-once
+  claim, single `Dial`, one `Finish`, one `Hangup`, and duplicate-dial fence are unchanged
+  (existing `TestRunAtomicClaimRejectsConcurrentDuplicate` still proves one dial).
+- **Adapters:** local store implements `SchedulerStore` with an in-memory lease map
+  (+json-persisted `next_attempt_at`/`attempt_history`); new
+  `internal/adapters/storage/postgres` (pgx v5 only) with embedded
+  `0001_orders.sql`, advisory-lock + `schema_migrations` migration runner, JSONB
+  `Order` mapping, `Create/Get/List/Update` (`SELECT … FOR UPDATE` transaction), and
+  `ListEligible`/`Claim` (`FOR UPDATE SKIP LOCKED`)/`Release`. Blobs stay on the local
+  adapter via a composite `ports.Storage`.
+- **Config:** `storage.provider=postgres` + `INSTEADLY_POSTGRES_DSN` (secret),
+  scheduler params (`enabled/tick/max_attempts/max_concurrent/lease/backoffs/windows`),
+  `INSTEADLY_API_KEY` (secret) + `INSTEADLY_API_IDEMPOTENCY_TTL`; new duration setter;
+  strict windows JSON validation; redacted `postgres.dsn` in `Summary`; `config` remains
+  stdlib-only (no pgx). No-env boot unchanged (`storage: local`, scheduler enabled).
+- **HTTP:** `POST /api/v1/orders/{id}/call` is an **eligibility** endpoint
+  (`created→paid→scheduled(now)`, `202`, `Location`, constant-time Bearer auth when a key
+  is configured, in-process `(order,key)` idempotency with TTL, 409 on repeats); no
+  synchronous dial path. `GET /api/v1/orders/{id}/events` streams a full-order snapshot
+  then live `order` events, `retry: 3000`, 15 s `: ping`, flush per event, overrun ends the
+  stream with `event: error`/`overrun`. SSE subscribes only; it never publishes.
+- **Composition/lifecycle:** `App.Events`/`App.Scheduler`, `App.Start(ctx)` (idempotent,
+  no-op when disabled), `App.Close(ctx)` = scheduler → runner → hub, and
+  `App.CloseStorage()` for the Postgres pool last. `cmd/insteadly` starts the scheduler
+  before serving and shuts down scheduler → runner → hub → HTTP → pool.
+- **Tests added:** domain Schedule/Requeue guardrails + history ordering; events hub
+  delivery/drop/close; local scheduler store; runner publisher event sequence
+  (success/failure/shutdown abort); scheduler fake-clock retry table, cap, callback,
+  windows/DST/quiet, concurrency cap, lease release, Close; config defaults/env/validation/
+  redaction; HTTP auth/202/409/idempotent replay/TTL/SSE snapshot+live+heartbeat+overrun+
+  disconnect; Postgres-gated (`//go:build postgres`) adapter round-trip/JSONB/row-lock/
+  migration/claim-contention/SKIP-LOCKED/lease tests and app-level Postgres composition +
+  scheduler retry; untagged `m2_integration_test.go` (local + fake telephony/agent) driving
+  create → real place-call → scheduler → busy retry → booked, plus callback requeue and
+  SSE status sequence.
+- **Observed verification (this sandbox, `/tmp` caches; `CGO_ENABLED=0` for tagged tests):**
+  - `/Library/Developer/CommandLineTools/usr/bin/make verify` → **PASS** (gofmt clean,
+    `go vet`, `go test -race -count=1 ./...` all green, `check-deps` OK: core imports no
+    adapters, `CGO_ENABLED=0` build OK). The target reports golangci-lint as a PATH skip;
+    `/tmp/golangci-lint-2.15.0-darwin-arm64/golangci-lint run --timeout=5m` → **0 issues**.
+  - `make cover` → total **83.3 %** statements (events 94.0 %, scheduler 84.6 %,
+    httpapi 84.4 %, runner 94.3 %, app 78.4 %, config 96.7 %, domain 96.3 %, local 83.1 %;
+    the Postgres adapter has no default-tag tests by design). Tagged coverage:
+    postgres adapter **73.6 %**, app **82.8 %**.
+  - `go test -race -count=10 ./internal/core/scheduler ./internal/core/events
+    ./internal/core/runner ./internal/httpapi ./internal/app` → **PASS** (scheduler 1.7 s,
+    events 1.8 s, runner 4.8 s, httpapi 12.0 s, app 18.3 s). One earlier identical stress
+    run hit a transient 10 s loopback WebSocket read timeout in the pre-existing M0 fake
+    Mistral harness; the two subsequent full runs (app alone and the combined command)
+    passed, and no C5 test was involved.
+  - `go test -tags postgres -count=1 ./internal/adapters/storage/postgres/ ./internal/app/`
+    → **PASS** with Docker Engine 29.7.2 (testcontainers `postgres:16-alpine`): adapter
+    3.2 s, app 4.1 s. This includes concurrent claim contention (exactly one winner),
+    `SKIP LOCKED` locked-row exclusion, migration idempotence, JSONB fidelity, and the
+    Postgres-backed scheduler busy→booked retry.
+  - `go mod tidy` + `git diff --exit-code -- go.mod go.sum` → **clean**; `go.mod` pins
+    `pgx/v5 v5.13.0`, `testcontainers-go v0.45.0` and its Postgres module (test-only,
+    `//go:build postgres`); no other direct dependency. `go vet -tags live ./...` clean.
+  - `git diff main -- internal/core/domain/order.go internal/core/ports/storage.go` →
+    **additive only** (new fields/type/methods + new port; no changed existing behavior).
+    `git diff --check main...HEAD` clean. No live phone/Mistral test was run; no secret was
+    read or logged (`postgres.dsn` and `api.key` stay out of `Summary`).
+- **Status:** C5 is 🔵 code complete pending the conductor's final verification/merge.
+  DESIGN's real-phone exits, per-clinic opening hours (Q3), River, payments, recording
+  persistence, web UI, and real user auth remain out of scope/blocked as before.
 
 ### 2026-11-17 — C4 conductor live-gate session (Europe/Vienna)
 

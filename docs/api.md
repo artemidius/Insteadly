@@ -20,7 +20,8 @@ timestamps are RFC 3339.
   | 400 | `bad_request` | malformed JSON, unknown field, validation failure |
   | 404 | `not_found` | no such order (malformed IDs count as missing) |
   | 405 | — | wrong method (stdlib ServeMux default body) |
-  | 409 | `conflict` | order ID already exists |
+  | 401 | `unauthorized` | missing/invalid API key for a protected endpoint |
+  | 409 | `conflict` / `already_scheduled` | order ID already exists, or the order cannot be scheduled again |
   | 413 | `payload_too_large` | request body over 1 MiB |
   | 500 | `internal` | unexpected failure (details only in logs) |
 
@@ -90,6 +91,12 @@ Response: `201 Created`, `Location: /api/v1/orders/<id>`, and the stored order:
 }
 ```
 
+C5 adds the scheduler fields, omitted when empty:
+
+- `next_attempt_at`: when the next dial is due (scheduled orders; absent means due now).
+- `attempt_history`: append-only prior attempts (`number`, `outcome`, `started_at`,
+  `ended_at`), written when the scheduler requeues a callback or retryable failure.
+
 ## `GET /api/v1/orders`
 
 Returns all orders, newest first by `created_at`; an empty store returns `[]` (never
@@ -103,6 +110,46 @@ generated at creation.
 ```bash
 curl -s http://127.0.0.1:8080/api/v1/orders/ad354a4459ffdff6870e77e85bd04ac0 | jq .status
 # "created"
+```
+
+## `POST /api/v1/orders/{id}/call`
+
+**Makes an order eligible to dial now** — it does not dial synchronously. When
+`INSTEADLY_API_KEY` is set, send `Authorization: Bearer <key>`; an empty key disables auth
+for development. The call drives `created → paid → scheduled`
+(`next_attempt_at = now`) and returns `202 Accepted`; the scheduler claims and runs it on
+its next tick.
+
+- Optional `Idempotency-Key` header (≤ 128 chars). Reusing the key for the same order
+  returns the stored order with `200` and does not schedule again. The cache is in-process
+  with `INSTEADLY_API_IDEMPOTENCY_TTL` (default 10m); it is not durable (C6).
+- `404 not_found` if the order does not exist.
+- `409 already_scheduled` if it is already paid/scheduled; `409 conflict` for any other
+  status (dialing/ringing/in_call/finished).
+- `401 unauthorized` for a missing/wrong key when auth is configured.
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/api/v1/orders/<id>/call \
+  -H 'Authorization: Bearer <key>' -H 'Idempotency-Key: request-1'
+```
+
+## `GET /api/v1/orders/{id}/events` (SSE)
+
+A `text/event-stream` for one order. The first `event: order` frame is a full order
+snapshot; subsequent frames are order-status events:
+
+```json
+{"order_id":"…","status":"scheduled","outcome":null,"attempts":1,"at":"2026-11-17T20:00:00+01:00"}
+```
+
+`retry: 3000` is sent once so clients reconnect after 3 s. A `: ping` comment is sent every
+15 s. `Last-Event-ID` is accepted but ignored: every (re)connect re-snapshots, so no replay
+buffer exists. If a slow client overflows its buffer, the stream ends with
+`event: error` / `{"code":"overrun"}` and the client reconnects/re-snapshots. No auth in
+C5 (the whole API is prototype-scoped until C6).
+
+```bash
+curl -N http://127.0.0.1:8080/api/v1/orders/<id>/events
 ```
 
 ## Telephony webhooks (Twilio)

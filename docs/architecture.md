@@ -25,6 +25,8 @@ project exists — see `make check-deps` and [../DESIGN.md](../DESIGN.md).
 
 - `internal/core/domain` imports **stdlib only** (plus nothing else).
 - `internal/core/ports` imports `domain` only.
+- `internal/core/{events,scheduler}` import `domain`/`ports` and stdlib only;
+  `internal/core/config` stays stdlib-only (it never imports pgx).
 - Adapters import `ports` + `domain` only (plus vetted third-party libraries used entirely
   inside the adapter); they never import each other or `app`.
 - `internal/httpapi` talks to ports through `*app.App`; it contains no business rules.
@@ -53,6 +55,16 @@ concern (C5) and is deliberately absent from the state machine. Corrupt or illeg
 transitions return `domain.ErrInvalidTransition`; bad outcomes return
 `domain.ErrInvalidOutcome`.
 
+C5 adds two **additive** order fields and two methods:
+
+- `next_attempt_at` (scheduled due time; nil = due now) and `attempt_history`
+  (append-only `AttemptRecord`s of prior finished attempts).
+- `Schedule(next)` is the only `paid → scheduled` path besides `Requeue(next)`, which
+  re-opens a **finished** order with a retryable outcome (`callback_needed` or
+  `failed/{busy,no_answer,ivr_dead_end,error}`) while appending the finished attempt to
+  history. `booked`/`aborted`/`rejected`/`other` are never requeued. The spine transition
+  table is unchanged. `callback_needed` remains a terminal outcome, not a status.
+
 Other domain shapes: `CallEvent`/`EndReason` (normalized telephony, including
 `EventPlaybackMark` with an opaque `PlaybackID`), `Transcript`,
 `AudioChunk` + canonical audio constants, `BlobKey`, `Tool`, `Notification`,
@@ -74,25 +86,33 @@ the port boundary.
 | `TextToSpeech` / `SpeechStream` | `ports/speech.go` | conversation engine (C4) | feed text, canonical audio out, non-flushing `Abort` for barge-in; not 1:1 |
 | `Dialogue` / `DialogueSession` / `AssistantTurn` | `ports/dialogue.go` | conversation engine (C4) | text + tools in, streamed text + tool calls + outcome out; `Interrupt`/`SendControl` reconciliation |
 | `Storage` → `OrderStore`, `BlobStore` | `ports/storage.go` | API, runner, scheduler | orders + blobs; no provider types |
+| `SchedulerStore` | `ports/storage.go` | scheduler | list due orders, lease-claim (`ports.ErrNotEligible`), release; a claim never changes status |
 | `Payments` | `ports/payments.go` | API/webhook (C6) | declared, no adapter yet |
 | `Notifier` | `ports/notify.go` | runner (C7) | declared, no adapter yet |
 
 Sentinel errors shared by adapters: `ports.ErrNotFound`, `ports.ErrConflict`,
-`ports.ErrNotImplemented`. Channel closure and backpressure rules are written in the
-interface doc comments and must be honored by every adapter.
+`ports.ErrNotImplemented`, `ports.ErrNotEligible`. Channel closure and backpressure rules
+are written in the interface doc comments and must be honored by every adapter.
 
 ## Composition root
 
 `internal/app.New` turns a validated `config.Config` into the `App` object graph:
 
-- `Storage`: `local`.
+- `Storage`: `local`, or `postgres` (orders in Postgres, **blobs still local** via a
+  composite `ports.Storage`). The Postgres adapter runs embedded migrations at startup.
 - `Telephony`: `stub`, or `twilio` in `voice-api` mode (C1). `sip-trunk` still returns
   `ports.ErrNotImplemented` (C7).
 - `STT`, `TTS`, `Dialogue`: `stub`, or `mistral` (C2).
 - `Payments` and `Notify` remain `nil` until C6/C7.
 - `Agent` is one stateless `internal/core/agent.Agent` around the selected STT/TTS/
   Dialogue/Orders ports; `Runner` is one `internal/core/runner.Runner` around telephony,
-  orders, and the agent. `App.Close` drains active calls through the runner.
+  orders, and the agent.
+- `Events` is one `internal/core/events.Hub`; the runner and scheduler publish to it and
+  the HTTP SSE handler subscribes. `Scheduler` is one `internal/core/scheduler.Scheduler`
+  around the scheduler store, the order store, and the runner.
+- `App.Start(ctx)` starts the scheduler (idempotent, no-op when disabled).
+  `App.Close(ctx)` stops the scheduler, drains the runner, then closes the hub — in that
+  order. `App.CloseStorage()` releases the Postgres pool **last**, after HTTP shutdown.
 - `App.Webhooks` carries the telephony adapter's HTTP surface (nil for stub);
   `internal/httpapi` mounts it, so the JSON API package never imports an adapter.
 
@@ -118,6 +138,10 @@ No core changes, by design.
   so callbacks must be fast, I/O-free, and must not re-enter the store.
 - One `sync.RWMutex` for the whole store: fine at prototype scale; per-key sharding is
   a later optimization.
+- The local store also implements `ports.SchedulerStore`: `ListEligible` selects paid or
+  due scheduled orders, `Claim` records an **in-memory** lease (single-process only), and
+  `Release` clears it. `next_attempt_at`/`attempt_history` persist through the normal JSON
+  file.
 
 ## HTTP layer
 
@@ -129,6 +153,8 @@ No core changes, by design.
 | `GET /api/v1/orders` | list, newest first, `[]` when empty |
 | `POST /api/v1/orders` | create (server-assigned ID, strict JSON, 1 MiB cap) |
 | `GET /api/v1/orders/{id}` | fetch one |
+| `POST /api/v1/orders/{id}/call` | make an order eligible to dial now (`202`); API-key-gated when configured |
+| `GET /api/v1/orders/{id}/events` | SSE: one order snapshot, then live status events |
 
 Middleware order is `recoverer → requestID → logger`. Every response carries
 `X-Request-Id` (inbound value honored). Errors use one envelope:
@@ -245,6 +271,65 @@ endpoint in C4 — `Runner.Run` is the invocation surface until C5 owns authenti
 idempotent scheduling. Exact state machine, DSP constants, barge/hold/IVR/recovery rules,
 privacy constraints, and live-test recipes are in [agent.md](agent.md).
 
+## Orchestration (C5)
+
+### Event hub
+
+`internal/core/events.Hub` is a bounded fan-out (64 events per subscriber by default).
+`Publish` is non-blocking: a slow subscriber's channel is closed and counted as dropped
+rather than stalling a call. The runner publishes after every persisted status change
+(dialing/ringing/in_call/finished); the scheduler publishes `paid → scheduled`, requeues,
+and exhausted decisions. The HTTP layer only subscribes. A closed subscription is the
+client-visible signal to reconnect and re-snapshot.
+
+### Scheduler
+
+`internal/core/scheduler` is one in-process loop (the C7 seam is River):
+
+1. On each tick, if the configured opening windows allow `now`, list up to the free
+   concurrency slots from `SchedulerStore`.
+2. Lease-claim each candidate (never changing status). A paid order is moved to
+   `scheduled(next_attempt_at = now)` via the domain method; a scheduled one goes straight
+   to `Runner.Run`.
+3. `Runner.Run` remains the **only** `scheduled → dialing` transition and `Attempts++`.
+4. After the attempt, classify the persisted outcome: `booked`/`aborted`/`rejected`/`other`
+   are terminal; `callback_needed` requeues at `callback_at`; `busy` (15m),
+   `no_answer`/`ivr_dead_end` (30m), and `error` (5m) requeue with a linear
+   attempt multiplier, advanced to the next opening window. At `max_attempts` a retryable
+   outcome becomes terminal `failed/attempts_exhausted`.
+5. Every lease is released when the attempt returns; lease expiry is the crash-safety net.
+
+Clocks are injectable (`scheduler.Clock`, `scheduler.FakeClock`), windows are a config JSON
+list (Mon–Fri 08:00–18:00 Europe/Vienna by default) and quiet hours are simply the
+complement of the windows. The loop is bounded by `max_concurrent`; `Close` stops issuing,
+cancels in-flight attempts, and waits for them. `Scheduler.RunOnce`/`Wait` exist so tests
+drive scans deterministically under a fake clock.
+
+### Postgres adapter
+
+`internal/adapters/storage/postgres` implements `ports.OrderStore` and
+`ports.SchedulerStore` with pgx v5 only (no ORM):
+
+- `orders` table with JSONB `clinic`/`patient`/`outcome`/`recording`/`attempt_history`,
+  timestamptz columns, and adapter-local `lease_owner`/`lease_until`.
+- Embedded migrations (`migrations/0001_orders.sql`) applied in one transaction under a
+  `schema_migrations` version table and an advisory lock, so startup is idempotent and
+  concurrent instances do not race.
+- `Update` runs `SELECT … FOR UPDATE`, the callback, and the write in one transaction —
+  the runner's duplicate-dial fence stays intact cross-process.
+- `ListEligible` uses `FOR UPDATE SKIP LOCKED`; `Claim` locks the row, re-checks
+  status/lease/due-ness, and updates only the lease columns.
+- Postgres mode does **not** expose a blob store; the composition root composes it with
+  the local blob adapter.
+
+### Lifecycle
+
+`cmd/insteadly` starts the scheduler before serving HTTP. On SIGTERM/SIGINT it runs:
+scheduler → runner → event hub → `http.Server.Shutdown` → Postgres pool close. The pool is
+last so a persisting runner/scheduler never touches a closed pool; HTTP drains after the
+runner because an active call needs the telephony HTTP/WebSocket surface while it cancels
+and hangs up.
+
 ## Mistral adapters (C2)
 
 `internal/adapters/{stt,tts,dialogue}/mistral` implement `ports.SpeechToText`,
@@ -277,5 +362,5 @@ and live-test recipe.
 | C2 | ✅ (code) `internal/adapters/{stt,tts,dialogue}/mistral` + three `build*` cases; live Mistral smoke passed |
 | C3 | ✅ code complete (real-Mistral no-phone gate passed) `internal/core/agent` + `internal/core/runner`; no new API route |
 | C4 | 🔵 code complete pending the live no-phone gate: streaming VAD/turn-taking, barge-in, Twilio clear/mark, Mistral interrupt/control, TTS abort, IVR, hold, recovery; no new module/env/API surface |
-| C5 | Postgres storage adapter, scheduler, SSE endpoint in `httpapi` |
+| C5 | 🔵 code complete pending conductor verification: `internal/adapters/storage/postgres`, `internal/core/{scheduler,events}`, place-call + SSE in `httpapi`, Postgres-gated testcontainers suites |
 | C6/C7 | Payments and Notifier adapters; fill the `nil` fields in `app.App` |
