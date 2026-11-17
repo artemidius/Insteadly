@@ -55,11 +55,14 @@ func TestLiveM1NoPhone(t *testing.T) {
 		t.Fatalf("dialogue New: %v", err)
 	}
 
-	// Real TTS creates two scripted caller utterances. The second is used only when the
-	// assistant is speaking, proving a real barge with ClearAudio rather than a polite
-	// follow-up turn. No transcript is logged.
+	// Real TTS creates two scripted caller utterances. The first deliberately only asks for
+	// an appointment so the model must SPEAK a reply; an abort instruction here made a real
+	// model finish immediately with no assistant text, leaving nothing to barge. The abort
+	// instruction lives only in the second utterance, which is fed once the assistant is
+	// speaking to prove real barge/ClearAudio rather than a polite follow-up turn. No
+	// transcript is logged.
 	first := synthesizeInbound(t, ctx, tts,
-		"Guten Tag. Ich möchte bitte einen Termin vereinbaren. Bitte buchen Sie den Termin und beenden Sie den Anruf danach mit dem Ergebnis abgebrochen, denn das ist ein automatischer Test.")
+		"Guten Tag. Ich möchte bitte einen Termin vereinbaren.")
 	second := synthesizeInbound(t, ctx, tts,
 		"Stopp, ich möchte noch etwas sagen. Bitte beenden Sie den Anruf jetzt mit dem Ergebnis abgebrochen.")
 
@@ -224,6 +227,11 @@ func sentFrames(session *integrationSession) int {
 	return len(session.sentAudio)
 }
 
+// liveReplyGrowthFrames is 100 ms of new canonical audio. It is enough to prove the
+// assistant actually started speaking, while a short-but-real reply must not fail the
+// harness (the greeting is counted in the baseline before it).
+const liveReplyGrowthFrames = 5
+
 func awaitAudioGrowth(t *testing.T, session *integrationSession, baseline int, timeout time.Duration, runDone <-chan struct{}) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -233,7 +241,7 @@ func awaitAudioGrowth(t *testing.T, session *integrationSession, baseline int, t
 			t.Fatal("call ended before the assistant started speaking")
 		default:
 		}
-		if sentFrames(session) > baseline+20 {
+		if sentFrames(session) > baseline+liveReplyGrowthFrames {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)

@@ -24,8 +24,9 @@
 - **Current chunk:** C4 code complete (🔵). Next: conductor runs `make live-test-m1`
   (`TestLiveM1NoPhone`) with explicit approval; only an observed pass marks C4 ✅. Then write
   `plans/06-orchestration.md` and start C5.
-- **First action of the next session:** run the C4 no-phone live gate; if it passes, mark C4
-  ✅ and proceed to C5 planning. Do not run the real-phone M1 harness.
+- **First action of the next session:** re-run the C4 no-phone live gate with the pacing and
+  script harness fixes; if it passes, mark C4 ✅ and proceed to C5 planning. Do not run the
+  real-phone M1 harness.
 - **Blockers:** DESIGN's real-phone M0/M1 exits remain blocked by the Twilio trial stripping
   `<Stream>` and the unproven outbound-DTMF path — need an upgraded account, a controlled
   IVR/hold destination, and explicit approval before the end-to-end phone walk. Operational:
@@ -157,9 +158,17 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
   `feedPacedWhileRunning` (one frame per 20 ms, stops on `runDone`) for both scripted
   utterances; `sendFrames` remains the instant burst for credential-free integration tests.
   No production VAD/queue/`audioFeedBuffer` change. Dated details in
-  `plans/05-conversation.md` §13. The no-phone gate remains pending a fresh conductor run.
-- **Status:** C4 → 🔵 code complete pending the conductor's re-run of `make live-test-m1`
-  after the harness pacing fix. Real-phone M1 remains blocked by the Twilio
+  `plans/05-conversation.md` §13.
+- **Post-merge live-gate script fix (test content only):** the re-run on `92d8cdf` failed
+  because the first scripted utterance instructed the model to book AND abort, so the real
+  model returned `finish_call(aborted)` with no assistant text; there was no assistant audio
+  to barge (`clears=0`, greeting-only outbound). `first` is now exactly
+  `"Guten Tag. Ich möchte bitte einen Termin vereinbaren."`; the abort instruction stays only
+  in the `second` barge utterance. `awaitAudioGrowth` now needs only
+  `liveReplyGrowthFrames = 5` new frames (100 ms), so a short-but-real reply is not rejected.
+  No production change. Dated details in `plans/05-conversation.md` §13.
+- **Status:** C4 → 🔵 code complete pending the conductor's next `make live-test-m1` run
+  after the pacing and script harness fixes. Real-phone M1 remains blocked by the Twilio
   trial/outbound-DTMF/controlled IVR+hold prerequisites; C1 and the real-phone M0 exit
   remain blocked as before.
 
