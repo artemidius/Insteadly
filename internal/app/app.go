@@ -43,15 +43,15 @@ func New(cfg config.Config) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("telephony: %w", err)
 	}
-	stt, err := buildSTT(cfg.STT)
+	stt, err := buildSTT(cfg.STT, cfg.Mistral, log)
 	if err != nil {
 		return nil, fmt.Errorf("stt: %w", err)
 	}
-	tts, err := buildTTS(cfg.TTS)
+	tts, err := buildTTS(cfg.TTS, cfg.Mistral, log)
 	if err != nil {
 		return nil, fmt.Errorf("tts: %w", err)
 	}
-	dialogue, err := buildDialogue(cfg.Dialogue)
+	dialogue, err := buildDialogue(cfg.Dialogue, cfg.Mistral, log)
 	if err != nil {
 		return nil, fmt.Errorf("dialogue: %w", err)
 	}

@@ -9,14 +9,13 @@ medical appointments in Vienna, Austria. The backend is a Go service built as a
 interfaces; telephony, speech, dialogue, storage, payments, and notifications are
 swappable adapters.
 
-**Status:** C1 (Twilio telephony) is code-complete — see [PROGRESS.md](PROGRESS.md). The
-binary still boots and serves a working API with **no credentials and no external network
-calls** (all providers default to deterministic stubs); selecting
-`INSTEADLY_TELEPHONY_PROVIDER=twilio` activates the real Twilio Voice + Media Streams
-adapter. Live Media Streams audio is blocked on the current **trial** Twilio account
-(Twilio strips `<Stream>` during trial); the adapter is fully covered by fake-Twilio tests,
-and real dialing/status callbacks/TwiML fetch were verified live. STT, TTS, and dialogue
-are still stubs until C2.
+**Status:** C2 (Mistral STT/TTS/dialogue adapters) is code-complete — see
+[PROGRESS.md](PROGRESS.md). The binary still boots and serves a working API with **no
+credentials and no external network calls** (all providers default to deterministic stubs).
+Selecting `INSTEADLY_TELEPHONY_PROVIDER=twilio` activates the real Twilio Voice + Media Streams
+adapter; selecting `INSTEADLY_{STT,TTS,DIALOGUE}_PROVIDER=mistral` activates the real Mistral
+speech and dialogue adapters (see [docs/mistral.md](docs/mistral.md)). Twilio live audio is
+blocked on the current **trial** account; the Mistral chain was verified with a live smoke test.
 
 Design of record: [DESIGN.md](DESIGN.md). Chunk plans live in [`plans/`](plans/).
 
@@ -63,15 +62,23 @@ ignored.
 | `INSTEADLY_TWILIO_PHONE_NUMBER` | — | caller ID, E.164 |
 | `INSTEADLY_TWILIO_MODE` | `voice-api` | `voice-api`, `sip-trunk` (SIP trunk lands in C7) |
 | `INSTEADLY_TWILIO_RING_TIMEOUT_SECONDS` | `0` | Twilio `Timeout` (0 = Twilio default ~60 s); trial accounts reject this parameter |
-| `INSTEADLY_STT_PROVIDER` | `stub` | `stub`, `mistral` (C2) |
-| `INSTEADLY_TTS_PROVIDER` | `stub` | `stub`, `mistral` (C2) |
-| `INSTEADLY_DIALOGUE_PROVIDER` | `stub` | `stub`, `mistral` (C2) |
+| `INSTEADLY_STT_PROVIDER` | `stub` | `stub`, `mistral` |
+| `INSTEADLY_TTS_PROVIDER` | `stub` | `stub`, `mistral` |
+| `INSTEADLY_DIALOGUE_PROVIDER` | `stub` | `stub`, `mistral` |
 | `INSTEADLY_STORAGE_PROVIDER` | `local` | `local` |
 | `INSTEADLY_STORAGE_LOCAL_DIR` | `./data` | storage root |
 | `INSTEADLY_RECORDING_ENABLED` | `false` | global default (DESIGN.md §3.4) |
 | `INSTEADLY_TRANSCRIPT_ENABLED` | `false` | global default |
 | `INSTEADLY_AUDIO_ENABLED` | `false` | global default |
-| `INSTEADLY_MISTRAL_API_KEY` | — | **secret** (C2) |
+| `INSTEADLY_MISTRAL_API_KEY` | — | **secret**; required only when a Mistral provider is selected |
+| `INSTEADLY_MISTRAL_API_BASE_URL` | `https://api.mistral.ai` | absolute **https** origin |
+| `INSTEADLY_MISTRAL_STT_REALTIME_MODEL` | `voxtral-mini-transcribe-realtime-3` | |
+| `INSTEADLY_MISTRAL_STT_BATCH_MODEL` | `voxtral-mini-transcribe-3` | |
+| `INSTEADLY_MISTRAL_STT_STREAMING_DELAY_MS` | `480` | 80..1200, or exactly 2400 |
+| `INSTEADLY_MISTRAL_TTS_MODEL` | `voxtral-mini-tts-3-0` | |
+| `INSTEADLY_MISTRAL_TTS_VOICE` | `voice_447` | |
+| `INSTEADLY_MISTRAL_TTS_MODE` | `realtime` | `realtime`, `offline` |
+| `INSTEADLY_MISTRAL_DIALOGUE_MODEL` | `mistral-small-2603` | |
 
 Secrets are never logged; startup logs and `/healthz` use a sanitized summary. `.env`
 is git-ignored and must never be committed. Only `INSTEADLY_*` names are read: the
@@ -82,6 +89,9 @@ in [docs/twilio.md](docs/twilio.md).
 Configuring a provider whose adapter does not exist yet fails fast with a clear
 `not implemented (lands in chunk Cx)` error instead of a half-wired process.
 
+Mistral setup, the exact protocols, the 24→16 kHz audio conversion, the tool/outcome
+contract, and the live-test recipe are described in [docs/mistral.md](docs/mistral.md).
+
 ## Development
 
 | Command | What it does |
@@ -91,6 +101,7 @@ Configuring a provider whose adapter does not exist yet fails fast with a clear
 | `make test` | `go test -race -count=1 ./...` |
 | `make cover` | tests with coverage + one-line total |
 | `make live-test` | **opt-in** real Twilio call (`-tags live`); needs a public tunnel, credentials and credit |
+| `make live-test-mistral` | **opt-in** real Mistral smoke (`-tags live`); needs `LIVE_MISTRAL=1` and `MISTRAL_API_KEY` |
 | `make verify` | `lint` + `test` + `check-deps` + `build` (what CI enforces) |
 | `make lint` | gofmt check + `go vet` (+ `golangci-lint` when installed) |
 | `make check-deps` | fails if `internal/core` imports an adapter (hexagon guard) |
@@ -98,8 +109,8 @@ Configuring a provider whose adapter does not exist yet fails fast with a clear
 | `make clean` / `make clean-data` | remove `bin/` / `data/` |
 
 Dependencies: exactly **one** third-party module — `github.com/coder/websocket` v1.8.15
-(pure Go, zero transitive dependencies) for Twilio Media Streams. A further dependency
-needs a plan-level decision.
+(pure Go, zero transitive dependencies) for the Twilio Media Streams and Mistral realtime
+WebSocket clients. A further dependency needs a plan-level decision.
 
 ### Layout
 
@@ -108,7 +119,8 @@ cmd/insteadly/            process entrypoint (config -> app -> http.Server)
 internal/core/domain/     pure types + order state machine (stdlib only)
 internal/core/ports/      the six+1 port contracts the core consumes
 internal/core/config/     env loader, validation, secret-safe summary
-internal/adapters/        implementations: storage/local, stub, telephony/twilio
+internal/adapters/        implementations: storage/local, stub, telephony/twilio,
+                          stt/mistral, tts/mistral, dialogue/mistral
 internal/app/             composition root (the only core+adapters importer)
 internal/httpapi/         JSON API, middleware, error envelope
 ```
@@ -159,7 +171,7 @@ write` for releases).
 |---|---|---|
 | C0 | foundation: hexagon skeleton, config, local storage, stubs, HTTP API | ✅ |
 | C1 | Twilio telephony adapter (webhooks, Media Streams, µ-law→PCM16, DTMF) | 🔵 code complete; live audio blocked by Twilio trial |
-| C2 | Mistral STT / TTS / dialogue adapters | ⬜ |
+| C2 | Mistral STT / TTS / dialogue adapters | ✅ code complete; live smoke passed |
 | C3 | call runner + agent engine, end-to-end M0 walk | ⬜ |
 | C4+ | conversation, orchestration, web app, swapability | ⬜ |
 

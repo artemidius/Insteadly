@@ -10,22 +10,19 @@
 
 ## Status at a glance (update every session)
 
-- **Phase:** C0 complete; **C1 code complete** — real dialing, status callbacks, TwiML
-  fetching, and hangup were verified against Twilio. Live Media Streams audio is blocked by
-  the Twilio **trial** plan (Twilio strips `<Stream>`), so C1 is 🔵 until the account is
-  upgraded and the live test passes.
-- **Current chunk:** C1 — Twilio telephony adapter. Implementation and automated tests are
-  done; see [plans/02-twilio-telephony.md](plans/02-twilio-telephony.md) and the
-  amendments recorded there.
-- **First action of the next session:** with an **upgraded** Twilio account, start a
-  tunnel and run `LIVE_TWILIO=1 make live-test`; if it passes (media stream attached, tone
-  heard), mark C1 ✅ and then write `plans/03-mistral-ai.md` (C2).
-- **Blockers:** live Media Streams audio only — Twilio trial accounts strip `<Stream>`
-  from TwiML ([trial TwiML restrictions](https://www.twilio.com/docs/usage/trials/try-out-voice#custom-twiml-during-trial)).
-  No code blocker. Operational notes: `golangci-lint` is not installed (optional; a local
-  v2.15.0 copy under `/tmp` was used, 0 issues); `/usr/bin/make` is broken by the
-  Xcode 16.2/macOS 26 issue — use `/Library/Developer/CommandLineTools/usr/bin/make`
-  (verified) or `brew install make`.
+- **Phase:** C0 ✅; **C1 code complete** (live audio blocked by Twilio trial); **C2 ✅
+  code complete** — Mistral STT/TTS/dialogue adapters implemented, fake-provider suites
+  green, and the optional live smoke **passed** (TTS→STT→dialogue; float32 PCM encoding
+  confirmed).
+- **Current chunk:** C2 — Mistral STT/TTS/dialogue adapters (done). Next: write
+  `plans/04-m0-e2e.md` and start C3.
+- **First action of the next session:** write the C3 plan (call runner + agent engine,
+  M0 end-to-end), which consumes the C2 adapters and the C1 Twilio adapter; the first real
+  end-to-end phone call still needs an upgraded Twilio account plus the real Mistral key.
+- **Blockers:** Twilio trial account strips `<Stream>` (live Media Streams audio) — C1 🔵;
+  no code blocker. Operational: `golangci-lint` absent (optional; CI installs v2.15.0);
+  `/usr/bin/make` broken by the Xcode 16.2/macOS 26 issue — use
+  `/Library/Developer/CommandLineTools/usr/bin/make`.
 
 ---
 
@@ -35,7 +32,7 @@
 |---|---|---|---|---|
 | **C0** | M0 | Foundation: Go module, hexagon skeleton (domain, all 6 port contracts, config loader, local storage adapter, stub providers, composition root, HTTP API). Zero external deps, zero credentials. | [plans/01-foundation.md](plans/01-foundation.md) | ✅ |
 | **C1** | M0 | Twilio telephony adapter (voice-api): webhooks, Media Streams WebSocket, µ-law→PCM16, DTMF. | [plans/02-twilio-telephony.md](plans/02-twilio-telephony.md) | 🔵 code complete; live audio blocked by Twilio trial |
-| **C2** | M0 | Mistral adapters for STT / TTS / Dialogue (raw WS/JSON APIs, no Go SDK exists). | `plans/03-mistral-ai.md` (TBD) | ⬜ |
+| **C2** | M0 | Mistral adapters for STT / TTS / Dialogue (raw WS/JSON APIs, no Go SDK exists). | [plans/03-mistral-ai.md](plans/03-mistral-ai.md) | ✅ code complete; live smoke passed |
 | **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | `plans/04-m0-e2e.md` (TBD) | ⬜ |
 | **C4** | M1 | Conversation: VAD / turn-taking, barge-in, DTMF through IVRs, structured outcome extraction. | `plans/05-conversation.md` (TBD) | ⬜ |
 | **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE. | `plans/06-orchestration.md` (TBD) | ⬜ |
@@ -49,6 +46,47 @@ C1's plan is ready; before starting C2, write `plans/03-mistral-ai.md`.
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C2 implementation session (Europe/Vienna)
+
+- Implemented [plans/03-mistral-ai.md](plans/03-mistral-ai.md) end to end; committed on
+  `feat/c2-mistral-ai` (PR opened in this session).
+- **New packages** `internal/adapters/{stt,tts,dialogue}/mistral`:
+  - `stt/mistral`: `adapter.go` (Config/New), `realtime.go` (WS client, bounded audio
+    queue, cumulative partials, final-on-close), `batch.go` (multipart WAV→transcript),
+    `wav.go`, `language.go`, `errors.go` + fake-server tests.
+  - `tts/mistral`: `adapter.go`, `realtime.go`, `offline.go`, `audio.go` (float32 LE 24 kHz
+    → 15-tap anti-alias + 3:2 polyphase → PCM16 16 kHz, 640-byte framing), `sse.go`,
+    `errors.go` + unit/fake tests.
+  - `dialogue/mistral`: `adapter.go`, `protocol.go`, `session.go` (history, pending calls,
+    one-turn-at-a-time), `stream.go` (SSE, fragmented tool calls), `outcome.go`
+    (finish_call), `sse.go`, `errors.go` + unit/fake tests.
+- **Config/wiring:** nested `config.Mistral` + 8 new `INSTEADLY_MISTRAL_*` entries, strict
+  validation, secret-safe `Summary`; `internal/app` wires all three with aliases
+  `sttmistral`/`ttsmistral`/`dialoguemistral`. `make live-test-mistral` target (excluded
+  from `verify`).
+- **Automated verification (observed):**
+  - `/Library/Developer/CommandLineTools/usr/bin/make verify` → gofmt/vet clean,
+    `go test -race -count=1 ./...` all packages `ok`, `OK: core imports no adapters`,
+    binary built.
+  - `go test -race -count=10 ./internal/adapters/{stt,tts,dialogue}/mistral` → green.
+  - `make cover` → **83.9 %** total; mistral packages **stt 83.9 %**, **tts 85.2 %**,
+    **dialogue 89.5 %**.
+  - `go mod tidy` + `git diff --exit-code -- go.mod go.sum` → no dependency drift.
+  - `git diff main -- internal/core/domain internal/core/ports` → empty (no contract drift).
+  - `go test -tags live -run '^TestLiveMistral$' ./internal/app` without gates → SKIP.
+- **Live smoke (user-authorized):** `LIVE_MISTRAL=1 make live-test-mistral` →
+  **PASS** — TTS `Guten Tag.` → 40 canonical 640-byte frames → realtime STT final transcript
+  containing `guten` → one dialogue `capture_info` call (not executed). The plan's #1 risk
+  (raw `pcm` float32 LE mono 24 kHz encoding) was **confirmed correct on the first attempt**.
+- **Amendments (also in the plan §13):** Mistral closes both realtime WebSockets without a
+  clean `1000` close frame after `speech.audio.done` / `transcription.done`; the TTS and STT
+  readers now treat any close after `done` as success. Transport robustness only — not a
+  PCM/model/message-shape mismatch.
+- **Docs:** README status/config/layout/roadmap, `docs/architecture.md`, new
+  `docs/mistral.md`, PROGRESS, `plans/03-mistral-ai.md` §13 amendments.
+- **Environment:** key present under unprefixed `MISTRAL_API_KEY` (value never read/printed);
+  app reads only `INSTEADLY_MISTRAL_API_KEY`. No new module deps.
 
 ### 2026-11-17 — C1 implementation session (Europe/Vienna)
 
@@ -254,7 +292,9 @@ C1's plan is ready; before starting C2, write `plans/03-mistral-ai.md`.
 - **Credentials:** `.env` must never be committed (it is git-ignored). The app reads it only
   through the registry of `INSTEADLY_*` names; the **unprefixed** Twilio names already in
   `.env` are not read (C1 decision — mirror/export them as `INSTEADLY_TWILIO_*`). `TEST_PHONE`
-  is read only by the build-tagged live test. `MISTRAL_API_KEY` still missing (needed C2).
+  is read only by the build-tagged live test. `MISTRAL_API_KEY` (unprefixed) is present in
+  `.env`; the app reads only `INSTEADLY_MISTRAL_API_KEY`, and only the build-tagged
+  `LIVE_MISTRAL=1` smoke reads `MISTRAL_API_KEY` directly.
 - **Tunnel:** `cloudflared` 2026.11.0 works from `/tmp` (quick tunnel; HTTP + WSS verified);
   it is **not installed** globally. The tunnel URL must equal `INSTEADLY_HTTP_PUBLIC_URL`
   (scheme + host, no trailing slash) or Twilio webhook signatures fail with 403.

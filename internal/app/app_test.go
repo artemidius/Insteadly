@@ -43,20 +43,74 @@ func TestNewWiresDefaults(t *testing.T) {
 	}
 }
 
-func TestNewRejectsUnimplementedProviders(t *testing.T) {
-	// Every mistral-backed port must fail until C2.
-	for name, mutate := range map[string]func(*config.Config){
+func mistralCfg(cfg *config.Config) {
+	cfg.Mistral = config.Mistral{
+		APIKey:  "test-key",
+		BaseURL: "https://example.test",
+		STT: config.MistralSTT{
+			RealtimeModel:    "rt-model",
+			BatchModel:       "batch-model",
+			StreamingDelayMS: 480,
+		},
+		TTS:      config.MistralTTS{Model: "tts-model", DefaultVoice: "voice_1", Mode: "realtime"},
+		Dialogue: config.MistralDialogue{Model: "dlg-model"},
+	}
+}
+
+func TestNewWiresMistralProviders(t *testing.T) {
+	providers := map[string]func(*config.Config){
 		"stt":      func(c *config.Config) { c.STT.Provider = "mistral" },
 		"tts":      func(c *config.Config) { c.TTS.Provider = "mistral" },
 		"dialogue": func(c *config.Config) { c.Dialogue.Provider = "mistral" },
-	} {
+	}
+	for name, mutate := range providers {
 		t.Run(name, func(t *testing.T) {
 			cfg := testConfig(t)
+			mistralCfg(&cfg)
 			mutate(&cfg)
-			if _, err := New(cfg); !errors.Is(err, ports.ErrNotImplemented) {
-				t.Fatalf("err = %v, want ErrNotImplemented", err)
+			a, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			switch name {
+			case "stt":
+				if a.STT == nil {
+					t.Fatal("stt not wired")
+				}
+			case "tts":
+				if a.TTS == nil {
+					t.Fatal("tts not wired")
+				}
+			case "dialogue":
+				if a.Dialogue == nil {
+					t.Fatal("dialogue not wired")
+				}
 			}
 		})
+	}
+
+	// All three at once.
+	cfg := testConfig(t)
+	mistralCfg(&cfg)
+	cfg.STT.Provider = "mistral"
+	cfg.TTS.Provider = "mistral"
+	cfg.Dialogue.Provider = "mistral"
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New(all mistral): %v", err)
+	}
+	if a.STT == nil || a.TTS == nil || a.Dialogue == nil {
+		t.Fatal("mistral providers not wired")
+	}
+}
+
+func TestNewRejectsMistralMissingKey(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.STT.Provider = "mistral"
+	// Mistral.APIKey left empty; the adapter constructor must reject it without any
+	// network I/O.
+	if _, err := New(cfg); err == nil {
+		t.Fatal("expected missing-key error at construction")
 	}
 }
 
