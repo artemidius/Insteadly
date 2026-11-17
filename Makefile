@@ -1,7 +1,7 @@
 BIN      := bin/insteadly
 VERSION  ?= dev
 
-.PHONY: build run test live-test lint fmt check-deps verify cover clean clean-data
+.PHONY: build run test live-test live-test-mistral live-test-m0 live-test-m0-phone lint fmt check-deps verify cover clean clean-data
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$(VERSION)" -o $(BIN) ./cmd/insteadly
@@ -17,6 +17,12 @@ live-test:
 
 live-test-mistral:
 	go test -tags live -count=1 -run '^TestLiveMistral$$' -v ./internal/app
+
+live-test-m0:
+	go test -tags live -count=1 -run '^TestLiveM0NoPhone$$' -v ./internal/app
+
+live-test-m0-phone:
+	go test -tags live -count=1 -run '^TestLiveM0Phone$$' -v ./internal/app
 
 cover:
 	go test -race -count=1 -coverprofile=coverage.out ./...
