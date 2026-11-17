@@ -183,9 +183,22 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
   drops the model-reply `awaitMarks`/`awaitAudioGrowth` gating. Production barge is
   unchanged; the synthetic M1 scenario still covers it. Dated details in
   `plans/05-conversation.md` §13.
+- **Barge-onset VAD tuning (production change, conductor-authorized):** the `35d3512` gate
+  still saw `clears=0`; measured real-TTS frames showed why. Real speech has only 3–4 loud
+  consecutive frames before consonant/phoneme dips (e.g. RMS 0.0046, 0.0373, 0.0946, 0.0897,
+  0.0366, 0.0035, …), and spectral flux spikes only at transitions, so the old
+  “5 consecutive flux-qualified frames” barge rule was unreachable in practice. Barge onset
+  now requires **3 consecutive frames / 60 ms** above `max(normal, 4·noise, 0.024)` with
+  flatness/tone checks and **no per-frame flux**; normal listening onset still requires flux.
+  `BargeInFrames` default 5→3; the stronger energy floor retains asymmetry (still no AEC).
+  The live cue now starts with measured speech energy: `"Guten Tag. Bitte beenden Sie den
+  Anruf jetzt mit dem Ergebnis abgebrochen, …"`. Added
+  `TestVADBargeFiresOnSteadyLoudVoicedFramesWithoutFlux` and
+  `TestVADBargeFiresOnMeasuredSpeechProfile`; updated synthetic barge/listener thresholds.
+  Dated §3.7 + §13 notes. No live test run.
 - **Status:** C4 → 🔵 code complete pending the conductor's next `make live-test-m1` run
-  with the greeting-barge harness. Real-phone M1 remains blocked by the Twilio
-  trial/outbound-DTMF/controlled IVR+hold prerequisites; C1 and the real-phone M0 exit
+  with the tuned barge onset and greeting-barge harness. Real-phone M1 remains blocked by the
+  Twilio trial/outbound-DTMF/controlled IVR+hold prerequisites; C1 and the real-phone M0 exit
   remain blocked as before.
 
 

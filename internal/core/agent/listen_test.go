@@ -99,15 +99,15 @@ func TestListenerBargeSignalBeforeHandshake(t *testing.T) {
 	stt := &fakeSTT{script: fakeSTTScript{finals: []string{"Stopp"}}}
 	l, call := startTestListener(t, stt)
 	l.setMode(modeAssistant)
-	// 3 frames < 100 ms barge threshold.
-	call.push(speechFrames(3)...)
+	// 2 frames < 60 ms barge onset.
+	call.push(speechFrames(2)...)
 	time.Sleep(30 * time.Millisecond)
 	select {
 	case <-l.bargeChannel():
-		t.Fatal("barge fired before 100 ms")
+		t.Fatal("barge fired before 60 ms")
 	default:
 	}
-	call.push(speechFrames(5)...)
+	call.push(speechFrames(4)...)
 	select {
 	case <-l.bargeChannel():
 	case <-time.After(time.Second):

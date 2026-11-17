@@ -97,7 +97,7 @@ func TestBargeOmitsCurrentUnmarkedSegment(t *testing.T) {
 	tts.feedHook = func(text string) {
 		if strings.HasPrefix(text, "Zweiter") {
 			// Keep the second assistant segment in synthesis long enough that the barge
-			// (published after ~100 ms of speech) always wins the race. The aborted stream
+			// (published after ~60 ms of speech) always wins the race. The aborted stream
 			// must not be marked even after FeedText returns.
 			time.Sleep(400 * time.Millisecond)
 		}
@@ -126,7 +126,7 @@ func TestBargeOmitsCurrentUnmarkedSegment(t *testing.T) {
 	}
 }
 
-func TestBargeRequiresStrongerOnsetAndRejectsTones(t *testing.T) {
+func TestBargeRequiresStrongerEnergyAndRejectsTones(t *testing.T) {
 	store := newFakeStore(testOrder())
 	never := make(chan struct{})
 	dlg := &fakeDialogue{scripts: []turnScript{
@@ -139,24 +139,32 @@ func TestBargeRequiresStrongerOnsetAndRejectsTones(t *testing.T) {
 	c := startConversation(t, cfg)
 	c.call.push(utteranceAudio()...)
 	waitFor(t, "assistant speaks", func() bool { return ttsSpoke(tts, "Antwort") })
-	// Three onset frames (60 ms) are below the 100 ms barge threshold.
-	c.call.push(speechFrames(3)...)
-	time.Sleep(50 * time.Millisecond)
-	dlg.mu.Lock()
-	interrupts := len(dlg.interrupts)
-	dlg.mu.Unlock()
-	if interrupts != 0 {
-		t.Fatalf("60 ms of speech interrupted the assistant")
+	interrupted := func() bool {
+		dlg.mu.Lock()
+		defer dlg.mu.Unlock()
+		return len(dlg.interrupts) > 0
 	}
-	// A strong hold tone never barges, even for 200 ms.
+	// Speech above the normal floor but below the 0.024 barge floor must not interrupt.
+	c.call.push(frames(6, voicedFrameAtRMS(0.015))...)
+	time.Sleep(50 * time.Millisecond)
+	if interrupted() {
+		t.Fatal("sub-barge-threshold speech interrupted the assistant")
+	}
+	// A strong hold tone never barges, even for 150 ms.
 	c.call.push(frames(10, toneFrame(440, 12000))...)
 	time.Sleep(50 * time.Millisecond)
-	dlg.mu.Lock()
-	interrupts = len(dlg.interrupts)
-	dlg.mu.Unlock()
-	if interrupts != 0 {
-		t.Fatalf("a hold tone interrupted the assistant")
+	if interrupted() {
+		t.Fatal("a hold tone interrupted the assistant")
 	}
+	// Two loud voiced frames (40 ms) are below the 3-frame barge onset.
+	c.call.push(speechFrames(2)...)
+	time.Sleep(30 * time.Millisecond)
+	if interrupted() {
+		t.Fatal("two barge frames interrupted the assistant")
+	}
+	// The third loud voiced frame completes the 60 ms barge onset.
+	c.call.push(speechFrames(1)...)
+	waitFor(t, "barge", interrupted)
 	close(c.ended)
 	_, _ = resultOf(t, c.done)
 }

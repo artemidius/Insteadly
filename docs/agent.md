@@ -72,7 +72,7 @@ Independent goroutines never decide whether the user is speaking.
 |---|---|---|
 | `listening` | noise-adaptive VAD; no assistant audio | 60 ms onset opens one STT worker; listen timeout 20 s |
 | `utterance` | pre-roll + live frames feed STT; results drained concurrently | 700 ms hangover after ≥200 ms speech closes input; 15 s forced boundary |
-| `assistant` | full-duplex VAD and playback-mark reconciliation | 100 ms stronger onset barges in; cancel model/TTS, clear playback |
+| `assistant` | full-duplex VAD and playback-mark reconciliation | 60 ms stronger onset barges in; cancel model/TTS, clear playback |
 | `tools` | capture/transcribe one bounded pending utterance; never cancel an atomic tool | tool results are submitted before a new assistant can speak |
 | `holding` | detect speech/silence/DTMF; never STT hold audio | speech resumes an utterance; 500 ms silence returns to listening; 90 s → `failed/other` |
 | `ivr_wait` | wait for a new menu, hold, or human speech after a digit | repeats/ambiguity/loops/4-step/15 s bounds follow the policy |
@@ -91,7 +91,7 @@ ring, and a 150-frame hold slate are retained; no recording or spectrogram is st
 | Frame | 640 B / 20 ms | arbitrary even chunks reframed with residual bytes; empty/odd input is a contract error |
 | Noise floor | 0.003, clamp [0.001, 0.05] | adapts only on non-speech, non-hold frames (up 0.02 / down 0.005); frozen during speech, assistant playback, and hold |
 | Normal energy threshold | `clamp(3·noise, 0.012, 0.10)` | onset additionally needs flatness `< 0.75`, flux `≥ 0.04`, no strong tone |
-| Barge threshold | `max(normal, 4·noise, 0.024)` | 5 consecutive onset frames / 100 ms |
+| Barge threshold | `max(normal, 4·noise, 0.024)` | 3 consecutive barge frames / 60 ms; energy/flatness/tone only (no per-frame flux) |
 | Start | 3 onset frames / 60 ms | pre-roll ring prepended exactly once |
 | Pre-roll | 15 frames / 300 ms | bounded; never replayed from a whole-utterance buffer |
 | Minimum utterance | 10 active frames / 200 ms | shorter candidates are discarded, listening continues |

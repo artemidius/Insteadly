@@ -95,3 +95,30 @@ func testHoldConfig() HoldConfig {
 	}
 	return c
 }
+
+// voicedFrameAtRMS builds a stationary multi-component voiced frame scaled to the given
+// normalized RMS. It is not a hold probe and is useful for realistic loudness envelopes.
+func voicedFrameAtRMS(target float64) []byte {
+	base := speechFrame(0)
+	var sum float64
+	for i := 0; i < domain.FrameBytes/2; i++ {
+		v := float64(int16(binary.LittleEndian.Uint16(base[2*i:]))) / 32768
+		sum += v * v
+	}
+	current := math.Sqrt(sum / float64(domain.FrameBytes/2))
+	if current == 0 {
+		return make([]byte, domain.FrameBytes)
+	}
+	scale := target / current
+	frame := make([]byte, domain.FrameBytes)
+	for i := 0; i < domain.FrameBytes/2; i++ {
+		v := float64(int16(binary.LittleEndian.Uint16(base[2*i:]))) * scale
+		if v > 32767 {
+			v = 32767
+		} else if v < -32768 {
+			v = -32768
+		}
+		binary.LittleEndian.PutUint16(frame[2*i:], uint16(int16(v)))
+	}
+	return frame
+}

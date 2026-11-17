@@ -158,14 +158,14 @@ func TestVADStrongToneNeverOnset(t *testing.T) {
 
 func TestVADBargeThreshold(t *testing.T) {
 	cfg := testVADConfig()
-	// Normal onset is 3 frames; barge-in needs 5.
-	tr := runVAD(t, cfg, vadBarge, speechFrames(4))
+	// Normal onset is 3 frames; barge-in needs 3 consecutive barge frames (60 ms).
+	tr := runVAD(t, cfg, vadBarge, speechFrames(2))
 	if tr.onsets != 0 {
-		t.Errorf("barge fired before 100 ms: %+v", tr)
+		t.Errorf("barge fired before 60 ms: %+v", tr)
 	}
-	tr = runVAD(t, cfg, vadBarge, speechFrames(6))
+	tr = runVAD(t, cfg, vadBarge, speechFrames(4))
 	if tr.onsets != 1 {
-		t.Fatalf("barge did not fire after 5 onset frames: %+v", tr)
+		t.Fatalf("barge did not fire after 3 barge frames: %+v", tr)
 	}
 }
 
@@ -174,7 +174,7 @@ func TestVADConfigValidation(t *testing.T) {
 	if err := applyVADDefaults(&c); err != nil {
 		t.Fatalf("defaults: %v", err)
 	}
-	if c.PreRollFrames != 15 || c.StartFrames != 3 || c.BargeInFrames != 5 ||
+	if c.PreRollFrames != 15 || c.StartFrames != 3 || c.BargeInFrames != 3 ||
 		c.MinActiveFrames != 10 || c.EndSilenceFrames != 35 || c.MaxUtteranceFrames != 750 {
 		t.Errorf("unexpected defaults: %+v", c)
 	}
@@ -203,3 +203,35 @@ func TestVADConfigValidation(t *testing.T) {
 }
 
 func domainFrameBytes() int { return 640 }
+
+func TestVADBargeFiresOnSteadyLoudVoicedFramesWithoutFlux(t *testing.T) {
+	// Repeating one stationary voiced frame keeps spectral flux near zero after the first
+	// frame. Real speech runs like this between transitions; requiring flux on every barge
+	// frame made barge essentially unreachable. The stronger energy/tone checks still apply.
+	cfg := testVADConfig()
+	tr := runVAD(t, cfg, vadBarge, frames(3, speechFrame(0)))
+	if tr.onsets != 1 {
+		t.Fatalf("barge did not fire on steady loud voiced frames: %+v", tr)
+	}
+	if tr.onsetAt != 2 {
+		t.Errorf("barge onset at %d, want the third frame (60 ms)", tr.onsetAt)
+	}
+}
+
+func TestVADBargeFiresOnMeasuredSpeechProfile(t *testing.T) {
+	// RMS profile measured from real Mistral TTS "Guten Tag. …": four loud frames, a
+	// consonant/phoneme dip, then four loud frames. Only three consecutive barge frames are
+	// required, so the first run must open the interruption.
+	profile := []float64{0.0046, 0.0373, 0.0946, 0.0897, 0.0366, 0.0035, 0.0014, 0.0054, 0.1160, 0.1388, 0.1509, 0.1167}
+	list := make([][]byte, 0, len(profile))
+	for _, rms := range profile {
+		list = append(list, voicedFrameAtRMS(rms))
+	}
+	tr := runVAD(t, testVADConfig(), vadBarge, list)
+	if tr.onsets != 1 {
+		t.Fatalf("barge did not fire on the measured speech profile: %+v", tr)
+	}
+	if tr.onsetAt != 3 {
+		t.Errorf("barge onset at %d, want the fourth profile frame after three confirmed frames", tr.onsetAt)
+	}
+}
