@@ -145,7 +145,7 @@ func TestHealth(t *testing.T) {
 	if got.UptimeSeconds < 0 {
 		t.Errorf("uptime = %d", got.UptimeSeconds)
 	}
-	for _, key := range []string{"telephony", "stt", "tts", "dialogue", "storage"} {
+	for _, key := range []string{"telephony", "stt", "tts", "dialogue", "storage", "notify"} {
 		if got.Providers[key] == "" {
 			t.Errorf("providers[%q] is empty", key)
 		}

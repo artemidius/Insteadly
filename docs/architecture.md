@@ -20,7 +20,8 @@ project exists — see `make check-deps` and [../DESIGN.md](../DESIGN.md).
                   ▼        ▼
         internal/core/*   internal/adapters/*
         (domain, ports,   (storage/local,
-         config)           stub, twilio… in C1+)
+         config, recorder, stub, twilio, telnyx,
+         notify, agent…)   openai, notify/*, …)
 ```
 
 - `internal/core/domain` imports **stdlib only** (plus nothing else).
@@ -28,6 +29,9 @@ project exists — see `make check-deps` and [../DESIGN.md](../DESIGN.md).
 - `internal/core/{events,scheduler}` import `domain`/`ports` and stdlib only;
   `internal/core/auth` imports only `core/{ports,domain}` + stdlib (crypto/rand,
   crypto/sha256, encoding/base64); bcrypt lives in `internal/adapters/password/bcrypt`.
+- `internal/core/recorder` (C7) imports only `domain`/`ports` + stdlib; it never imports
+  `config` or an adapter. `internal/core/notify` (C7) imports `domain`/`ports`/`events` +
+  stdlib. Both are covered by `make check-deps`.
 - `internal/core/config` stays stdlib-only (it never imports pgx, stripe-go, or bcrypt).
 - Adapters import `ports` + `domain` only (plus vetted third-party libraries used entirely
   inside the adapter); they never import each other or `app`.
@@ -105,7 +109,7 @@ the port boundary.
 | `SchedulerStore` | `ports/storage.go` | scheduler | list due orders, lease-claim (`ports.ErrNotEligible`), release; a claim never changes status |
 | `Payments` | `ports/payments.go` | API/webhook (C6) | Checkout redirect + signed webhook; `stub` (dev) or `stripe` adapter |
 | `AuthStore` / `PasswordHasher` | `ports/auth.go` | core auth service (C6) | users/sessions persistence + password hashing; local/Postgres + bcrypt adapters |
-| `Notifier` | `ports/notify.go` | runner (C7) | declared, no adapter yet |
+| `Notifier` | `ports/notify.go` | `core/notify` worker (C7) | terminal outcome → one notification; `log`/`webhook` adapters, `off` by default |
 
 Sentinel errors shared by adapters: `ports.ErrNotFound`, `ports.ErrConflict`,
 `ports.ErrNotImplemented`, `ports.ErrNotEligible`. Channel closure and backpressure rules
@@ -117,20 +121,27 @@ are written in the interface doc comments and must be honored by every adapter.
 
 - `Storage`: `local`, or `postgres` (orders in Postgres, **blobs still local** via a
   composite `ports.Storage`). The Postgres adapter runs embedded migrations at startup.
-- `Telephony`: `stub`, or `twilio` in `voice-api` mode (C1). `sip-trunk` still returns
-  `ports.ErrNotImplemented` (C7).
-- `STT`, `TTS`, `Dialogue`: `stub`, or `mistral` (C2).
+- `Telephony`: `stub`, `twilio` in `voice-api` mode (C1), or `telnyx` (C7). Twilio
+  `sip-trunk` still returns `ports.ErrNotImplemented`.
+- `STT`/`TTS`: `stub` or `mistral` (C2). `Dialogue`: `stub`, `mistral` (C2), or `openai`
+  (C7).
 - `Payments` is `stub` (default) or `stripe`; `Auth` is one `core/auth.Service` built from
-  the storage `AuthStore` + the bcrypt `PasswordHasher`. `Notify` remains `nil` until C7.
+  the storage `AuthStore` + the bcrypt `PasswordHasher`.
+- `Notify` (C7) is `nil` when `notify.provider=off` (the default); otherwise it is a
+  `log`/`webhook` `ports.Notifier` plus one `core/notify.Worker` subscribed to the hub.
+- `Recorder` (C7) is always injected into the runner: with every recording flag off it
+  returns the dialed session unchanged, and a per-order override can still enable capture.
 - `Agent` is one stateless `internal/core/agent.Agent` around the selected STT/TTS/
   Dialogue/Orders ports; `Runner` is one `internal/core/runner.Runner` around telephony,
   orders, and the agent.
 - `Events` is one `internal/core/events.Hub`; the runner and scheduler publish to it and
   the HTTP SSE handler subscribes. `Scheduler` is one `internal/core/scheduler.Scheduler`
   around the scheduler store, the order store, and the runner.
-- `App.Start(ctx)` starts the scheduler (idempotent, no-op when disabled).
-  `App.Close(ctx)` stops the scheduler, drains the runner, then closes the hub — in that
-  order. `App.CloseStorage()` releases the Postgres pool **last**, after HTTP shutdown.
+- `App.Start(ctx)` starts the notify worker (when configured), then the scheduler
+  (idempotent, no-op when disabled).
+  `App.Close(ctx)` stops the scheduler, drains the runner, stops the notify worker (so it
+  can still deliver a final finished event), then closes the hub — in that order.
+  `App.CloseStorage()` releases the Postgres pool **last**, after HTTP shutdown.
 - `App.Webhooks` carries the telephony adapter's HTTP surface (nil for stub);
   `internal/httpapi` mounts it, so the JSON API package never imports an adapter.
 
@@ -452,6 +463,61 @@ never cross a port boundary.
 See [mistral.md](mistral.md) for the exact protocols, config surface, tool/outcome contract,
 and live-test recipe.
 
+## Telnyx telephony adapter (C7)
+
+`internal/adapters/telephony/telnyx` is the second `ports.Telephony`/`ports.CallSession`
+adapter. It uses Telnyx Call Control REST + call-control webhooks and is the **server** for
+Telnyx's bidirectional Media Streams WebSocket. Provider concepts (`call_control_id`,
+`connection_id`, `stream_id`, µ-law, Ed25519 signatures) never leave the package.
+
+- Dial `POST /v2/calls` → `call.initiated`/`call.answered`/`call.hangup` webhooks; on
+  answer, `POST /v2/calls/{id}/actions/streaming_start` with `stream_track=both_tracks`,
+  `stream_bidirectional_mode=rtp`, `stream_bidirectional_codec=PCMU`.
+- Webhooks are Ed25519-signed (`telnyx-signature-ed25519` + `telnyx-timestamp`, message
+  `{ts}|{body}`); the media-stream handshake is signed over `{ts}|{stream_url}`. With the
+  optional `INSTEADLY_TELNYX_WEBHOOK_PUBLIC_KEY`, signed requests must verify (fail closed);
+  unsigned callbacks rely on the unguessable per-call path plus a `call_control_id` (and,
+  when present, `connection_id`) match.
+- Media stream: `start`/`media`(µ-law 8 kHz)/`dtmf`/`mark`(echo)/`stop`/`error` inbound;
+  `media`/`mark`/`clear` outbound. The adapter has a self-contained G.711 + 8↔16 kHz codec
+  (a copy, not an import, of the Twilio conversion).
+- Outbound DTMF uses `POST /v2/calls/{id}/actions/send_dtmf`; hangup treats `90018`
+  (already ended) as success.
+
+Mounted by `httpapi` when `telephony.provider=telnyx`:
+
+| Route | Purpose |
+|---|---|
+| `POST /webhooks/telephony/telnyx/webhook/{callID}` | call-control events |
+| `GET /webhooks/telephony/telnyx/stream/{callID}` | bidirectional media-stream WebSocket |
+
+All tests use in-repo fake REST/WebSocket servers — no account or live call. See
+[telnyx.md](telnyx.md) for the verified protocol, signatures, and plan deviations.
+
+## OpenAI dialogue adapter (C7)
+
+`internal/adapters/dialogue/openai` is the second `ports.Dialogue` adapter and the C7
+"alternative AI provider". It is structurally parallel to `dialogue/mistral`: Chat
+Completions SSE over stdlib `net/http` + `bufio`, local history, fragmented tool-call
+assembly, and the reserved `finish_call` outcome with strict `domain.Outcome` validation.
+The OpenAI-specific differences are the base URL (`https://api.openai.com/v1`), the model
+(`gpt-4o-mini` default), and the `max_completion_tokens` request field (a test pins it).
+
+STT/TTS stay on Mistral in C7; one alternative AI port is enough to prove the swap promise.
+All tests use a single `httptest` SSE server — no key, no network. See
+[openai.md](openai.md).
+
+## Recording and notifications (C7)
+
+The recording seam is one optional `runner.Config.Recorder` field. `internal/core/recorder`
+resolves `recording` as the master gate over the per-order `domain.RecordingFlags`, tees the
+dialed `ports.CallSession` (forwarding every method, including optional `StreamReady`), and
+on finalize persists two mono WAVs and/or a batch transcript through `ports.BlobStore`.
+Flags off ⇒ the original session, no goroutine, zero bytes. `internal/core/notify` is a core
+worker over the existing `events.Hub`: `finished` + non-nil `Outcome`, deduped by
+`(OrderID, Attempts)`, resolved recipient, best-effort `Notifier.Send`. See
+[recording.md](recording.md) and [notifications.md](notifications.md).
+
 ## Extension points
 
 | Chunk | Change |
@@ -462,4 +528,4 @@ and live-test recipe.
 | C4 | 🔵 code complete pending the live no-phone gate: streaming VAD/turn-taking, barge-in, Twilio clear/mark, Mistral interrupt/control, TTS abort, IVR, hold, recovery; no new module/env/API surface |
 | C5 | 🔵 code complete pending conductor verification: `internal/adapters/storage/postgres`, `internal/core/{scheduler,events}`, place-call + SSE in `httpapi`, Postgres-gated testcontainers suites |
 | C6 | 🔵 code complete pending conductor verification: users/sessions + cookie auth, Stripe Checkout + signed webhook + stub, ownership scoping, React+TS SPA embedded behind `webembed` |
-| C7 | Notifier adapter; recording persistence; CSRF/reset/rate limiting; second provider swap |
+| C7 | 🔵 code complete pending conductor verification: `telephony/telnyx`, `dialogue/openai`, `core/recorder` + `runner.Config.Recorder`, `core/notify` + `notify/{log,webhook}`, config/env wiring; **no port/domain change**; no new module dep. Still later: durable outbox, CSRF/reset/rate limiting, Postgres blobs, deployment (Q5) |

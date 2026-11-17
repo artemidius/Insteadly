@@ -429,3 +429,84 @@ func TestNewWiresStripeAdapterWithoutNetwork(t *testing.T) {
 		t.Fatal("stripe Payments not wired")
 	}
 }
+
+func TestNewWiresTelnyxOpenAIAndNotify(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.HTTP.PublicURL = "https://example.test"
+	cfg.Telephony = config.Telephony{
+		Provider: "telnyx",
+		Telnyx: config.Telnyx{
+			APIKey:       "KEY_test",
+			ConnectionID: "conn_test",
+			FromNumber:   "+15551234567",
+		},
+	}
+	cfg.Dialogue = config.Dialogue{Provider: "openai"}
+	cfg.OpenAI = config.OpenAI{
+		APIKey:        "sk-test",
+		BaseURL:       "https://api.openai.com/v1",
+		DialogueModel: "gpt-4o-mini",
+	}
+	cfg.Notify = config.Notify{Provider: "log", Webhook: config.NotifyWebhook{Channel: "email"}}
+
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.Telephony == nil || a.Dialogue == nil || a.Notify == nil {
+		t.Fatalf("telnyx/openai/notify not wired: %+v", a)
+	}
+	if a.Webhooks == nil {
+		t.Error("telnyx webhook handler not mounted")
+	}
+	if a.notifyWorker == nil {
+		t.Error("notify worker not built when notify.provider=log")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	a.Start(ctx)
+	if err := a.Close(ctx); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+func TestNewNotifyWebhookWiresAdapter(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Notify = config.Notify{
+		Provider: "webhook",
+		Webhook:  config.NotifyWebhook{URL: "https://hooks.example.test/insteadly", Channel: "sms"},
+	}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.Notify == nil || a.notifyWorker == nil {
+		t.Fatal("webhook notifier/worker not wired")
+	}
+	if err := a.Close(context.Background()); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+func TestNewRejectsNotifyWebhookWithoutURL(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Notify = config.Notify{Provider: "webhook", Webhook: config.NotifyWebhook{Channel: "email"}}
+	if _, err := New(cfg); err == nil {
+		t.Fatal("expected a notify webhook url error at construction")
+	}
+}
+
+func TestNewNotifyOffHasNoWorker(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Notify = config.Notify{Provider: "off", Webhook: config.NotifyWebhook{Channel: "email"}}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.Notify != nil || a.notifyWorker != nil {
+		t.Fatal("notify.provider=off must build neither a notifier nor a worker")
+	}
+	if err := a.Close(context.Background()); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}

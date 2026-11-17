@@ -10,6 +10,9 @@ import (
 	"time"
 
 	dialoguemistral "github.com/artemidius/insteadly/internal/adapters/dialogue/mistral"
+	dialogueopenai "github.com/artemidius/insteadly/internal/adapters/dialogue/openai"
+	notifylog "github.com/artemidius/insteadly/internal/adapters/notify/log"
+	notifywebhook "github.com/artemidius/insteadly/internal/adapters/notify/webhook"
 	"github.com/artemidius/insteadly/internal/adapters/password/bcrypt"
 	paymentsstripe "github.com/artemidius/insteadly/internal/adapters/payments/stripe"
 	paymentsstub "github.com/artemidius/insteadly/internal/adapters/payments/stub"
@@ -17,10 +20,12 @@ import (
 	"github.com/artemidius/insteadly/internal/adapters/storage/postgres"
 	sttmistral "github.com/artemidius/insteadly/internal/adapters/stt/mistral"
 	"github.com/artemidius/insteadly/internal/adapters/stub"
+	"github.com/artemidius/insteadly/internal/adapters/telephony/telnyx"
 	"github.com/artemidius/insteadly/internal/adapters/telephony/twilio"
 	ttsmistral "github.com/artemidius/insteadly/internal/adapters/tts/mistral"
 	"github.com/artemidius/insteadly/internal/core/config"
 	"github.com/artemidius/insteadly/internal/core/ports"
+	"github.com/artemidius/insteadly/internal/core/recorder"
 )
 
 // Each builder is one switch: adding a provider means one new case and one adapter
@@ -77,6 +82,20 @@ func buildTelephony(c config.Telephony, publicURL string, log *slog.Logger) (por
 	switch c.Provider {
 	case "stub":
 		return stub.NewTelephony(log), nil, nil
+	case "telnyx":
+		adapter, err := telnyx.New(telnyx.Config{
+			APIKey:           c.Telnyx.APIKey,
+			ConnectionID:     c.Telnyx.ConnectionID,
+			FromNumber:       c.Telnyx.FromNumber,
+			PublicBaseURL:    publicURL,
+			WebhookPublicKey: c.Telnyx.WebhookPublicKey,
+			RingTimeout:      time.Duration(c.Telnyx.RingTimeoutSeconds) * time.Second,
+			Logger:           log,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		return adapter, adapter.Handler(), nil
 	case "twilio":
 		if c.Twilio.Mode != "voice-api" {
 			return nil, nil, fmt.Errorf("twilio mode %q: %w (lands in chunk C7)", c.Twilio.Mode, ports.ErrNotImplemented)
@@ -142,7 +161,7 @@ func buildTTS(c config.TTS, mistral config.Mistral, log *slog.Logger) (ports.Tex
 	}
 }
 
-func buildDialogue(c config.Dialogue, mistral config.Mistral, log *slog.Logger) (ports.Dialogue, error) {
+func buildDialogue(c config.Dialogue, mistral config.Mistral, openai config.OpenAI, log *slog.Logger) (ports.Dialogue, error) {
 	switch c.Provider {
 	case "stub":
 		return stub.NewDialogue(), nil
@@ -157,6 +176,44 @@ func buildDialogue(c config.Dialogue, mistral config.Mistral, log *slog.Logger) 
 			return nil, err
 		}
 		return adapter, nil
+	case "openai":
+		adapter, err := dialogueopenai.New(dialogueopenai.Config{
+			APIKey:  openai.APIKey,
+			BaseURL: openai.BaseURL,
+			Model:   openai.DialogueModel,
+			Logger:  log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return adapter, nil
+	default:
+		return nil, fmt.Errorf("unknown provider %q", c.Provider)
+	}
+}
+
+// buildRecorder selects the recording capture seam. It is always wired: with every flag
+// off (the default) recorder.Wrap returns the dialed session unchanged, and a per-order
+// override can still enable capture. A nil recorder would make per-order overrides
+// impossible.
+func buildRecorder(policy config.Policy, stt ports.SpeechToText, blobs ports.BlobStore, log *slog.Logger) recorder.Recorder {
+	return recorder.New(stt, blobs, recorder.Policy{
+		Recording:  policy.RecordingEnabled,
+		Transcript: policy.TranscriptEnabled,
+		Audio:      policy.AudioEnabled,
+	}, log)
+}
+
+// buildNotifier selects the notification adapter. "off" (the default) returns nil: no
+// notifier, no worker, no behavior change.
+func buildNotifier(c config.Notify, log *slog.Logger) (ports.Notifier, error) {
+	switch c.Provider {
+	case "off", "":
+		return nil, nil
+	case "log":
+		return notifylog.New(log), nil
+	case "webhook":
+		return notifywebhook.New(c.Webhook.URL, c.Webhook.Channel, log)
 	default:
 		return nil, fmt.Errorf("unknown provider %q", c.Provider)
 	}
