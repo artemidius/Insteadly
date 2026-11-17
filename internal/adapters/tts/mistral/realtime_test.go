@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 
@@ -363,3 +364,67 @@ func TestRealtimeOutputIsPCM16LE(t *testing.T) {
 }
 
 var _ ports.SpeechStream = (*realtimeStream)(nil)
+
+// audioDoneWithoutCloseScript sends the terminal speech.audio.done and then deliberately
+// keeps the WebSocket open (no close frame), which is what the real provider may do.
+func audioDoneWithoutCloseScript(t *testing.T, conn *websocket.Conn, c *ttsCapture) {
+	wsWrite(t, conn, map[string]any{"type": "session.created", "session": map[string]any{}})
+	update := wsReadMap(t, conn)
+	c.mu.Lock()
+	c.update = update
+	c.mu.Unlock()
+	wsWrite(t, conn, map[string]any{"type": "session.updated", "session": map[string]any{}})
+
+	for {
+		m := wsReadMap(t, conn)
+		switch m["type"] {
+		case "input_text.append":
+			c.mu.Lock()
+			c.texts = append(c.texts, m["text"].(string))
+			c.mu.Unlock()
+		case "input_text.end":
+			c.mu.Lock()
+			c.endSeen = true
+			c.mu.Unlock()
+			audio := sineFloat32(480, 440)
+			wsWrite(t, conn, map[string]any{"type": "speech.audio.delta", "audio_data": base64.StdEncoding.EncodeToString(float32Bytes(audio))})
+			wsWrite(t, conn, map[string]any{"type": "speech.audio.done"})
+			return // keep the connection open: no close frame
+		}
+	}
+}
+
+func TestRealtimeAudioDoneDoesNotWaitForServerClose(t *testing.T) {
+	a, _ := newRealtimeServer(t, audioDoneWithoutCloseScript)
+	stream, err := a.Speak(context.Background(), ports.SpeakOptions{})
+	if err != nil {
+		t.Fatalf("Speak: %v", err)
+	}
+	if err := stream.FeedText(context.Background(), "Guten Tag."); err != nil {
+		t.Fatalf("FeedText: %v", err)
+	}
+	var frames int
+	drained := make(chan struct{})
+	go func() {
+		for chunk := range stream.Audio() {
+			frames += len(chunk.Data)
+		}
+		close(drained)
+	}()
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	err = stream.Close(closeCtx)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Close: %v (a terminal done must not wait for a server close frame)", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Close took %v; the reader waited for a server close frame", elapsed)
+	}
+	<-drained
+	if frames == 0 || frames%domain.FrameBytes != 0 {
+		t.Fatalf("canonical audio = %d bytes, want a positive multiple of %d", frames, domain.FrameBytes)
+	}
+}

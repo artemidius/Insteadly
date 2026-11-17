@@ -443,3 +443,69 @@ func TestRealtimeConcurrentFeedAndClose(t *testing.T) {
 }
 
 var _ ports.TranscriptionStream = (*transcriptionStream)(nil)
+
+// doneWithoutCloseScript sends the terminal transcription.done and then deliberately keeps
+// the WebSocket open (no close frame), which is what the real provider may do.
+func doneWithoutCloseScript(t *testing.T, conn *websocket.Conn, c *realtimeCapture) {
+	wsWrite(t, conn, map[string]any{"type": "session.created", "session": map[string]any{}})
+	update := wsReadMap(t, conn)
+	c.mu.Lock()
+	c.update = update
+	c.mu.Unlock()
+	wsWrite(t, conn, map[string]any{"type": "session.updated", "session": map[string]any{}})
+
+	for {
+		m := wsReadMap(t, conn)
+		switch m["type"] {
+		case "input_audio.append":
+			raw, _ := base64.StdEncoding.DecodeString(m["audio"].(string))
+			c.mu.Lock()
+			c.audioData = append(c.audioData, raw)
+			c.mu.Unlock()
+		case "input_audio.end":
+			c.mu.Lock()
+			c.endSeen = true
+			c.mu.Unlock()
+			wsWrite(t, conn, map[string]any{"type": "transcription.text.delta", "text": "Guten"})
+			wsWrite(t, conn, map[string]any{"type": "transcription.done", "text": "Guten Tag.", "segments": []any{}, "language": "de"})
+			return // keep the connection open: no close frame
+		}
+	}
+}
+
+func TestRealtimeDoneDoesNotWaitForServerClose(t *testing.T) {
+	a, _ := newRealtimeServer(t, doneWithoutCloseScript)
+	stream, err := a.TranscribeStream(context.Background(), ports.StreamOptions{Language: "de-AT"})
+	if err != nil {
+		t.Fatalf("TranscribeStream: %v", err)
+	}
+	if err := stream.Feed(context.Background(), domain.AudioChunk{Data: make([]byte, domain.FrameBytes)}); err != nil {
+		t.Fatalf("Feed: %v", err)
+	}
+	var finals []string
+	drained := make(chan struct{})
+	go func() {
+		for ev := range stream.Results() {
+			if ev.Final {
+				finals = append(finals, ev.Text)
+			}
+		}
+		close(drained)
+	}()
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	err = stream.Close(closeCtx)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Close: %v (a terminal done must not wait for a server close frame)", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Close took %v; the reader waited for a server close frame", elapsed)
+	}
+	<-drained
+	if len(finals) != 1 || finals[0] != "Guten Tag." {
+		t.Fatalf("finals = %q, want one final transcript", finals)
+	}
+}
