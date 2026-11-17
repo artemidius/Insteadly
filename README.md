@@ -14,8 +14,8 @@ is **✅ code complete** after its real-Mistral no-phone live gate. C4 (conversa
 streaming VAD/turn-taking, barge-in, playback marks/clear, deterministic IVR, hold detection,
 bounded structured-outcome repair) is **✅ code complete** after its real-Mistral no-phone
 M1 live gate. C5 (M2 orchestration: Postgres order store, scheduler with retries and
-callback requeue, status API + SSE, place-call eligibility endpoint) is **🔵 code
-complete pending the conductor's final verification** — see [PROGRESS.md](PROGRESS.md). The
+callback requeue, status API + SSE, place-call eligibility endpoint) is **✅ code complete**
+— see [PROGRESS.md](PROGRESS.md). The
 binary still boots and serves a working API with **no credentials and no external network
 calls** (all providers default to deterministic stubs). Selecting `INSTEADLY_TELEPHONY_PROVIDER=twilio` activates the real Twilio Voice +
 Media Streams adapter; selecting `INSTEADLY_{STT,TTS,DIALOGUE}_PROVIDER=mistral` activates the
@@ -230,7 +230,7 @@ write` for releases).
 | C2 | Mistral STT / TTS / dialogue adapters | ✅ code complete; live smoke passed |
 | C3 | call runner + agent engine, end-to-end M0 walk | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | C4 | conversation: VAD/turn-taking, barge-in, IVR, hold, outcome repair | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
-| C5 | orchestration: Postgres order store, scheduler, status SSE, place-call | 🔵 code complete pending conductor verification |
+| C5 | orchestration: Postgres order store, scheduler, status SSE, place-call | ✅ code complete; make verify + test-postgres green |
 | C6/C7 | web app, payments, swapability, recording, notifications | ⬜ |
 
 See [PROGRESS.md](PROGRESS.md) for the authoritative status and session log.

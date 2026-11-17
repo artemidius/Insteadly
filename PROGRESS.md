@@ -15,17 +15,16 @@
   complete** (call runner + agent engine v0; real-Mistral no-phone live gate passed);
   **C4 ✅ code complete** (streaming VAD/turn-taking, barge-in with Twilio `clear`/`mark`,
   deterministic IVR, hold detection, bounded structured-outcome repair; real-Mistral
-  no-phone M1 live gate passed); **C5 🔵 code complete pending the conductor's final
-  verification** — Postgres order/scheduler store (migrations, `FOR UPDATE`, `SKIP
-  LOCKED`), in-process scheduler (windows, bounded concurrency, retry backoff,
-  history-preserving callback requeue), order-status SSE hub + endpoint, and the
-  API-key-gated place-call eligibility endpoint. DESIGN's **real-phone M0 and M1 exits**
-  remain blocked by the Twilio trial stripping `<Stream>` (and, for M1, by the unproven
-  outbound-DTMF path plus the need for controlled IVR/hold destinations).
-- **Current chunk:** C5 (implementation done, PR open, awaiting conductor verification).
-  Next: conductor verifies C5, then C6 plan (web app, payments, real auth).
-- **First action of the next session:** verify PR #12 / C5 acceptance in `plans/06-orchestration.md`
-  §10, then write `plans/07-web-app.md`.
+  no-phone M1 live gate passed); **C5 ✅ code complete** — Postgres order/scheduler store
+  (migrations, `FOR UPDATE`, `SKIP LOCKED`), in-process scheduler (windows, bounded
+  concurrency, retry backoff, history-preserving callback requeue), order-status SSE hub +
+  endpoint, and the API-key-gated place-call eligibility endpoint; `make verify` +
+  `make test-postgres` (Docker/testcontainers) green. DESIGN's **real-phone M0 and M1
+  exits** remain blocked by the Twilio trial stripping `<Stream>` (and, for M1, by the
+  unproven outbound-DTMF path plus the need for controlled IVR/hold destinations).
+- **Current chunk:** C5 done (code complete). Next: write `plans/07-web-app.md` and start
+  C6 (React+TS web app, registration, Stripe payments, order form, dashboard).
+- **First action of the next session:** write the C6 plan (`plans/07-web-app.md`).
 - **Blockers:** DESIGN's real-phone M0/M1 exits remain blocked by the Twilio trial stripping
   `<Stream>` and the unproven outbound-DTMF path — need an upgraded account, a controlled
   IVR/hold destination, and explicit approval before the end-to-end phone walk. C5
@@ -50,7 +49,7 @@
 | **C2** | M0 | Mistral adapters for STT / TTS / Dialogue (raw WS/JSON APIs, no Go SDK exists). | [plans/03-mistral-ai.md](plans/03-mistral-ai.md) | ✅ code complete; live smoke passed |
 | **C3** | M0 | Call runner + agent engine v0; end-to-end walk: dial owner's mobile, speak through the whole Mistral chain. M0 exit. | [plans/04-m0-e2e.md](plans/04-m0-e2e.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
 | **C4** | M1 | Conversation: streaming VAD/turn-taking, barge-in, playback clear/marks, deterministic IVR, hold detection, bounded structured-outcome repair. | [plans/05-conversation.md](plans/05-conversation.md) | ✅ code complete; real-Mistral no-phone gate passed; real phone blocked by Twilio trial |
-| **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE, place-call. | [plans/06-orchestration.md](plans/06-orchestration.md) | 🔵 code complete pending conductor verification |
+| **C5** | M2 | Orchestration: order store on Postgres, scheduler (windows, retries, callback re-scheduling), status API + SSE, place-call. | [plans/06-orchestration.md](plans/06-orchestration.md) | ✅ code complete; make verify + test-postgres green |
 | **C6** | M3 | Web app (React+TS): registration, payments (Stripe), order form, dashboard. | `plans/07-web-app.md` (TBD) | ⬜ |
 | **C7** | M4 | Swapability proof + hardening: second telephony adapter (Telnyx or Twilio SIP trunk), one alternative AI provider, recording/storage flags end-to-end, notifications. | `plans/08-swapability.md` (TBD) | ⬜ |
 
@@ -63,6 +62,35 @@ account upgrade (and, for M1, controlled IVR/hold destinations).
 ---
 
 ## Session log (most recent first)
+
+### 2026-11-17 — C5 conductor session (Europe/Vienna)
+
+- Ran the multi-agent flow for C5: Architect (started `kimi-code/k3.1-pro`, which failed 3×
+  — likely a Kimi-side limit — then `deepseek-official/deepseek-v4-pro`) → Coder
+  (`deepseek-official/deepseek-flash`) → Reviewer (`deepseek-official/deepseek-v4-pro`).
+  Merged PR #12 (`feat/c5-orchestration`) via squash.
+- **C5 → ✅ code complete.** Postgres order/scheduler store (embedded migrations +
+  `pg_advisory_xact_lock`, `OrderStore.Update` = `SELECT … FOR UPDATE` tx, `SchedulerStore`
+  `FOR UPDATE SKIP LOCKED`), in-process scheduler (fake-clock-tested windows/CET-CEST,
+  retry backoff, history-preserving `callback_needed`/`failed` requeue, bounded concurrency,
+  `Close`), order-status SSE hub + `GET /api/v1/orders/{id}/events`, and the API-key-gated
+  idempotent `POST /api/v1/orders/{id}/call` eligibility endpoint.
+- **New dependencies (plan-justified):** `github.com/jackc/pgx/v5 v5.13.0` (runtime) and
+  `github.com/testcontainers/testcontainers-go v0.45.0` + `modules/postgres` (test-only,
+  `//go:build postgres`). `make verify` stays Docker-free.
+- **Conductor verification (observed):** `make verify` → PASS (gofmt/vet/race/check-deps
+  "OK: core imports no adapters"/build); `golangci-lint v2.15.0` → 0 issues (Reviewer);
+  `CGO_ENABLED=0 go test -tags postgres -count=1 ./internal/adapters/storage/postgres/
+  ./internal/app/` → ok (testcontainers `postgres:16-alpine`; CGO off due to the broken
+  Xcode clang — documented env workaround); `go mod tidy` no drift; domain/ports diff
+  additive-only; scheduler never mutates to `dialing` (runner's `scheduled→dialing` +
+  `Attempts++` stays the sole dial fence). Reviewer verdict: APPROVE (10 §14 amendments
+  judged correct; 2 non-blocking nits + one pre-existing flaky
+  `TestM1IntegrationHoldResumeWithoutSTT` filed as a separate follow-up).
+- **Status:** C5 → ✅. DESIGN's real-phone M0/M1 exits remain blocked by the Twilio trial +
+  unproven outbound DTMF + controlled IVR/hold destinations. C5 deployment blockers (no
+  River, placeholder API-key auth, single-process scheduler, untested multi-instance
+  draining) are documented, not code-complete blockers.
 
 ### 2026-11-17 — C5 implementation session (Europe/Vienna)
 
